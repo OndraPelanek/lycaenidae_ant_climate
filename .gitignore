@@ -30,3 +30,5 @@ code/*.rdx
 #/data/archive/*
 #!/data/archive/*.md
 versions
+data/raw
+data/intermediate
