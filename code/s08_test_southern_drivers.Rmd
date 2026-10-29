@@ -1,0 +1,394 @@
+---
+title: "Lycaenidae ant-interaction climate 08 - what the southern continents share: soils and fire"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+`s06_test_stability` showed that the obligacy signal that transfers across lineages is a concentration of obligate associates at southern mid-latitudes, which the LGM anomaly described only because it is small there. This notebook asks whether properties that the obligate-rich southern regions share, and that the literature links to ant-dependent life histories, describe the same concentration better than latitude and hemisphere:
+
+- **Old, nutrient-poor soils** with carbohydrate-rich, ant-dominated ecosystems (H3; Orians & Milewski 2007; Pierce & Dankowicz 2022): soil pH, cation exchange capacity, nitrogen and organic carbon (SoilGrids 2.0; Poggio et al. 2021) and, when its file is present, soil total phosphorus (He et al. 2021).
+- **Fire and seasonal drought**, in which ant nests are refuges (H2; Espeland et al. 2023): mean annual burned fraction (GFED5; Chen et al. 2023), with the present aridity index and precipitation seasonality.
+- **Long-term aridity** (H7): when its files are present, the mean log precipitation and the share of time with low precipitation over the last 5 million years (PALEO-PGEM; Barreto et al. 2023).
+
+As in `s06`, each property is tested by whether it improves the prediction of obligacy in held-out subfamilies and genera beyond latitude and hemisphere, and by its effect given region and lineage. A full run takes about 10 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(pastclim)
+library(mgcv)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+# SoilGrids variables (0-30 cm, depth-weighted means of the 0-5, 5-15 and 15-30 cm layers) and the
+# factors converting their stored integers to conventional units
+soil_vars <- c(phh2o = 10, cec = 10, nitrogen = 100, soc = 10)
+soil_depths <- c(`0-5cm` = 5, `5-15cm` = 10, `15-30cm` = 15)
+
+# GFED5 years at 0.25 degrees
+fire_years <- 2001:2020
+
+# Contrast: obligate (mutualist or parasite) against facultative associates
+obligate_types <- c("m", "p")
+associated_types <- c("f", "m", "p")
+genus_cv_repeats <- 20
+
+# Optional layers, used when their files are present in the raw data
+soil_p_candidates <- c("soil_phosphorus_he2021/stp.0-10cm.tif", "soil_phosphorus_he2021_stp.0-10cm.tif")
+pgem_files <- c(bio01 = "pastclim/PALEO-PGEM-Series_bio1_mean.nc",
+                bio12 = "pastclim/PALEO-PGEM-Series_bio12_mean.nc")
+# Share of time "dry": annual precipitation below this value (mm); every 10th of the 5,001
+# 1-kyr steps is used (10-kyr resolution), as reading all of them takes over an hour
+pgem_dry_mm <- 500
+pgem_step <- 10
+
+# Labels of the drivers
+driver_labels <- c(phh2o = "Soil pH", cec = "Soil cation exchange capacity (log)",
+                   nitrogen = "Soil nitrogen (log)", soc = "Soil organic carbon (log)",
+                   soil_p = "Soil total phosphorus (log)",
+                   fire = "Burned fraction per year (log)", log_aridity = "Aridity index (log P/PET)",
+                   bio15 = "Precipitation seasonality",
+                   pgem_log_precipitation = "Mean log precipitation, 5 Myr",
+                   pgem_dry_share = "Share of 5 Myr with < 500 mm")
+
+# Colours of the interaction types, as in butterfly_ant_interactions
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+type_labels <- c(n = "Non-associated", f = "Facultative", m = "Obligate mutualist",
+                 p = "Obligate parasite")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s06 <- path_resrepo("data/intermediate/s06_test_stability")
+dir_data_intermediate <- path_resrepo("data/intermediate/s08_test_southern_drivers")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Binomial deviance of 0/1 outcomes y under probabilities q
+binary_deviance <- function(y, q) {
+  q <- pmin(pmax(q, 1e-9), 1 - 1e-9)
+  -2 * sum(y * log(q) + (1 - y) * log(1 - q))
+}
+
+# Cross-validated deviance explained of a logistic regression (as in s06): each group of `fold`
+# is predicted from the other groups; unseen factor levels get the baseline
+cv_d2 <- function(d, rhs, fold) {
+  X <- model.matrix(as.formula(paste("~", rhs)), data = d)
+  q <- q0 <- numeric(nrow(d))
+  for (k in unique(fold)) {
+    test <- fold == k
+    fit <- suppressWarnings(glm.fit(X[!test, , drop = FALSE], d$y[!test], family = binomial()))
+    b <- fit$coefficients
+    b[is.na(b)] <- 0
+    q[test] <- plogis(X[test, , drop = FALSE] %*% b)
+    q0[test] <- mean(d$y[!test])
+  }
+  1 - binary_deviance(d$y, q) / binary_deviance(d$y, q0)
+}
+
+# Save a figure with ragg; width and height in inches
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Driver layers at 10 arc-minutes
+
+The SoilGrids layers (Interrupted Goode Homolosine, 5 km) are projected to the 10-arc-minute grid of WorldClim by averaging, converted to conventional units and averaged over 0-30 cm weighted by layer thickness. The GFED5 total burned area (km² per 0.25° cell and month) is summed over each year of 2001-2020, averaged over the years, divided by the area of the cell and interpolated to 10 arc-minutes. The optional layers are added when present.
+
+*Inputs:* raw/soilgrids_2.0/; raw/gfed5/BA.zip; optional raw/soil_phosphorus_he2021/ and raw/pastclim/PALEO-PGEM files; s01/climate_present_10m.tif
+*Outputs:* drivers_10m.tif
+
+```{r driver_layers}
+template <- rast(file.path(dir_s01, "climate_present_10m.tif"))[["bio01"]]
+
+# --- Soils: depth-weighted 0-30 cm means ---
+soil <- rast(lapply(names(soil_vars), function(v) {
+  layers <- rast(file.path(dir_data_raw, "soilgrids_2.0",
+                           paste0(v, "_", names(soil_depths), "_mean_5000.tif")))
+  layers <- project(layers, template, method = "average") / soil_vars[[v]]
+  out <- sum(layers * soil_depths) / sum(soil_depths)
+  names(out) <- v
+  out
+}))
+
+# --- Fire: mean annual burned fraction 2001-2020 ---
+tmp <- file.path(tempdir(), "gfed5")
+dir.create(tmp, showWarnings = FALSE)
+unzip(file.path(dir_data_raw, "gfed5", "BA.zip"),
+      files = sprintf("BA%d%02d.nc", rep(fire_years, each = 12), 1:12), exdir = tmp,
+      junkpaths = TRUE)
+annual <- rast(lapply(fire_years, function(yr) {
+  sum(rast(lapply(sprintf("%s/BA%d%02d.nc", tmp, yr, 1:12),
+                  function(f) rast(f, subds = "Total"))))
+}))
+cell_km2 <- cellSize(annual[[1]], unit = "km")
+fire <- resample(mean(annual) / cell_km2, template, method = "bilinear")
+names(fire) <- "fire"
+unlink(tmp, recursive = TRUE)
+
+drivers <- c(soil, fire)
+
+# --- Optional: soil total phosphorus ---
+soil_p_file <- soil_p_candidates[file.exists(file.path(dir_data_raw, soil_p_candidates))][1]
+if (!is.na(soil_p_file)) {
+  sp_r <- project(rast(file.path(dir_data_raw, soil_p_file)), template, method = "bilinear")
+  names(sp_r) <- "soil_p"
+  drivers <- c(drivers, sp_r)
+}
+
+# --- Optional: long-term (5 Myr) precipitation from PALEO-PGEM ---
+if (all(file.exists(file.path(dir_data_raw, pgem_files)))) {
+  p <- rast(file.path(dir_data_raw, pgem_files[["bio12"]]))
+  p <- p[[seq(1, nlyr(p), by = pgem_step)]]
+  pg <- c(app(log(p + 1), mean, na.rm = TRUE), app(p < pgem_dry_mm, mean, na.rm = TRUE))
+  pg <- resample(pg, template, method = "bilinear")
+  names(pg) <- c("pgem_log_precipitation", "pgem_dry_share")
+  drivers <- c(drivers, pg)
+}
+
+drivers <- mask(drivers, template)
+writeRaster(drivers, file.path(dir_data_intermediate, "drivers_10m.tif"), overwrite = TRUE)
+cat("driver layers:", paste(names(drivers), collapse = ", "), "\n")
+```
+
+```{r clear_driver_layers, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Drivers of each species
+
+Each species of the obligacy contrast (`s06_test_stability`) gets the median of each driver over the 10-arc-minute pixels holding its records. Cation exchange capacity, nitrogen, organic carbon, phosphorus and the burned fraction are log-transformed (burned fraction plus 0.0001). All predictors are standardised over the species.
+
+*Inputs:* s06/species_stability.csv; s02/species_records.rds; s08/drivers_10m.tif
+*Outputs:* species_drivers.csv
+
+```{r species_drivers}
+sp <- fread(file.path(dir_s06, "species_stability.csv"), colClasses = c(pool_key = "character"))
+drivers <- rast(file.path(dir_data_intermediate, "drivers_10m.tif"))
+x <- readRDS(file.path(dir_s02, "species_records.rds"))[pool_key %in% sp$pool_key]
+x[, pixel := cellFromXY(drivers, cbind(decimalLongitude, decimalLatitude))]
+px <- unique(x[!is.na(pixel), .(pool_key, pixel)])
+vals <- as.data.table(drivers[px$pixel])
+vals[, pool_key := px$pool_key]
+med <- vals[, lapply(.SD, median, na.rm = TRUE), by = pool_key, .SDcols = names(drivers)]
+sp <- merge(sp, med, by = "pool_key")
+
+# Transformations and standardisation
+for (v in intersect(c("cec", "nitrogen", "soc", "soil_p"), names(sp))) set(sp, j = v,
+                                                                       value = log(sp[[v]]))
+sp[, fire := log(fire + 1e-4)]
+drv <- intersect(names(driver_labels), names(sp))
+sp <- sp[complete.cases(sp[, ..drv])]
+for (v in drv) set(sp, j = paste0(v, "_z"), value = as.numeric(scale(sp[[v]])))
+write_table(sp, file.path(dir_data_intermediate, "species_drivers.csv"))
+cat("species:", nrow(sp), "; obligate:", sum(sp$y), "; drivers:", paste(drv, collapse = ", "),
+    "\n")
+print(round(cor(sp[, c(drv, "abs_latitude", "lgm_anomaly_temperature"), with = FALSE],
+                method = "spearman"), 2))
+```
+
+```{r clear_species_drivers, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Prediction of held-out lineages
+
+For held-out subfamilies (each in turn) and genera (ten groups, 20 splits), the cross-validated deviance explained of the reference model (latitude by hemisphere) is compared with that of the reference model plus each driver, of each driver alone, and of the reference model plus all soil and fire drivers. A driver that captures what makes the southern regions obligate-rich should improve on latitude and hemisphere, or match them alone.
+
+*Inputs:* s08/species_drivers.csv
+*Outputs:* drivers_cv.csv
+
+```{r drivers_cv}
+sp <- fread(file.path(dir_data_intermediate, "species_drivers.csv"),
+            colClasses = c(pool_key = "character"))
+sp[, hemisphere := factor(hemisphere)]
+drv <- intersect(names(driver_labels), sub("_z$", "", grep("_z$", names(sp), value = TRUE)))
+ref <- "abs_latitude_z * hemisphere"
+sets <- c(list(reference = ref),
+          setNames(as.list(paste(ref, "+", paste0(drv, "_z"))), paste("reference +", drv)),
+          setNames(as.list(paste0(drv, "_z")), paste(drv, "alone")),
+          list(`reference + all drivers` = paste(ref, "+", paste0(drv, "_z", collapse = " + ")),
+               `all drivers alone` = paste0(drv, "_z", collapse = " + ")))
+
+set.seed(20261028)
+genera <- unique(sp$genus)
+folds <- lapply(seq_len(genus_cv_repeats), function(r)
+  setNames(sample(rep_len(1:10, length(genera))), genera))
+res <- rbindlist(lapply(names(sets), function(s) rbind(
+  data.table(set = s, scheme = "subfamily", repeat_id = 1L,
+             cv_d2 = cv_d2(sp, sets[[s]], sp$subfamily)),
+  rbindlist(lapply(seq_along(folds), function(r)
+    data.table(set = s, scheme = "genus", repeat_id = r,
+               cv_d2 = cv_d2(sp, sets[[s]], folds[[r]][sp$genus])))))))
+write_table(res, file.path(dir_data_intermediate, "drivers_cv.csv"))
+print(dcast(res[, .(cv_d2 = median(cv_d2)), by = .(set, scheme)], set ~ scheme,
+            value.var = "cv_d2")[order(-subfamily)], digits = 3)
+```
+
+```{r clear_drivers_cv, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Effects given region and lineage
+
+Each driver's effect on obligacy is estimated alone and with region as a fixed effect, both with random intercepts of subfamily and genus (`mgcv`, REML), as for the LGM anomaly in `s06`.
+
+*Inputs:* s08/species_drivers.csv
+*Outputs:* drivers_effects.csv
+
+```{r drivers_effects}
+sp <- fread(file.path(dir_data_intermediate, "species_drivers.csv"),
+            colClasses = c(pool_key = "character"))
+sp[, `:=`(region = factor(region), genus = factor(genus), subfamily = factor(subfamily))]
+drv <- intersect(names(driver_labels), sub("_z$", "", grep("_z$", names(sp), value = TRUE)))
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+effects <- rbindlist(lapply(drv, function(v) rbindlist(lapply(c(FALSE, TRUE), function(rg) {
+  rhs <- paste(c(if (rg) "region", paste0(v, "_z"), lineage), collapse = " + ")
+  m <- gam(as.formula(paste("y ~", rhs)), data = sp, family = binomial, method = "REML")
+  cf <- summary(m)$p.table[paste0(v, "_z"), ]
+  data.table(driver = v, given_region = rg, estimate = cf[1], se = cf[2], p = cf[4])
+}))))
+write_table(effects, file.path(dir_data_intermediate, "drivers_effects.csv"))
+print(effects, digits = 3)
+```
+
+```{r clear_drivers_effects, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(A) The drivers of facultative, obligate mutualist and obligate parasite species, separately for the two hemispheres (medians over each species' pixels). (B) The gain in cross-validated deviance explained over latitude and hemisphere when each driver is added, for held-out subfamilies and genera. (C) The effect of each driver given lineage, with and without region.
+
+*Inputs:* s08/ species_drivers.csv, drivers_cv.csv, drivers_effects.csv
+*Outputs:* plot_southern_drivers.png
+
+```{r plot_drivers}
+sp <- fread(file.path(dir_data_intermediate, "species_drivers.csv"),
+            colClasses = c(pool_key = "character"))
+res <- fread(file.path(dir_data_intermediate, "drivers_cv.csv"))
+effects <- fread(file.path(dir_data_intermediate, "drivers_effects.csv"))
+drv <- unique(effects$driver)
+
+# --- A: driver values by strategy and hemisphere ---
+long <- melt(sp[, c("interaction_type", "hemisphere", drv), with = FALSE],
+             id.vars = c("interaction_type", "hemisphere"), variable.name = "driver")
+long[, `:=`(driver = factor(driver_labels[as.character(driver)], driver_labels[drv]),
+            interaction_type = factor(interaction_type, names(type_colours)),
+            hemisphere = factor(hemisphere, c("North", "South"),
+                                c("Northern Hemisphere", "Southern Hemisphere")))]
+panel_a <- ggplot(long, aes(value, hemisphere, fill = interaction_type)) +
+  geom_boxplot(outlier.size = 0.2, outlier.alpha = 0.3, width = 0.7, linewidth = 0.3,
+               position = position_dodge(width = 0.8)) +
+  facet_wrap(~ driver, scales = "free_x", nrow = 2, labeller = label_wrap_gen(width = 24)) +
+  scale_fill_manual(values = type_colours[c("f", "m", "p")], labels = type_labels,
+                    name = NULL) +
+  labs(x = NULL, y = NULL, title = "Drivers of the species of each strategy") +
+  theme_minimal(base_size = 8.5) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        legend.position = "bottom", strip.text = element_text(size = 7.5),
+        plot.title = element_text(face = "bold", size = 9.5))
+
+# --- B: gain over latitude and hemisphere ---
+ref <- res[set == "reference", .(ref = cv_d2), by = .(scheme, repeat_id)]
+gain <- merge(res[grepl("^reference \\+ ", set)], ref, by = c("scheme", "repeat_id"))
+gain[, `:=`(gain = cv_d2 - ref, driver = sub("^reference \\+ ", "", set))]
+gs <- gain[, .(median = median(gain), low = min(gain), high = max(gain)), by = .(driver, scheme)]
+gs[, `:=`(driver = factor(ifelse(driver == "all drivers", "All drivers",
+                                 driver_labels[driver]),
+                          rev(c(driver_labels[drv], "All drivers"))),
+          scheme = factor(scheme, c("subfamily", "genus"),
+                          c("Held-out subfamilies", "Held-out genera (20 splits)")))]
+panel_b <- ggplot(gs, aes(100 * median, driver, shape = scheme)) +
+  geom_vline(xintercept = 0, colour = "grey55", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = 100 * low, xmax = 100 * high), width = 0, linewidth = 0.5,
+                orientation = "y", position = position_dodge(width = 0.5)) +
+  geom_point(size = 1.9, position = position_dodge(width = 0.5)) +
+  scale_shape_manual(values = c(17, 18), name = NULL) +
+  labs(x = "Gain over latitude and hemisphere (percentage points)", y = NULL,
+       title = "Prediction of new lineages") +
+  guides(shape = guide_legend(ncol = 1)) +
+  theme_minimal(base_size = 8.5) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        legend.position = "bottom", plot.title = element_text(face = "bold", size = 9.5))
+
+# --- C: effects given lineage, with and without region ---
+effects[, `:=`(driver = factor(driver_labels[driver], rev(driver_labels[drv])),
+               model = factor(ifelse(given_region, "Given region and lineage", "Given lineage"),
+                              c("Given lineage", "Given region and lineage")),
+               fill_key = ifelse(p < 0.05, ifelse(given_region, "a", "b"), "open"))]
+panel_c <- ggplot(effects, aes(estimate, driver, colour = model)) +
+  geom_vline(xintercept = 0, colour = "grey55", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), width = 0,
+                linewidth = 0.5, orientation = "y", position = position_dodge(width = 0.6)) +
+  geom_point(aes(fill = fill_key), shape = 21, size = 1.9, stroke = 0.6,
+             position = position_dodge(width = 0.6)) +
+  scale_colour_manual(values = c(`Given lineage` = "grey55", `Given region and lineage` = "black"),
+                      name = NULL) +
+  scale_fill_manual(values = c(a = "black", b = "grey55", open = "white"), guide = "none") +
+  labs(x = "Effect on obligacy (log odds per SD, 95% CI; filled: p < 0.05)", y = NULL,
+       title = "Effects on obligacy") +
+  guides(colour = guide_legend(ncol = 1)) +
+  theme_minimal(base_size = 8.5) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        legend.position = "bottom", plot.title = element_text(face = "bold", size = 9.5))
+
+fig <- panel_a / (panel_b | panel_c) + plot_layout(heights = c(1, 1)) +
+  plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(face = "bold", size = 12))
+save_figure(fig, "plot_southern_drivers", 10.5, 9.5)
+fig
+```
+
+```{r clear_plot_drivers, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

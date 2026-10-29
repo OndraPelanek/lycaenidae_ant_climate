@@ -1,0 +1,497 @@
+---
+title: "Lycaenidae ant-interaction climate 18 - audit of the shared-climate comparison"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+`s13_compare_matched_climates` compared Mediterranean-climate regions within the climate strata that both occupy, pooling the species of all shared strata. An external review (29 October 2026) pointed out that restricting two regions to common climatic support does not balance them: one region's species may sit mostly in the warmest shared strata and the other's in the coolest. This notebook audits the comparison:
+
+1. **Standardised contrasts.** The share of each strategy is estimated within each shared stratum for each region, and averaged over a common set of stratum weights: equal weights, or the mean of the two regions' area distributions over the shared strata. A species recorded in several strata counts in each, so uncertainty comes from resampling genera across all strata at once (genus bootstrap), which keeps such species and their congeners together. A second version assigns each species to the single shared stratum holding most of its records.
+2. **Balance.** The climates of the two regions before matching and after it (shared strata, common weights), as standardised mean differences, and the share of each region's Mediterranean-climate area and classified species retained.
+3. **Sensitivity** to the width of the strata and to the minimum number of pixels for a region to occupy a stratum.
+4. **The four strategies.** Obligacy combines mutualists and parasites; the standardised shares of all four strategies are compared.
+5. **Genus weighting.** The share of obligate species weights every species equally. Weighting every genus equally instead separates how many genera are obligate from how species-rich the obligate genera are, and the regional contrasts are decomposed into these two parts.
+
+A full run takes about 10 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+# Climate strata of s13 (2 °C, 3 °C, 0.15 log10, 15%), the multipliers of the sensitivity
+# analysis and the minimum pixels for a region to occupy a stratum
+strata_widths <- c(bio01 = 2, bio06 = 3, log_aridity = 0.15, bio15 = 15)
+width_factors <- c(0.5, 1, 1.5, 2)
+min_pixels_grid <- c(1, 5, 10)
+main_factor <- 1
+main_min_pixels <- 5
+
+# A shared stratum enters the standardised estimate when both regions have at least this many
+# classified species in it
+min_species_stratum <- 3
+
+# Pairs compared, and genus bootstrap replicates
+pairs <- list(c("Cape", "Mediterranean Basin"), c("Southern Australia", "Mediterranean Basin"),
+              c("Cape", "Southern Australia"), c("Mediterranean Basin", "California"))
+n_boot <- 1000
+
+med_levels <- c("Cape", "Southern Australia", "Mediterranean Basin", "California",
+                "Central Chile")
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+types <- c("n", "f", "m", "p")
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+type_labels <- c(n = "Non-associated", f = "Facultative", m = "Obligate mutualist",
+                 p = "Obligate parasite")
+climate_labels <- c(bio01 = "Annual mean temperature", bio06 = "Minimum temperature",
+                    log_aridity = "Aridity (log10 P/PET)", bio15 = "Precipitation seasonality")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_s07 <- path_resrepo("data/intermediate/s07_compare_mediterranean")
+dir_s13 <- path_resrepo("data/intermediate/s13_compare_matched_climates")
+dir_data_intermediate <- path_resrepo("data/intermediate/s18_audit_shared_climates")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Stratum of each pixel for a given multiplier of the stratum widths
+stratum_of <- function(pix, factor) {
+  w <- factor * strata_widths
+  paste(floor(pix$bio01 / w[["bio01"]]), floor(pix$bio06 / w[["bio06"]]),
+        floor(pix$log_aridity / w[["log_aridity"]]), floor(pix$bio15 / w[["bio15"]]), sep = "_")
+}
+
+# Species-by-stratum table of the Mediterranean-climate pixels of one grain: one row per region,
+# stratum and classified species, with the pixels of each region in each stratum
+pair_tables <- function(pix, rec, taxa, factor, min_pixels) {
+  cs <- pix[!is.na(med_region)]
+  cs[, s := stratum_of(cs, factor)]
+  area <- cs[, .(pixels = .N), by = .(region = as.character(med_region), s)]
+  occ <- area[pixels >= min_pixels]
+  sp <- merge(rec[cell %in% cs$cell], cs[, .(cell, region = as.character(med_region), s)],
+              by = "cell")
+  sp <- unique(sp[, .(region, s, pool_key)])
+  sp <- merge(sp, taxa[classified == TRUE, .(pool_key, genus, type = interaction_type)],
+              by = "pool_key")
+  list(area = area, occ = occ, sp = sp, cs = cs)
+}
+
+# Shared strata of a pair that both regions occupy and in which both have enough classified
+# species, with the common stratum weights (equal, or the mean of the two regions' area shares)
+shared_strata <- function(tabs, pr) {
+  occ <- tabs$occ[region %in% pr]
+  n_sp <- tabs$sp[region %in% pr, .(n = uniqueN(pool_key)), by = .(region, s)]
+  ok <- merge(occ, n_sp, by = c("region", "s"))[n >= min_species_stratum]
+  s_ok <- ok[, .N, by = s][N == 2]$s
+  a <- tabs$area[region %in% pr & s %in% s_ok]
+  a[, share := pixels / sum(pixels), by = region]
+  w <- a[, .(w_area = mean(share)), by = s][, w_equal := 1 / .N]
+  w
+}
+
+# Standardised share of each strategy (and of obligacy) in each region of a pair, from the
+# species table, the stratum weights and genus multiplicities (1 for the data, bootstrap
+# counts otherwise); strata where a region has no weight are dropped and the weights rescaled
+standardised <- function(sp, w, pr, gw = NULL, weight = "w_area") {
+  d <- sp[region %in% pr & s %in% w$s]
+  d[, g := if (is.null(gw)) 1 else gw[genus]]
+  d[is.na(g), g := 0]
+  cnt <- d[, .(n = sum(g * (type == "n")), f = sum(g * (type == "f")), m = sum(g * (type == "m")),
+               p = sum(g * (type == "p")), tot = sum(g)), by = .(region, s)]
+  keep <- cnt[tot > 0, .N, by = s][N == 2]$s
+  cnt <- merge(cnt[s %in% keep], w[s %in% keep, .(s, wt = get(weight))], by = "s")
+  cnt[, wt := wt / sum(wt), by = region]
+  cnt[, .(n = sum(wt * n / tot), f = sum(wt * f / tot), m = sum(wt * m / tot),
+          p = sum(wt * p / tot), obligate = sum(wt * (m + p) / tot), strata = .N), by = region]
+}
+
+# Genus bootstrap of the standardised shares and their difference (first minus second region)
+boot_standardised <- function(sp, w, pr, weight = "w_area", reps = n_boot) {
+  genera <- unique(sp[region %in% pr & s %in% w$s]$genus)
+  rbindlist(lapply(seq_len(reps), function(b) {
+    gw <- setNames(tabulate(sample.int(length(genera), replace = TRUE), length(genera)), genera)
+    out <- standardised(sp, w, pr, gw, weight)
+    if (nrow(out) < 2) return(NULL)
+    out[, rep := b]
+  }))
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 8.5) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom", plot.tag = element_text(face = "bold", size = 11))
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Standardised contrasts
+
+For each pair and the main grain (strata of s13, at least `r main_min_pixels` pixels), the standardised share of each strategy with area weights and with equal weights, the genus-bootstrap intervals of the shares and of the difference in obligacy, and the same with each species assigned to its main stratum.
+
+*Inputs:* s13/ pixel_strata.rds, record_pixels.rds, taxa.csv
+*Outputs:* standardised_contrasts.csv, standardised_shares.csv
+
+```{r standardised_contrasts}
+pix <- readRDS(file.path(dir_s13, "pixel_strata.rds"))
+rec <- readRDS(file.path(dir_s13, "record_pixels.rds"))
+taxa <- fread(file.path(dir_s13, "taxa.csv"), colClasses = c(pool_key = "character"))
+rec[, pool_key := as.character(pool_key)]
+tabs <- pair_tables(pix, rec, taxa, main_factor, main_min_pixels)
+
+# Each species assigned to the shared stratum holding most of its records within the region
+main_stratum <- function(sp_tab, w) {
+  recs <- merge(rec[cell %in% tabs$cs$cell],
+                tabs$cs[s %in% w$s, .(cell, region = as.character(med_region), s)], by = "cell")
+  modal <- recs[, .N, by = .(pool_key, region, s)][order(-N)][, .SD[1], by = .(pool_key, region)]
+  merge(sp_tab, modal[, .(pool_key, region, s)], by = c("pool_key", "region", "s"))
+}
+
+set.seed(20261029)
+shares <- list()
+contrasts <- list()
+for (pr in pairs) {
+  key <- paste(pr, collapse = " vs ")
+  w <- shared_strata(tabs, pr)
+  for (version in c("all strata of each species", "main stratum of each species")) {
+    sp <- if (version == "main stratum of each species") main_stratum(tabs$sp, w) else tabs$sp
+    for (weight in c("w_area", "w_equal")) {
+      obs <- standardised(sp, w, pr, weight = weight)
+      bt <- boot_standardised(sp, w, pr, weight = weight)
+      ci <- bt[, lapply(.SD, function(x) quantile(x, c(0.025, 0.975), na.rm = TRUE)),
+               by = region, .SDcols = c(types, "obligate")]
+      ci[, bound := rep(c("low", "high"), .N / 2)]
+      lab <- c(w_area = "area weights", w_equal = "equal weights")[[weight]]
+      shares[[paste(key, version, weight)]] <- merge(
+        melt(obs, id.vars = c("region", "strata"), variable.name = "type", value.name = "share"),
+        dcast(melt(ci, id.vars = c("region", "bound"), variable.name = "type"),
+              region + type ~ bound, value.var = "value"),
+        by = c("region", "type"))[, `:=`(pair = key, version = version, weights = lab)]
+      diff <- dcast(bt[, .(rep, region, obligate)], rep ~ region, value.var = "obligate")
+      d <- diff[[pr[1]]] - diff[[pr[2]]]
+      contrasts[[paste(key, version, weight)]] <- data.table(
+        pair = key, version = version, weights = lab, strata = obs$strata[1],
+        obligate_1 = obs[region == pr[1]]$obligate, obligate_2 = obs[region == pr[2]]$obligate,
+        difference = obs[region == pr[1]]$obligate - obs[region == pr[2]]$obligate,
+        difference_low = quantile(d, 0.025, na.rm = TRUE),
+        difference_high = quantile(d, 0.975, na.rm = TRUE),
+        share_reps_positive = mean(d > 0, na.rm = TRUE))
+    }
+  }
+}
+shares <- rbindlist(shares)
+contrasts <- rbindlist(contrasts)
+write_table(shares, file.path(dir_data_intermediate, "standardised_shares.csv"))
+write_table(contrasts, file.path(dir_data_intermediate, "standardised_contrasts.csv"))
+print(contrasts, digits = 2)
+```
+
+```{r clear_standardised_contrasts, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Balance of the climates
+
+For each pair: the mean of each climate variable over each region's Mediterranean-climate pixels, before matching (all Cs pixels) and after it (pixels of the shared strata, reweighted so that each region has the common area distribution over the strata), with the standardised mean difference (difference of the means divided by the pooled SD before matching). Also the share of each region's Cs pixels and of its classified Cs species retained in the shared strata.
+
+*Inputs:* s13/ pixel_strata.rds, record_pixels.rds, taxa.csv
+*Outputs:* balance.csv, retained.csv, balance_pixels.csv
+
+```{r balance}
+pix <- readRDS(file.path(dir_s13, "pixel_strata.rds"))
+rec <- readRDS(file.path(dir_s13, "record_pixels.rds"))
+taxa <- fread(file.path(dir_s13, "taxa.csv"), colClasses = c(pool_key = "character"))
+rec[, pool_key := as.character(pool_key)]
+tabs <- pair_tables(pix, rec, taxa, main_factor, main_min_pixels)
+vars <- names(climate_labels)
+
+balance <- list()
+retained <- list()
+pixels_out <- list()
+for (pr in pairs) {
+  key <- paste(pr, collapse = " vs ")
+  w <- shared_strata(tabs, pr)
+  cs <- tabs$cs[as.character(med_region) %in% pr]
+  cs[, region := as.character(med_region)]
+  # Weights after matching: each region's pixels reweighted to the common area distribution
+  after <- merge(cs[s %in% w$s], w[, .(s, w_area)], by = "s")
+  after[, wt := w_area / .N, by = .(region, s)]
+  for (v in vars) {
+    sd_pooled <- sqrt((var(cs[region == pr[1]][[v]]) + var(cs[region == pr[2]][[v]])) / 2)
+    m_before <- cs[, .(m = mean(get(v))), by = region]
+    m_after <- after[, .(m = weighted.mean(get(v), wt)), by = region]
+    balance[[paste(key, v)]] <- data.table(
+      pair = key, variable = v,
+      smd_before = (m_before[region == pr[1]]$m - m_before[region == pr[2]]$m) / sd_pooled,
+      smd_after = (m_after[region == pr[1]]$m - m_after[region == pr[2]]$m) / sd_pooled)
+  }
+  sp_all <- unique(tabs$sp[region %in% pr, .(region, pool_key)])
+  sp_kept <- unique(tabs$sp[region %in% pr & s %in% w$s, .(region, pool_key)])
+  retained[[key]] <- merge(
+    cs[, .(cs_pixels = .N, pixels_retained = sum(s %in% w$s)), by = region],
+    merge(sp_all[, .(classified = .N), by = region], sp_kept[, .(retained = .N), by = region],
+          by = "region", all.x = TRUE), by = "region")[, `:=`(pair = key, strata = nrow(w))]
+  pixels_out[[key]] <- rbind(cs[, c("region", vars), with = FALSE][, `:=`(stage = "before", wt = 1)],
+                             after[, c("region", vars, "wt"), with = FALSE][, stage := "after"],
+                             fill = TRUE)[, pair := key]
+}
+balance <- rbindlist(balance)
+retained <- rbindlist(retained)
+retained[is.na(retained), retained := 0L]
+retained[, `:=`(share_pixels = pixels_retained / cs_pixels, share_species = retained / classified)]
+write_table(balance, file.path(dir_data_intermediate, "balance.csv"))
+write_table(retained, file.path(dir_data_intermediate, "retained.csv"))
+write_table(rbindlist(pixels_out), file.path(dir_data_intermediate, "balance_pixels.csv"))
+print(balance, digits = 2)
+print(retained, digits = 2)
+```
+
+```{r clear_balance, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Sensitivity to the strata
+
+The standardised difference in obligacy (area weights, all strata of each species) and its genus-bootstrap interval for every combination of stratum width (`r paste(width_factors, collapse = ", ")` times the s13 widths) and minimum pixels (`r paste(min_pixels_grid, collapse = ", ")`), with 200 bootstrap replicates each.
+
+*Inputs:* s13/ pixel_strata.rds, record_pixels.rds, taxa.csv
+*Outputs:* sensitivity.csv
+
+```{r sensitivity}
+pix <- readRDS(file.path(dir_s13, "pixel_strata.rds"))
+rec <- readRDS(file.path(dir_s13, "record_pixels.rds"))
+taxa <- fread(file.path(dir_s13, "taxa.csv"), colClasses = c(pool_key = "character"))
+rec[, pool_key := as.character(pool_key)]
+sens_boot <- 200
+
+set.seed(20261029)
+sens <- rbindlist(lapply(width_factors, function(fct) rbindlist(lapply(min_pixels_grid, function(mp) {
+  tabs <- pair_tables(pix, rec, taxa, fct, mp)
+  rbindlist(lapply(pairs, function(pr) {
+    w <- shared_strata(tabs, pr)
+    obs <- if (nrow(w) > 0) standardised(tabs$sp, w, pr) else data.table()
+    if (nrow(obs) < 2) return(data.table(pair = paste(pr, collapse = " vs "), width_factor = fct,
+                                         min_pixels = mp, strata = 0L))
+    bt <- boot_standardised(tabs$sp, w, pr, reps = sens_boot)
+    diff <- if (nrow(bt) > 0) dcast(bt[, .(rep, region, obligate)], rep ~ region,
+                                    value.var = "obligate") else data.table()
+    d <- if (all(pr %in% names(diff))) diff[[pr[1]]] - diff[[pr[2]]] else NA_real_
+    data.table(pair = paste(pr, collapse = " vs "), width_factor = fct, min_pixels = mp,
+               strata = obs$strata[1],
+               difference = obs[region == pr[1]]$obligate - obs[region == pr[2]]$obligate,
+               difference_low = quantile(d, 0.025, na.rm = TRUE),
+               difference_high = quantile(d, 0.975, na.rm = TRUE))
+  }), fill = TRUE)
+}), fill = TRUE)), fill = TRUE)
+write_table(sens, file.path(dir_data_intermediate, "sensitivity.csv"))
+print(sens, digits = 2)
+```
+
+```{r clear_sensitivity, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Genus-weighted composition and its decomposition
+
+For each Mediterranean-climate pool (`s07`) and each biogeographic region (`s05`): the species-weighted share of each strategy, and the genus-weighted share (each genus has weight one, split by the strategies of its classified species). For obligacy, the species-weighted share S equals the genus-weighted share G plus a richness term R = S − G, which is positive when obligate genera are richer in species than other genera. A contrast between two regions is the sum of the difference in G (how many of their genera are obligate) and the difference in R (how species-rich their obligate genera are). Intervals come from resampling genera within each region.
+
+*Inputs:* s07/mediterranean_pool_species.csv; s05/species_regions.csv
+*Outputs:* genus_weighted.csv, decomposition.csv
+
+```{r genus_weighted}
+med <- fread(file.path(dir_s07, "mediterranean_pool_species.csv"))[interaction_type %in% types]
+reg <- fread(file.path(dir_s05, "species_regions.csv"))[interaction_type %in% types & !is.na(region)]
+pools <- rbind(med[, .(level = "Mediterranean-climate pool", unit = med_region, genus,
+                       type = interaction_type)],
+               reg[, .(level = "Biogeographic region", unit = region, genus,
+                       type = interaction_type)])
+
+composition <- function(d) {
+  g <- d[, .(n_sp = .N, obl = mean(type %in% c("m", "p")), n = mean(type == "n"),
+             f = mean(type == "f"), m = mean(type == "m"), p = mean(type == "p")), by = genus]
+  data.table(species = nrow(d), genera = nrow(g),
+             obligate_genera = sum(g$obl > 0),
+             S_obligate = mean(d$type %in% c("m", "p")), G_obligate = mean(g$obl),
+             S_n = mean(d$type == "n"), G_n = mean(g$n), S_f = mean(d$type == "f"), G_f = mean(g$f),
+             S_m = mean(d$type == "m"), G_m = mean(g$m), S_p = mean(d$type == "p"), G_p = mean(g$p),
+             top3_obligate_share = if (sum(d$type %in% c("m", "p")) > 0)
+               sum(head(sort(d[type %in% c("m", "p"), .N, by = genus]$N, decreasing = TRUE), 3)) /
+               sum(d$type %in% c("m", "p")) else NA_real_)
+}
+gw <- pools[, composition(.SD), by = .(level, unit)]
+gw[, R_obligate := S_obligate - G_obligate]
+write_table(gw, file.path(dir_data_intermediate, "genus_weighted.csv"))
+print(gw[, .(level, unit, species, genera, obligate_genera, S_obligate, G_obligate, R_obligate,
+             top3_obligate_share)], digits = 2)
+
+# --- Decomposition of contrasts, with genus bootstrap within each region ---
+comparisons <- list(c("Mediterranean-climate pool", "Cape", "Mediterranean Basin"),
+                    c("Mediterranean-climate pool", "Southern Australia", "Mediterranean Basin"),
+                    c("Biogeographic region", "Southern Africa", "Palearctic"),
+                    c("Biogeographic region", "Australia", "Palearctic"),
+                    c("Biogeographic region", "Southern Africa", "Australia"))
+boot_unit <- function(d) {
+  g <- d[, .(n_sp = .N, k = sum(type %in% c("m", "p"))), by = genus]
+  i <- sample.int(nrow(g), replace = TRUE)
+  c(S = sum(g$k[i]) / sum(g$n_sp[i]), G = mean(g$k[i] / g$n_sp[i]))
+}
+set.seed(20261029)
+decomp <- rbindlist(lapply(comparisons, function(cmp) {
+  a <- pools[level == cmp[1] & unit == cmp[2]]
+  b <- pools[level == cmp[1] & unit == cmp[3]]
+  oa <- gw[level == cmp[1] & unit == cmp[2]]
+  ob <- gw[level == cmp[1] & unit == cmp[3]]
+  bt <- t(replicate(1000, boot_unit(a) - boot_unit(b)))
+  data.table(level = cmp[1], region_1 = cmp[2], region_2 = cmp[3],
+             S_difference = oa$S_obligate - ob$S_obligate,
+             G_difference = oa$G_obligate - ob$G_obligate,
+             R_difference = oa$R_obligate - ob$R_obligate,
+             G_share_of_S = (oa$G_obligate - ob$G_obligate) / (oa$S_obligate - ob$S_obligate),
+             S_low = quantile(bt[, "S"], 0.025), S_high = quantile(bt[, "S"], 0.975),
+             G_low = quantile(bt[, "G"], 0.025), G_high = quantile(bt[, "G"], 0.975))
+}))
+write_table(decomp, file.path(dir_data_intermediate, "decomposition.csv"))
+print(decomp, digits = 2)
+```
+
+```{r clear_genus_weighted, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) Standardised share of each strategy in the climate strata shared by each pair (area weights; 95% intervals from resampling genera). (b) Standardised mean difference of each climate variable between the regions of each pair, before and after matching. (c) Standardised difference in obligacy for every stratum width and minimum number of pixels. (d) Species-weighted against genus-weighted obligate share of each Mediterranean-climate pool and biogeographic region.
+
+*Inputs:* s18/ standardised_shares.csv, balance.csv, sensitivity.csv, genus_weighted.csv
+*Outputs:* plot_shared_climate_audit.png
+
+```{r plot_audit}
+shares <- fread(file.path(dir_data_intermediate, "standardised_shares.csv"))
+balance <- fread(file.path(dir_data_intermediate, "balance.csv"))
+sens <- fread(file.path(dir_data_intermediate, "sensitivity.csv"))
+gw <- fread(file.path(dir_data_intermediate, "genus_weighted.csv"))
+pair_levels <- sapply(pairs, paste, collapse = " vs ")
+
+# --- a: four strategies ---
+sa <- shares[version == "all strata of each species" & weights == "area weights" &
+               type %in% types]
+sa[, `:=`(pair = factor(pair, pair_levels), type = factor(type, types),
+          region = factor(region, rev(med_levels)))]
+panel_a <- ggplot(sa, aes(100 * share, region, colour = type)) +
+  geom_errorbar(aes(xmin = 100 * low, xmax = 100 * high), width = 0, linewidth = 0.5,
+                orientation = "y", position = position_dodge(width = 0.7)) +
+  geom_point(size = 1.8, position = position_dodge(width = 0.7)) +
+  facet_wrap(~ pair, ncol = 2, scales = "free_y") +
+  scale_colour_manual(values = type_colours, labels = type_labels, name = NULL) +
+  labs(x = "Standardised share of classified species (%)", y = NULL,
+       title = "Strategies within shared climate strata") +
+  theme_figure()
+
+# --- b: balance ---
+bl <- melt(balance, id.vars = c("pair", "variable"), variable.name = "stage", value.name = "smd")
+bl[, `:=`(pair = factor(pair, pair_levels), variable = factor(climate_labels[variable],
+                                                                rev(climate_labels)),
+          stage = factor(c(smd_before = "Before matching", smd_after = "After matching")[stage],
+                         c("Before matching", "After matching")))]
+panel_b <- ggplot(bl, aes(smd, variable, shape = stage)) +
+  annotate("rect", xmin = -0.25, xmax = 0.25, ymin = -Inf, ymax = Inf, fill = "grey93") +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_point(size = 2, fill = "white") +
+  facet_wrap(~ pair, ncol = 2) +
+  scale_shape_manual(values = c(21, 16), name = NULL) +
+  labs(x = "Standardised mean difference (grey band: |SMD| < 0.25)", y = NULL,
+       title = "Climate balance before and after matching") +
+  theme_figure()
+
+# --- c: sensitivity ---
+sens <- sens[strata > 0]
+sens[, `:=`(pair = factor(pair, pair_levels), grain = factor(paste0("×", width_factor)))]
+panel_c <- ggplot(sens, aes(grain, 100 * difference, colour = factor(min_pixels))) +
+  geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(ymin = 100 * difference_low, ymax = 100 * difference_high), width = 0,
+                linewidth = 0.5, position = position_dodge(width = 0.6)) +
+  geom_point(size = 1.8, position = position_dodge(width = 0.6)) +
+  facet_wrap(~ pair, ncol = 2) +
+  scale_colour_manual(values = c(`1` = "#9A9A9A", `5` = "#3B3B3B", `10` = "#B73779"),
+                      name = "Minimum pixels") +
+  labs(x = "Stratum width (multiple of the main strata)",
+       y = "Difference in obligate share (points)",
+       title = "Robust to the definition of the strata") +
+  theme_figure()
+
+# --- d: genus weighting ---
+gw[, label := ifelse(level == "Biogeographic region", unit, paste0(unit, " (Cs)"))]
+panel_d <- ggplot(gw, aes(100 * G_obligate, 100 * S_obligate, shape = level)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_point(size = 2.2, fill = "white") +
+  geom_text(data = gw[S_obligate > 0.05], aes(label = label), size = 2.3, hjust = -0.12,
+            colour = "grey25") +
+  scale_shape_manual(values = c(16, 21), name = NULL) +
+  coord_cartesian(xlim = c(0, 75), ylim = c(0, 75)) +
+  labs(x = "Genus-weighted obligate share (%)", y = "Species-weighted obligate share (%)",
+       title = "Obligate genera are species-rich") +
+  theme_figure()
+
+fig <- (panel_a | panel_b) / (panel_c | panel_d) +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")")
+save_figure(fig, "plot_shared_climate_audit", 12, 10)
+fig
+```
+
+```{r clear_plot_audit, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

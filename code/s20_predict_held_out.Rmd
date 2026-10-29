@@ -1,0 +1,376 @@
+---
+title: "Lycaenidae ant-interaction climate 20 - predicting held-out realms and subfamilies"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+`s04`, `s06` and `s12` summarised out-of-sample prediction as one pooled deviance explained per fold scheme. An external review (29 October 2026) asked for the predictions to be reported per held-out unit, with calibration, uncertainty, baselines and the climatic novelty of the held-out species. This notebook predicts the strategy of every classified species twice:
+
+1. **Held-out realms.** Each of the eight regions of `s05` in turn is predicted from the species of the other seven (each species in its majority region). This asks whether the geography of strategies in one part of the world can be predicted from climate, or from lineage, as learned elsewhere.
+2. **Held-out subfamilies.** Each subfamily in turn is predicted from the others. Here lineage is unknown by design, so only climate and geography can predict.
+
+Five models are compared for each contrast (ant-associated vs non-associated; obligate vs facultative; parasite vs mutualist):
+
+- **baseline**: the share of the outcome among the training species;
+- **climate**: the six climate predictors of `s04`;
+- **latitude × hemisphere**: absolute latitude, hemisphere and their interaction (`s06`);
+- **lineage**: random intercepts of subfamily and genus;
+- **lineage + climate**.
+
+For each held-out unit and model: the predicted and observed share of the outcome (calibration in the large), the area under the ROC curve (discrimination; species of the unit only), the deviance explained relative to the baseline, and the calibration slope. Intervals come from resampling genera within the held-out unit (the predictions are fixed; the resampling expresses how much the metric depends on which lineages the unit happens to contain). The climatic novelty of each held-out species is its Mahalanobis distance from the training species in the six climate predictors, called novel when beyond the 99th percentile of the training species' own distances; the metrics are also given for the non-novel species only.
+
+A full run takes about 10 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(mgcv)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+# Predictors of s04 (present and past climate)
+climate_vars <- c("bio01", "log_aridity", "bio15", "lgm_anomaly_temperature",
+                  "lgm_anomaly_log_precipitation", "log10_velocity_temperature")
+
+# Nested contrasts as in s04
+contrasts <- list(associated = list(rows = c("n", "f", "m", "p"), success = c("f", "m", "p"),
+                                    label = "Ant-associated vs non-associated"),
+                  obligate = list(rows = c("f", "m", "p"), success = c("m", "p"),
+                                  label = "Obligate vs facultative"),
+                  parasite = list(rows = c("m", "p"), success = "p",
+                                  label = "Parasite vs mutualist"))
+
+# Models
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+models <- c(baseline = "1", climate = paste(climate_vars, collapse = " + "),
+            `latitude x hemisphere` = "abs_latitude * hemisphere", lineage = lineage,
+            `lineage + climate` = paste(paste(climate_vars, collapse = " + "), "+", lineage))
+model_labels <- c(baseline = "Baseline", climate = "Climate",
+                  `latitude x hemisphere` = "Latitude × hemisphere", lineage = "Lineage",
+                  `lineage + climate` = "Lineage + climate")
+model_colours <- c(baseline = "#9A9A9A", climate = "#B73779", `latitude x hemisphere` = "#009E73",
+                   lineage = "#3B3B3B", `lineage + climate` = "#56B4E9")
+
+# Genus bootstrap replicates within each held-out unit; quantile of training distances
+# beyond which a held-out species is climatically novel
+n_boot <- 1000
+novelty_quantile <- 0.99
+
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+types <- c("n", "f", "m", "p")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_data_intermediate <- path_resrepo("data/intermediate/s20_predict_held_out")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Binomial deviance of 0/1 outcomes y under probabilities q
+binary_deviance <- function(y, q) {
+  q <- pmin(pmax(q, 1e-9), 1 - 1e-9)
+  -2 * sum(y * log(q) + (1 - y) * log(1 - q))
+}
+
+# Area under the ROC curve (Mann-Whitney); NA unless both outcomes occur
+auc <- function(y, q) {
+  if (length(unique(y)) < 2) return(NA_real_)
+  r <- rank(q)
+  n1 <- sum(y == 1)
+  n0 <- sum(y == 0)
+  (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+# Metrics of held-out predictions q against the training share q0
+metrics <- function(y, q, q0) {
+  slope <- if (length(unique(y)) == 2 && length(y) >= 10 && sd(qlogis(q)) > 1e-6)
+    unname(coef(suppressWarnings(glm(y ~ qlogis(pmin(pmax(q, 1e-6), 1 - 1e-6)),
+                                     family = binomial)))[2]) else NA_real_
+  c(observed = mean(y), predicted = mean(q), auc = auc(y, q),
+    d2 = 1 - binary_deviance(y, q) / binary_deviance(y, q0), brier = mean((y - q)^2),
+    calibration_slope = slope)
+}
+
+# Genus bootstrap of the metrics of one held-out unit
+boot_metrics <- function(d, reps = n_boot) {
+  idx <- split(seq_len(nrow(d)), d$genus)
+  t(replicate(reps, {
+    i <- unlist(idx[sample.int(length(idx), replace = TRUE)], use.names = FALSE)
+    metrics(d$y[i], d$q[i], d$q0[i])
+  }))
+}
+
+# Species of a contrast, coded 0/1, with predictors standardised over these species
+contrast_data <- function(sp, ct) {
+  d <- copy(sp[interaction_type %in% contrasts[[ct]]$rows])
+  d[, y := as.integer(interaction_type %in% contrasts[[ct]]$success)]
+  for (v in c(climate_vars, "abs_latitude")) set(d, j = v, value = as.numeric(scale(d[[v]])))
+  d[, `:=`(genus = factor(genus), subfamily = factor(subfamily), hemisphere = factor(hemisphere))]
+  d
+}
+
+# Held-out predictions of every model for the species of one held-out unit. GAMs keep the factor
+# levels of all species (an unseen genus or subfamily gets a random effect of 0) and the
+# random-effect variances of the fit to all species (as in s12)
+predict_unit <- function(d, test, sps) {
+  train <- d[!test]
+  out <- d[test, .(pool_key, genus, subfamily, region, y)]
+  out[, q0 := mean(train$y)]
+  # Climatic novelty: Mahalanobis distance from the training species
+  X <- as.matrix(train[, climate_vars, with = FALSE])
+  S <- cov(X)
+  mu <- colMeans(X)
+  limit <- quantile(mahalanobis(X, mu, S), novelty_quantile)
+  out[, novelty := mahalanobis(as.matrix(d[test, climate_vars, with = FALSE]), mu, S)]
+  out[, novel := novelty > limit]
+  preds <- lapply(names(models), function(mo) {
+    if (mo == "baseline") return(rep(mean(train$y), sum(test)))
+    if (grepl("s\\(", models[[mo]])) {
+      m <- gam(as.formula(paste("y ~", models[[mo]])), data = train, family = binomial,
+               sp = sps[[mo]], drop.unused.levels = FALSE)
+      return(as.numeric(predict(m, newdata = d[test], type = "response")))
+    }
+    X <- model.matrix(as.formula(paste("~", models[[mo]])), data = d)
+    fit <- suppressWarnings(glm.fit(X[!test, , drop = FALSE], train$y, family = binomial()))
+    b <- fit$coefficients
+    b[is.na(b)] <- 0
+    as.numeric(plogis(X[test, , drop = FALSE] %*% b))
+  })
+  rbindlist(lapply(seq_along(models), function(i)
+    copy(out)[, `:=`(model = names(models)[i], q = preds[[i]])]))
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom", plot.tag = element_text(face = "bold", size = 11))
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Held-out predictions
+
+The classified species with complete climate predictors and a majority region (`s05`), with the median signed latitude of their records for the hemisphere.
+
+*Inputs:* s05/species_regions.csv; s02/species_records.rds
+*Outputs:* held_out_predictions.csv
+
+```{r held_out_predictions}
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+sp <- sp[interaction_type %in% types & !is.na(region)]
+sp <- sp[complete.cases(sp[, c(climate_vars, "abs_latitude"), with = FALSE])]
+x <- readRDS(file.path(dir_s02, "species_records.rds"))
+x[, pool_key := as.character(pool_key)]
+lat <- x[pool_key %in% sp$pool_key, .(signed_latitude = median(decimalLatitude)), by = pool_key]
+sp <- merge(sp, lat, by = "pool_key")
+sp[, hemisphere := ifelse(signed_latitude < 0, "South", "North")]
+rm(x)
+print(sp[, .N, by = .(region, interaction_type)][order(region, interaction_type)])
+
+pred <- rbindlist(lapply(names(contrasts), function(ct) {
+  d <- contrast_data(sp, ct)
+  # Random-effect variances from the fit to all species of the contrast
+  sps <- lapply(models[grepl("s\\(", models)], function(rhs)
+    gam(as.formula(paste("y ~", rhs)), data = d, family = binomial, method = "REML")$sp)
+  schemes <- list(`held-out realm` = d$region, `held-out subfamily` = as.character(d$subfamily))
+  rbindlist(lapply(names(schemes), function(s) rbindlist(lapply(unique(schemes[[s]]), function(u) {
+    test <- schemes[[s]] == u
+    if (sum(test) < 5 || length(unique(d$y[!test])) < 2) return(NULL)
+    predict_unit(d, test, sps)[, `:=`(contrast = ct, scheme = s, unit = u)]
+  }))))
+}))
+write_table(pred, file.path(dir_data_intermediate, "held_out_predictions.csv"))
+```
+
+```{r clear_held_out_predictions, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Metrics per held-out unit, with genus-bootstrap intervals
+
+*Inputs:* s20/held_out_predictions.csv
+*Outputs:* held_out_metrics.csv, held_out_pooled.csv
+
+```{r held_out_metrics}
+pred <- fread(file.path(dir_data_intermediate, "held_out_predictions.csv"),
+              colClasses = c(pool_key = "character"))
+set.seed(20261029)
+met <- pred[, {
+  m <- metrics(y, q, q0)
+  b <- boot_metrics(.SD)
+  ci <- apply(b, 2, quantile, c(0.025, 0.975), na.rm = TRUE)
+  nn <- !novel
+  m_nn <- if (sum(nn) >= 5) metrics(y[nn], q[nn], q0[nn]) else rep(NA_real_, length(m))
+  c(list(species = .N, genera = uniqueN(genus), events = sum(y), novel_share = mean(novel)),
+    as.list(m), setNames(as.list(ci[1, ]), paste0(names(m), "_low")),
+    setNames(as.list(ci[2, ]), paste0(names(m), "_high")),
+    setNames(as.list(m_nn), paste0(names(m), "_not_novel")))
+}, by = .(contrast, scheme, unit, model)]
+write_table(met, file.path(dir_data_intermediate, "held_out_metrics.csv"))
+print(met[contrast == "obligate", .(scheme, unit, model, species, events, observed, predicted,
+                                    auc, d2, novel_share)], digits = 2)
+
+# --- Pooled over all held-out units, with genus bootstrap over all species ---
+pooled <- pred[, {
+  m <- metrics(y, q, q0)
+  b <- boot_metrics(.SD, 500)
+  ci <- apply(b, 2, quantile, c(0.025, 0.975), na.rm = TRUE)
+  c(list(species = .N), as.list(m), setNames(as.list(ci[1, ]), paste0(names(m), "_low")),
+    setNames(as.list(ci[2, ]), paste0(names(m), "_high")))
+}, by = .(contrast, scheme, model)]
+write_table(pooled, file.path(dir_data_intermediate, "held_out_pooled.csv"))
+print(pooled[, .(contrast, scheme, model, auc, auc_low, auc_high, d2, d2_low, d2_high)],
+      digits = 2)
+```
+
+```{r clear_held_out_metrics, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Calibration
+
+Held-out predictions of each model pooled over the units of a scheme, in ten bins of predicted probability: the mean predicted probability against the observed share.
+
+*Inputs:* s20/held_out_predictions.csv
+*Outputs:* calibration_bins.csv
+
+```{r calibration}
+pred <- fread(file.path(dir_data_intermediate, "held_out_predictions.csv"),
+              colClasses = c(pool_key = "character"))
+pred[, bin := cut(q, breaks = seq(0, 1, 0.1), include.lowest = TRUE)]
+cal <- pred[, .(species = .N, predicted = mean(q), observed = mean(y)),
+            by = .(contrast, scheme, model, bin)]
+write_table(cal[order(contrast, scheme, model, bin)],
+            file.path(dir_data_intermediate, "calibration_bins.csv"))
+```
+
+```{r clear_calibration, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) Held-out realms: the observed share of obligate species among associated species in each realm against the share predicted from the other realms by each model, with 95% genus-bootstrap intervals of the prediction-observation pair omitted for clarity (they are in the table); the diagonal is perfect calibration. (b) Discrimination within each held-out realm (AUC, 95% genus-bootstrap intervals; 0.5 is no better than chance). (c, d) The same for held-out subfamilies. (e) Pooled deviance explained of each model and contrast for both schemes, with 95% genus-bootstrap intervals.
+
+*Inputs:* s20/ held_out_metrics.csv, held_out_pooled.csv
+*Outputs:* plot_held_out.png
+
+```{r plot_held_out}
+met <- fread(file.path(dir_data_intermediate, "held_out_metrics.csv"))
+pooled <- fread(file.path(dir_data_intermediate, "held_out_pooled.csv"))
+show <- c("baseline", "climate", "latitude x hemisphere", "lineage", "lineage + climate")
+met <- met[model %in% show]
+met[, model := factor(model, show)]
+
+calibration_panel <- function(s, title) {
+  d <- met[contrast == "obligate" & scheme == s]
+  ggplot(d, aes(100 * observed, 100 * predicted, colour = model)) +
+    geom_abline(slope = 1, intercept = 0, colour = "grey70", linewidth = 0.4) +
+    geom_point(size = 2.2, alpha = 0.9) +
+    geom_text(data = d[model == "lineage"], aes(label = unit), colour = "grey30", size = 2.4,
+              hjust = -0.12, vjust = 0.5) +
+    scale_colour_manual(values = model_colours, labels = model_labels, limits = names(models),
+                        name = NULL) +
+    coord_equal(xlim = c(0, 100), ylim = c(0, 100), clip = "off") +
+    labs(x = "Observed obligate share (%)", y = "Predicted obligate share (%)", title = title) +
+    theme_figure()
+}
+auc_panel <- function(s, title) {
+  d <- met[contrast == "obligate" & scheme == s & model != "baseline" & !is.na(auc)]
+  d[, unit := factor(unit, rev(sort(unique(unit))))]
+  ggplot(d, aes(auc, unit, colour = model)) +
+    geom_vline(xintercept = 0.5, colour = "grey60", linewidth = 0.4) +
+    geom_errorbar(aes(xmin = auc_low, xmax = auc_high), width = 0, linewidth = 0.5,
+                  orientation = "y", position = position_dodge(width = 0.7)) +
+    geom_point(size = 1.8, position = position_dodge(width = 0.7)) +
+    scale_colour_manual(values = model_colours, labels = model_labels, limits = names(models),
+                        name = NULL) +
+    scale_x_continuous(limits = c(0, 1)) +
+    labs(x = "Discrimination within the unit (AUC)", y = NULL, title = title) +
+    theme_figure()
+}
+
+pooled <- pooled[model %in% show]
+pooled[, `:=`(model = factor(model, rev(show)),
+              contrast = factor(sapply(contrasts, `[[`, "label")[contrast],
+                                sapply(contrasts, `[[`, "label")))]
+panel_e <- ggplot(pooled, aes(d2, model, colour = model)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = d2_low, xmax = d2_high), width = 0, linewidth = 0.5,
+                orientation = "y") +
+  geom_point(size = 2) +
+  facet_grid(scheme ~ contrast, scales = "free_x") +
+  scale_colour_manual(values = model_colours, labels = model_labels, guide = "none") +
+  scale_y_discrete(labels = model_labels) +
+  labs(x = "Held-out deviance explained relative to the training share", y = NULL,
+       title = "All held-out species") +
+  theme_figure()
+
+fig <- (calibration_panel("held-out realm", "Held-out realms: calibration") |
+          auc_panel("held-out realm", "Held-out realms: discrimination")) /
+  (calibration_panel("held-out subfamily", "Held-out subfamilies: calibration") |
+     auc_panel("held-out subfamily", "Held-out subfamilies: discrimination")) /
+  panel_e +
+  plot_layout(guides = "collect", heights = c(1, 1, 0.9)) +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")") &
+  theme(legend.position = "bottom")
+save_figure(fig, "plot_held_out", 10, 13)
+fig
+```
+
+```{r clear_plot_held_out, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

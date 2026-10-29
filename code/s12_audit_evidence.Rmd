@@ -1,0 +1,436 @@
+---
+title: "Lycaenidae ant-interaction climate 12 - evidence behind the strategies, and lineage out of sample"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+The interaction types of `butterfly_ant_interactions` rest on three kinds of evidence (`interaction_type_basis`): records for the species itself (`direct`); a directly recorded class (obligate) with the subtype (mutualist or parasite) inferred (`direct_class_inferred_subtype`); and statements by the sources about relatives or whole genera (`presumed_relatives`). Types presumed from relatives make congeners similar by construction, so the high share of variation described by lineage (`s04`) is partly an assumption of the data. An external review of the study (28 October 2026) asked for an auditable account of this evidence and for the main results to be repeated with species-specific evidence only. This notebook:
+
+1. tabulates the evidence of the classified species by region, strategy and lineage, and the share of each region's recorded species that is classified;
+2. measures how well lineage and climate predict the strategies of species *not used to fit the model* (cross-validation), with all species and with species-specific evidence only, rather than the in-sample deviance explained of `s04`;
+3. repeats the tests of `s06` (stability against southern geography) with species-specific evidence only.
+
+Species-specific evidence means `direct` or `direct_class_inferred_subtype` for the contrasts of association and obligacy, and `direct` only for parasite against mutualist.
+
+A full run takes about 30 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(mgcv)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+# Predictors of s04 (present and past climate)
+climate_vars <- c("bio01", "log_aridity", "bio15", "lgm_anomaly_temperature",
+                  "lgm_anomaly_log_precipitation", "log10_velocity_temperature")
+
+# Nested contrasts as in s04, with the evidence accepted as species-specific for each
+contrasts <- list(
+  associated = list(rows = c("n", "f", "m", "p"), success = c("f", "m", "p"),
+                    specific = c("direct", "direct_class_inferred_subtype"),
+                    label = "Ant-associated vs\nnon-associated"),
+  obligate = list(rows = c("f", "m", "p"), success = c("m", "p"),
+                  specific = c("direct", "direct_class_inferred_subtype"),
+                  label = "Obligate vs\nfacultative"),
+  parasite = list(rows = c("m", "p"), success = "p", specific = "direct",
+                  label = "Parasite vs\nmutualist"))
+
+# Cross-validation: ten folds, repeated
+n_folds <- 10
+cv_repeats <- 3
+
+# Regions and colours as in s05 and butterfly_ant_interactions
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+type_labels <- c(n = "Non-associated", f = "Facultative", m = "Obligate mutualist",
+                 p = "Obligate parasite")
+evidence_labels <- c(all = "All classified species", specific = "Species-specific evidence")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_s06 <- path_resrepo("data/intermediate/s06_test_stability")
+dir_data_intermediate <- path_resrepo("data/intermediate/s12_audit_evidence")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Evidence basis of every species unit of the parent study
+read_basis <- function() {
+  fread(file.path(dir_data_raw, "butterfly_ant_interactions", "species_table.csv"),
+        colClasses = c(pool_key = "character"))[, .(pool_key, interaction_type_basis)]
+}
+
+# Classified species with complete climate predictors (as in s04), with their evidence basis;
+# predictors standardised over all of them
+read_species <- function() {
+  sp <- fread(file.path(dir_s02, "species_climate.csv"), colClasses = c(pool_key = "character"))
+  sp <- sp[interaction_type %in% names(type_colours)]
+  sp[, log_aridity := log10(aridity_index)]
+  sp <- sp[complete.cases(sp[, climate_vars, with = FALSE])]
+  for (v in climate_vars) set(sp, j = v, value = as.numeric(scale(sp[[v]])))
+  merge(sp, read_basis(), by = "pool_key")
+}
+
+# The species of a contrast, with all evidence or species-specific evidence only, coded 0/1
+contrast_data <- function(sp, ct, evidence) {
+  d <- sp[interaction_type %in% contrasts[[ct]]$rows]
+  if (evidence == "specific") d <- d[interaction_type_basis %in% contrasts[[ct]]$specific]
+  d <- copy(d)
+  d[, `:=`(y = as.integer(interaction_type %in% contrasts[[ct]]$success),
+           genus = factor(genus), subfamily = factor(subfamily))]
+  d
+}
+
+# Binomial deviance of 0/1 outcomes y under probabilities q
+binary_deviance <- function(y, q) {
+  q <- pmin(pmax(q, 1e-9), 1 - 1e-9)
+  -2 * sum(y * log(q) + (1 - y) * log(1 - q))
+}
+
+# Cross-validated deviance explained of a binomial GAM with right-hand side `rhs`: each group
+# of `fold` is predicted by a model fitted to the others (with the factor levels of all species,
+# so that an unseen genus or subfamily gets a random effect of 0), against the outcome
+# proportion of the training species. The random-effect variances (smoothing parameters `sp`)
+# are those estimated on all species, which makes each fit five times faster; refitting them
+# in each fold changed held-out predictions little in a trial (r = 0.9999)
+gam_cv_d2 <- function(d, rhs, fold, sp) {
+  q <- q0 <- numeric(nrow(d))
+  for (k in unique(fold)) {
+    test <- fold == k
+    m <- gam(as.formula(paste("y ~", rhs)), data = d[!test], family = binomial, sp = sp,
+             drop.unused.levels = FALSE)
+    q[test] <- predict(m, newdata = d[test], type = "response")
+    q0[test] <- mean(d$y[!test])
+  }
+  1 - binary_deviance(d$y, q) / binary_deviance(d$y, q0)
+}
+
+# Cross-validated deviance explained of a logistic regression (as in s06)
+glm_cv_d2 <- function(d, rhs, fold) {
+  X <- model.matrix(as.formula(paste("~", rhs)), data = d)
+  q <- q0 <- numeric(nrow(d))
+  for (k in unique(fold)) {
+    test <- fold == k
+    fit <- suppressWarnings(glm.fit(X[!test, , drop = FALSE], d$y[!test], family = binomial()))
+    b <- fit$coefficients
+    b[is.na(b)] <- 0
+    q[test] <- plogis(X[test, , drop = FALSE] %*% b)
+    q0[test] <- mean(d$y[!test])
+  }
+  1 - binary_deviance(d$y, q) / binary_deviance(d$y, q0)
+}
+
+# Random folds of species, or of whole genera
+species_folds <- function(d) sample(rep_len(seq_len(n_folds), nrow(d)))
+genus_folds <- function(d) {
+  g <- levels(d$genus)
+  setNames(sample(rep_len(seq_len(n_folds), length(g))), g)[as.character(d$genus)]
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Evidence and completeness by region, strategy and lineage
+
+Every species unit with cleaned records is counted in its majority region (`s05`) as unclassified or by strategy and evidence. Completeness is the share of a region's recorded species that is classified. The second table gives the same counts by subfamily within each region.
+
+*Inputs:* s05/species_regions.csv; raw/butterfly_ant_interactions/species_table.csv
+*Outputs:* coverage_regions.csv, coverage_lineages.csv
+
+```{r coverage}
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+sp <- merge(sp, read_basis(), by = "pool_key", all.x = TRUE)
+sp[, `:=`(
+  strategy = fifelse(interaction_type %in% names(type_colours), interaction_type, "unclassified"),
+  evidence = fcase(interaction_type_basis == "direct", "direct",
+                   interaction_type_basis == "direct_class_inferred_subtype",
+                   "class direct, subtype inferred",
+                   interaction_type_basis == "presumed_relatives", "presumed from relatives",
+                   default = "none"))]
+sp[strategy == "unclassified", evidence := "none"]
+
+regions <- sp[, .N, by = .(region, strategy, evidence)]
+regions[, `:=`(recorded = sum(N), classified = sum(N[strategy != "unclassified"])), by = region]
+write_table(regions[order(factor(region, region_levels), strategy, evidence)],
+            file.path(dir_data_intermediate, "coverage_regions.csv"))
+lineages <- sp[strategy != "unclassified", .N, by = .(region, subfamily, strategy, evidence)]
+write_table(lineages[order(factor(region, region_levels), subfamily, strategy, evidence)],
+            file.path(dir_data_intermediate, "coverage_lineages.csv"))
+
+# --- Summaries ---
+cat("Completeness by region (classified / recorded species):\n")
+print(unique(regions[, .(region, recorded, classified,
+                         completeness = round(classified / recorded, 2))])[
+  order(factor(region, region_levels))])
+cat("\nShare of each strategy presumed from relatives:\n")
+print(sp[strategy != "unclassified", .(classified = .N,
+                                       presumed = round(mean(evidence == "presumed from relatives"),
+                                                        2)), by = strategy])
+cat("\nShare presumed from relatives by region and strategy:\n")
+print(dcast(sp[strategy != "unclassified",
+               .(presumed = round(mean(evidence == "presumed from relatives"), 2)),
+               by = .(region, strategy)], region ~ strategy, value.var = "presumed"))
+```
+
+```{r clear_coverage, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Lineage and climate out of sample
+
+For each contrast and evidence set, four models are compared by deviance explained in sample and by cross-validation (ten folds, three repeats):
+
+- **lineage**: random intercepts of subfamily and genus;
+- **climate**: the six predictors of `s04`;
+- **lineage + climate**;
+- for held-out genera only, climate-only models are the transfer test of `s04`.
+
+Two fold schemes answer different questions. With **random species folds**, a held-out species usually has classified congeners in the training data: this is how well knowing a species' genus predicts its strategy. With **whole genera held out**, only the subfamily is known: this is how well lineage predicts beyond the genus. If the high in-sample lineage share of `s04` were mainly an artefact of types presumed from relatives, it should fall with species-specific evidence only.
+
+*Inputs:* s02/species_climate.csv; raw/butterfly_ant_interactions/species_table.csv
+*Outputs:* lineage_out_of_sample.csv
+
+```{r lineage_out_of_sample}
+sp <- read_species()
+f_climate <- paste(climate_vars, collapse = " + ")
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+models <- c(lineage = lineage, climate = f_climate,
+            `lineage + climate` = paste(f_climate, "+", lineage))
+
+set.seed(20261029)
+res <- rbindlist(lapply(names(contrasts), function(ct) rbindlist(lapply(names(evidence_labels),
+                                                                         function(ev) {
+  d <- contrast_data(sp, ct, ev)
+  # --- In sample; the random-effect variances are kept for the cross-validation ---
+  fits <- lapply(models, function(rhs) gam(as.formula(paste("y ~", rhs)), data = d,
+                                           family = binomial, method = "REML"))
+  ins <- data.table(model = names(models), scheme = "in sample", repeat_id = 1L,
+                    d2 = sapply(fits, function(m) summary(m)$dev.expl))
+  # --- Cross-validated, species and genus folds ---
+  cv <- rbindlist(lapply(seq_len(cv_repeats), function(r) {
+    folds <- list(`species held out` = species_folds(d), `genera held out` = genus_folds(d))
+    rbindlist(lapply(names(folds), function(s) rbindlist(lapply(names(models), function(mo)
+      data.table(model = mo, scheme = s, repeat_id = r,
+                 d2 = if (mo == "climate") glm_cv_d2(d, models[[mo]], folds[[s]])
+                      else gam_cv_d2(d, models[[mo]], folds[[s]], fits[[mo]]$sp))))))
+  }))
+  rbind(ins, cv)[, `:=`(contrast = ct, evidence = ev, species = nrow(d), events = sum(d$y),
+                        genera = nlevels(d$genus))]
+}))))
+write_table(res, file.path(dir_data_intermediate, "lineage_out_of_sample.csv"))
+print(dcast(res[, .(d2 = round(median(d2), 3)), by = .(contrast, evidence, scheme, model)],
+            contrast + evidence + scheme ~ model, value.var = "d2"))
+```
+
+```{r clear_lineage_out_of_sample, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Stability against southern geography with species-specific evidence
+
+The cross-validation of `s06` (held-out subfamilies; held-out genera in ten groups, three repeats) and the effect of the LGM temperature anomaly on obligacy given region and lineage, with all associated species and with species-specific evidence only.
+
+*Inputs:* s06/species_stability.csv; raw/butterfly_ant_interactions/species_table.csv
+*Outputs:* stability_evidence_cv.csv, stability_evidence_effects.csv
+
+```{r stability_evidence}
+st <- fread(file.path(dir_s06, "species_stability.csv"), colClasses = c(pool_key = "character"))
+st <- merge(st, read_basis(), by = "pool_key")
+sets <- c(region = "region", anomaly = "lgm_anomaly_temperature_z",
+          `region + anomaly` = "region + lgm_anomaly_temperature_z",
+          `latitude x hemisphere` = "abs_latitude_z * hemisphere",
+          `latitude x hemisphere + anomaly` =
+            "abs_latitude_z * hemisphere + lgm_anomaly_temperature_z")
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+
+set.seed(20261029)
+cv <- list()
+effects <- list()
+for (ev in names(evidence_labels)) {
+  d <- if (ev == "specific") st[interaction_type_basis %in% contrasts$obligate$specific] else st
+  d <- copy(d)
+  d[, `:=`(region = factor(region), hemisphere = factor(hemisphere), genus = factor(genus),
+           subfamily = factor(subfamily))]
+  # Predictors restandardised over the species analysed
+  for (v in c("lgm_anomaly_temperature", "abs_latitude"))
+    set(d, j = paste0(v, "_z"), value = as.numeric(scale(d[[v]])))
+
+  # --- Prediction of held-out subfamilies and genera ---
+  folds <- c(list(subfamily = as.character(d$subfamily)),
+             setNames(lapply(seq_len(cv_repeats), function(r) genus_folds(d)),
+                      paste0("genus_", seq_len(cv_repeats))))
+  cv[[ev]] <- rbindlist(lapply(names(sets), function(s) rbindlist(lapply(names(folds), function(f)
+    data.table(evidence = ev, set = s, scheme = sub("_[0-9]+$", "", f),
+               cv_d2 = glm_cv_d2(d, sets[[s]], folds[[f]]))))))
+
+  # --- Anomaly given region and lineage, and within genera ---
+  d[, `:=`(anomaly_within = lgm_anomaly_temperature_z - ave(lgm_anomaly_temperature_z, genus),
+           anomaly_between = ave(lgm_anomaly_temperature_z, genus))]
+  fits <- list(
+    `Given region and lineage` = list(rhs = "region + lgm_anomaly_temperature_z",
+                                      term = "lgm_anomaly_temperature_z"),
+    `Given lineage only` = list(rhs = "lgm_anomaly_temperature_z",
+                                term = "lgm_anomaly_temperature_z"),
+    `Within genera` = list(rhs = "region + anomaly_within + anomaly_between",
+                           term = "anomaly_within"))
+  effects[[ev]] <- rbindlist(lapply(names(fits), function(a) {
+    m <- gam(as.formula(paste("y ~", fits[[a]]$rhs, "+", lineage)), data = d, family = binomial,
+             method = "REML")
+    cf <- summary(m)$p.table[fits[[a]]$term, ]
+    data.table(evidence = ev, analysis = a, species = nrow(d), obligate = sum(d$y),
+               estimate = cf[1], se = cf[2], p = cf[4])
+  }))
+}
+cv <- rbindlist(cv)
+effects <- rbindlist(effects)
+write_table(cv, file.path(dir_data_intermediate, "stability_evidence_cv.csv"))
+write_table(effects, file.path(dir_data_intermediate, "stability_evidence_effects.csv"))
+print(dcast(cv[, .(cv_d2 = round(median(cv_d2), 3)), by = .(evidence, set, scheme)],
+            set ~ evidence + scheme, value.var = "cv_d2"))
+print(effects, digits = 3)
+```
+
+```{r clear_stability_evidence, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(A) Recorded species of each region by strategy and evidence (light: presumed from relatives), with the unclassified species. (B) Deviance explained by lineage, climate and both, in sample and for held-out species and held-out genera (medians of three repeats), with all species and species-specific evidence only. (C) Prediction of held-out subfamilies and genera by region, latitude and hemisphere and the LGM anomaly (`s06`), with both evidence sets.
+
+*Inputs:* s12/ coverage_regions.csv, lineage_out_of_sample.csv, stability_evidence_cv.csv
+*Outputs:* plot_evidence.png
+
+```{r plot_evidence}
+regions <- fread(file.path(dir_data_intermediate, "coverage_regions.csv"))
+oos <- fread(file.path(dir_data_intermediate, "lineage_out_of_sample.csv"))
+scv <- fread(file.path(dir_data_intermediate, "stability_evidence_cv.csv"))
+base <- theme_minimal(base_size = 8.5) +
+  theme(panel.grid.minor = element_blank(), plot.title = element_text(face = "bold", size = 9.5),
+        legend.position = "bottom")
+
+# --- A: evidence and completeness by region ---
+regions[, `:=`(
+  region = factor(region, rev(region_levels)),
+  key = fifelse(strategy == "unclassified", "Unclassified",
+                paste(type_labels[strategy],
+                      fifelse(evidence == "presumed from relatives", "(presumed)", "(species)"))))]
+key_levels <- c(as.vector(t(outer(type_labels, c("(species)", "(presumed)"), paste))),
+                "Unclassified")
+key_fill <- setNames(c(as.vector(rbind(type_colours, scales::alpha(type_colours, 0.4))),
+                       "grey88"), key_levels)
+regions[, key := factor(key, rev(key_levels))]
+completeness <- unique(regions[, .(region, recorded, classified)])
+panel_a <- ggplot(regions[, .(N = sum(N)), by = .(region, key)], aes(N, region, fill = key)) +
+  geom_col(width = 0.75, colour = "white", linewidth = 0.15) +
+  geom_text(data = completeness, aes(x = recorded, y = region,
+                                     label = paste0(round(100 * classified / recorded), "%")),
+            inherit.aes = FALSE, hjust = -0.15, size = 2.3, colour = "grey30") +
+  scale_fill_manual(values = key_fill, breaks = key_levels, name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(x = "Recorded species (label: share classified)", y = NULL,
+       title = "Evidence behind the strategies") +
+  guides(fill = guide_legend(ncol = 3)) +
+  base
+
+# --- B: lineage and climate in and out of sample ---
+oos_sum <- oos[, .(d2 = median(d2)), by = .(contrast, evidence, scheme, model)]
+oos_sum[, `:=`(
+  contrast = factor(sapply(contrasts, `[[`, "label")[contrast],
+                    sapply(contrasts, `[[`, "label")),
+  scheme = factor(scheme, c("in sample", "species held out", "genera held out")),
+  model = factor(model, c("lineage", "climate", "lineage + climate")),
+  evidence = factor(evidence_labels[evidence], evidence_labels))]
+panel_b <- ggplot(oos_sum, aes(scheme, 100 * d2, colour = model, shape = evidence,
+                               group = interaction(model, evidence))) +
+  geom_hline(yintercept = 0, colour = "grey55", linewidth = 0.4) +
+  geom_line(position = position_dodge(width = 0.35), linewidth = 0.4, alpha = 0.6) +
+  geom_point(position = position_dodge(width = 0.35), size = 1.8) +
+  facet_wrap(~ contrast, nrow = 1) +
+  scale_colour_manual(values = c(lineage = "grey40", climate = "#B73779",
+                                 `lineage + climate` = "#2C7FB8"), name = NULL) +
+  scale_shape_manual(values = c(16, 1), name = NULL) +
+  scale_x_discrete(labels = c("In\nsample", "Species\nheld out", "Genera\nheld out")) +
+  labs(x = NULL, y = "Deviance explained (%)", title = "Lineage and climate out of sample") +
+  guides(colour = guide_legend(ncol = 1), shape = guide_legend(ncol = 1)) +
+  base + theme(strip.text = element_text(face = "bold"))
+
+# --- C: stability tests with both evidence sets ---
+scv_sum <- scv[, .(d2 = median(cv_d2)), by = .(evidence, set, scheme)]
+scv_sum[, `:=`(set = factor(set, rev(c("region", "anomaly", "region + anomaly",
+                                       "latitude x hemisphere",
+                                       "latitude x hemisphere + anomaly"))),
+               scheme = factor(c(subfamily = "Subfamilies held out",
+                                 genus = "Genera held out")[scheme],
+                               c("Subfamilies held out", "Genera held out")),
+               evidence = factor(evidence_labels[evidence], evidence_labels))]
+panel_c <- ggplot(scv_sum, aes(100 * d2, set, shape = evidence)) +
+  geom_vline(xintercept = 0, colour = "grey55", linewidth = 0.4) +
+  geom_point(size = 1.9, position = position_dodge(width = 0.5)) +
+  facet_wrap(~ scheme, ncol = 1) +
+  scale_shape_manual(values = c(16, 1), name = NULL) +
+  labs(x = "Cross-validated deviance explained, obligacy (%)", y = NULL,
+       title = "Obligacy: geography and the LGM anomaly") +
+  base + theme(strip.text = element_text(face = "bold"))
+
+fig <- panel_a / panel_b / panel_c + plot_layout(heights = c(1, 1, 1.1)) +
+  plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(face = "bold", size = 12))
+save_figure(fig, "plot_evidence", 8.5, 12)
+fig
+```
+
+```{r clear_plot_evidence, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

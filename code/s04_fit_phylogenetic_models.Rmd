@@ -1,0 +1,649 @@
+---
+title: "Lycaenidae ant-interaction climate 04 - phylogenetic models of species' strategies"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+This notebook relates the interaction strategies of individual species to their climates while accounting for shared ancestry, which is the main inference of the climate study. Cell-level analyses (`s03_explore_climate`) count the same species in many cells and cannot separate climate from geography or lineage. Species-level phylogenetic models avoid the first problem and estimate the second directly.
+
+Three nested contrasts are modelled with phylogenetic logistic regression (Ives & Garland 2010; `phylolm`): ant-associated against non-associated species, obligate against facultative associates, and obligate parasites against obligate mutualists. Each contrast is related to a small set of climate predictors chosen before the analysis, three for present climate and three for past climate. The models are fitted on the time-calibrated tree of Yumnam & Kodandaramaiah (2025) and, as an alternative hypothesis of relationships, on the tree of Schär et al. (2018) with Grafen branch lengths. In both, species missing from a tree are grafted onto their genus as in `butterfly_ant_interactions`. The variation is then partitioned into the parts explained by climate alone, by lineage alone and by both, with taxonomic models of all species, and climate-only models are tested on genera they were not fitted to.
+
+The last sections connect the species models to the maps. Following Jetz & Rubenstein (2011), species-level predictions from models of lineage alone (random effects of subfamily and genus), climate alone, and lineage with climate are averaged over the species of each 500-km cell and compared with the observed proportions of the strategies. The gain from adding climate to lineage measures how much of the mapped pattern climate adds beyond the composition of lineages. A full run takes about 5 min.
+
+# Setup
+
+## Packages
+
+`phylolm` fits the phylogenetic logistic models, `ape` and `phytools` handle the trees, `mgcv` fits the taxonomic models of the partition and the map comparison, `data.table` handles the tables and `ggplot2` with `patchwork` draws the figures; `sf` is used for the maps.
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(phylolm)
+library(ape)
+library(mgcv)
+library(ggplot2)
+library(patchwork)
+library(sf)
+```
+
+## Variables
+
+The predictors, the contrasts, the trees and the colours of the figures are fixed here. The predictors were chosen before the models were fitted, one per hypothesis block and with low correlations among species: annual mean temperature (cold filter, H1), the aridity index (harsh surface, H2) and precipitation seasonality (seasonal drought, H2) for present climate; the LGM anomalies of temperature and log precipitation and the temperature velocity since the LGM (Quaternary stability, H6) for past climate. The 800-kyr variability is omitted because it correlates at 0.97 with the LGM temperature anomaly among cells.
+
+```{r setup_variables}
+# Predictors and their labels, in two blocks
+present_vars <- c(bio01 = "Annual mean temperature", log_aridity = "Aridity index (log P/PET)",
+                  bio15 = "Precipitation seasonality")
+past_vars <- c(lgm_anomaly_temperature = "LGM temperature anomaly",
+               lgm_anomaly_log_precipitation = "LGM precipitation anomaly (log)",
+               log10_velocity_temperature = "Temperature velocity since LGM (log)")
+climate_vars <- c(present_vars, past_vars)
+
+# Nested contrasts: the species included and the strategies coded 1
+contrasts <- list(
+  associated = list(rows = c("n", "f", "m", "p"), success = c("f", "m", "p"),
+                    label = "Ant-associated vs\nnon-associated"),
+  obligate = list(rows = c("f", "m", "p"), success = c("m", "p"),
+                  label = "Obligate vs\nfacultative"),
+  parasite = list(rows = c("m", "p"), success = "p",
+                  label = "Parasite vs\nmutualist"))
+
+# The two trees and the branch lengths used, as in butterfly_ant_interactions
+branch <- c(yumnam_2025 = "published", schar_2018 = "grafen")
+tree_labels <- c(yumnam_2025 = "Yumnam tree", schar_2018 = "Schär tree")
+
+# Bounds of the phylogenetic logistic regression (phyloglm): a wide coefficient bound and
+# the default bound on log(alpha); alpha at its bound is reported
+phyloglm_btol <- 30
+phyloglm_log_alpha_bound <- 4
+
+# Cells of the map comparison: at least this many classified species with a climate
+min_classified <- 10
+
+# Colours: interaction types as in butterfly_ant_interactions, and the parts of the deviance
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+type_labels <- c(n = "Non-associated", f = "Facultative", m = "Obligate mutualist",
+                 p = "Obligate parasite")
+part_colours <- c(`Climate only` = "#B73779", `Climate and lineage` = "#F4A582",
+                  `Lineage only` = "grey60")
+```
+
+## Folders
+
+The trees and crosswalks are read from the raw data and the species climates from `s02_build_assemblages`; outputs are written to this notebook's folder.
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_data_intermediate <- path_resrepo("data/intermediate/s04_fit_phylogenetic_models")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+
+# The two published trees and the crosswalks from analysis species to their tips
+tree_files <- c(
+  yumnam_2025 = file.path(dir_data_raw, "phylogenies", "yumnam_2025",
+                          "21Jan2025_30June23_SubfamAdded_RelTime_DivergenceTime_928sp.nwk"),
+  schar_2018 = file.path(dir_data_raw, "phylogenies", "schar_2018", "treemacro.nex"))
+crosswalk_files <- c(
+  yumnam_2025 = file.path(dir_data_raw, "butterfly_ant_interactions",
+                          "crosswalk_yumnam_2025.csv"),
+  schar_2018 = file.path(dir_data_raw, "butterfly_ant_interactions",
+                         "crosswalk_schar_2018.csv"))
+```
+
+## Functions
+
+`write_table()` writes the output tables, `phylogeny.R` reads, prunes and grafts the trees as in `butterfly_ant_interactions`, and `projections.R` and `maps.R` draw the maps.
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+source(here::here("code", "R", "phylogeny.R"))
+source(here::here("code", "R", "projections.R"))
+source(here::here("code", "R", "maps.R"))
+```
+
+The species table is prepared in the same way in every section, and every figure is saved in the same way.
+
+```{r define_helpers}
+# Classified species with complete climate predictors, with the transformed predictors
+# standardised over all of them (coefficients are log odds ratios per SD)
+read_species <- function() {
+  sp <- fread(file.path(dir_s02, "species_climate.csv"))
+  sp <- sp[interaction_type %in% names(type_colours)]
+  sp[, log_aridity := log10(aridity_index)]
+  sp <- sp[complete.cases(sp[, names(climate_vars), with = FALSE])]
+  for (v in names(climate_vars)) set(sp, j = v, value = as.numeric(scale(sp[[v]])))
+  sp
+}
+
+# Save a figure as a PNG in this notebook's folder with ragg (identical text on every machine);
+# width and height in inches
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+```
+
+Each section below reads its inputs from disk and ends by removing its objects (in a hidden chunk), so only the objects defined in this setup carry over from one section to the next.
+
+```{r keep_setup_objects}
+# Objects of the setup, kept when each section clears its own objects
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Trees of the species with a climate
+
+The classified species with a climate are matched to the tips of each tree through the crosswalks of `butterfly_ant_interactions`; species missing from a tree are grafted onto their genus (as a polytomy at the genus node, or as sister to a single congener), and species of genera absent from a tree are omitted. The table gives the number of species of each strategy on each tree, and the correlations among the predictors over the species of the Yumnam tree.
+
+*Inputs:* s02/species_climate.csv; raw/phylogenies/ trees; raw/butterfly_ant_interactions/ crosswalks
+*Outputs:* grafted_trees.rds, tree_coverage.csv, predictor_correlations_species.csv
+
+```{r grafted_trees}
+sp <- read_species()
+trees <- list()
+coverage <- list()
+
+for (study in names(tree_files)) {
+  cw <- read.csv(crosswalk_files[[study]], na.strings = c("", "NA"))
+  matched <- intersect(sp$species, cw$analysis_species[cw$matched])
+  tr <- graft_species_to_genus(
+    prepare_analysis_tree(read_published_tree(tree_files[[study]]), cw, matched,
+                          branch[[study]]),
+    sp$species, genus_map = setNames(sp$genus, sp$species))
+  trees[[study]] <- tr
+
+  # Species of each strategy with a climate, matched and on the grafted tree
+  coverage[[study]] <- sp[, .(with_climate = .N, matched = sum(species %in% matched),
+                              on_tree = sum(species %in% tr$tip.label)),
+                          by = interaction_type][, tree := study]
+}
+saveRDS(trees, file.path(dir_data_intermediate, "grafted_trees.rds"))
+coverage <- rbindlist(coverage)
+write_table(coverage, file.path(dir_data_intermediate, "tree_coverage.csv"))
+print(dcast(coverage, interaction_type ~ tree, value.var = c("matched", "on_tree")))
+
+# --- Correlations among the predictors (species of the Yumnam tree) ---
+r <- cor(sp[species %in% trees$yumnam_2025$tip.label, names(climate_vars), with = FALSE])
+write_table(data.table(variable = rownames(r), round(r, 3)),
+            file.path(dir_data_intermediate, "predictor_correlations_species.csv"))
+print(round(r, 2))
+```
+
+```{r clear_grafted_trees, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Phylogenetic logistic models
+
+For each tree and contrast, the strategy is related to the six predictors by phylogenetic logistic regression (`phyloglm`, penalised likelihood, logistic MPLE), and by ordinary logistic regression without phylogeny for comparison. The coefficients of the phylogenetic models are the climate associations after accounting for shared ancestry; alpha measures how fast the strategy evolves along the tree, and small values (relative to the tree height, which is about 100 for the dated Yumnam tree and 1 for the Grafen-scaled Schär tree) mean a strong phylogenetic signal.
+
+The likelihoods of `phyloglm` (penalised) and of `phyr::pglmm_compare` (approximate, for binary responses) did not behave as nested likelihoods in a trial: reduced models sometimes had higher likelihoods than the full model. Likelihood-based R² (Ives 2019) were therefore not used to partition the variation; the partition is made with the taxonomic models of the next section.
+
+*Inputs:* s02/species_climate.csv; s04/grafted_trees.rds
+*Outputs:* phylo_coefficients.csv, phylo_metadata.csv
+
+```{r phylogenetic_models}
+sp <- read_species()
+trees <- readRDS(file.path(dir_data_intermediate, "grafted_trees.rds"))
+f_full <- as.formula(paste("y ~", paste(names(climate_vars), collapse = " + ")))
+
+# Coefficients of a fitted model (phyloglm or glm: estimate, SE, statistic, p) as a table
+coefficient_table <- function(m, model) {
+  cf <- summary(m)$coefficients
+  data.table(model = model, term = rownames(cf), estimate = cf[, 1], se = cf[, 2],
+             p = cf[, 4])
+}
+
+res <- list(coefficients = list(), metadata = list())
+for (study in names(trees)) {
+  for (ct in names(contrasts)) {
+    # --- Species of the contrast on the tree ---
+    d <- as.data.frame(sp[interaction_type %in% contrasts[[ct]]$rows &
+                            species %in% trees[[study]]$tip.label])
+    d$y <- as.integer(d$interaction_type %in% contrasts[[ct]]$success)
+    rownames(d) <- d$species
+    tr <- keep.tip(trees[[study]], d$species)
+
+    # --- Phylogenetic and ordinary logistic regressions ---
+    m_phylo <- phyloglm(f_full, data = d, phy = tr, method = "logistic_MPLE",
+                        btol = phyloglm_btol, log.alpha.bound = phyloglm_log_alpha_bound)
+    m_glm <- glm(f_full, data = d, family = binomial)
+    key <- paste(study, ct)
+    res$coefficients[[key]] <- rbind(coefficient_table(m_phylo, "phylogenetic"),
+                                     coefficient_table(m_glm, "non_phylogenetic"))[
+      , `:=`(tree = study, contrast = ct)]
+
+    # --- Sample, phylogenetic signal and convergence ---
+    # alpha is bounded to [exp(-b), exp(b)] / mean tip height (b = log.alpha.bound)
+    height <- mean(node.depth.edgelength(tr)[seq_len(Ntip(tr))])
+    res$metadata[[key]] <- data.table(
+      tree = study, contrast = ct, species = nrow(d), events = sum(d$y),
+      genera = uniqueN(d$genus),
+      grafted = sum(d$species %in% attr(trees[[study]], "grafted")),
+      tree_height = height, alpha = m_phylo$alpha,
+      alpha_at_bound = m_phylo$alpha <= 1.01 * exp(-phyloglm_log_alpha_bound) / height |
+        m_phylo$alpha >= 0.99 * exp(phyloglm_log_alpha_bound) / height,
+      convergence = m_phylo$convergence)
+  }
+}
+for (comp in names(res))
+  write_table(rbindlist(res[[comp]]), file.path(dir_data_intermediate,
+                                                paste0("phylo_", comp, ".csv")))
+print(rbindlist(res$metadata), digits = 3)
+print(rbindlist(res$coefficients)[model == "phylogenetic" & term != "(Intercept)" & p < 0.05,
+                                  .(tree, contrast, term, estimate = round(estimate, 2),
+                                    p = signif(p, 2))])
+```
+
+```{r clear_phylogenetic_models, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Climate and lineage: partition and transfer between genera
+
+The variation in each contrast is partitioned among climate and lineage with binomial models of all classified species with a climate (which need no tree): climate only (the six predictors), lineage only (random intercepts of subfamily and genus, `mgcv`, REML) and both. Deviance explained (D²) is well defined for all three, so the parts follow by subtraction as in variation partitioning: climate alone = D²(both) - D²(lineage), lineage alone = D²(both) - D²(climate), and the remainder is shared. The same subtraction within the model with lineage gives the parts of present and past climate alone. Taxonomy stands in for phylogeny here, as in the main models of `butterfly_ant_interactions`; the phylogenetic models of the previous section check the climate coefficients.
+
+In-sample D² measures description, not generality. The decisive question is whether climate predicts the strategies of lineages it has not seen. Genera are therefore split into ten groups; a climate-only model fitted to nine groups predicts the species of the tenth, and the cross-validated D² compares these predictions with the proportion of the training species. A positive value means that climate carries information about strategies that transfers between genera; a value near zero or negative means that the climate associations reflect which lineages live where. The split is repeated 20 times with different random groupings. Held-out genera still share subfamilies, and often regions, with the training genera, so each subfamily is also held out in turn, a stricter test of transfer between deep lineages.
+
+*Inputs:* s02/species_climate.csv
+*Outputs:* partition_species.csv, lineage_cv_species.csv, lineage_cv_importance.csv
+
+```{r partition_species}
+sp <- read_species()
+sp[, `:=`(genus = factor(genus), subfamily = factor(subfamily))]
+f_climate <- paste(names(climate_vars), collapse = " + ")
+f_present <- paste(names(present_vars), collapse = " + ")
+f_past <- paste(names(past_vars), collapse = " + ")
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+
+# Deviance explained by a binomial model of y with the given right-hand side
+d2_fit <- function(d, rhs) {
+  summary(gam(as.formula(paste("y ~", rhs)), data = d, family = binomial,
+              method = "REML"))$dev.expl
+}
+
+# Binomial deviance of 0/1 outcomes y under probabilities q
+binary_deviance <- function(y, q) {
+  q <- pmin(pmax(q, 1e-9), 1 - 1e-9)
+  -2 * sum(y * log(q) + (1 - y) * log(1 - q))
+}
+
+# Cross-validated deviance explained of the climate-only model: each group of `fold` is
+# predicted by a model fitted to the other groups, against the outcome proportion of the
+# training species
+climate_cv_d2 <- function(d, fold, vars = names(climate_vars)) {
+  q <- numeric(nrow(d))
+  q0 <- numeric(nrow(d))
+  for (k in unique(fold)) {
+    test <- fold == k
+    m <- glm(as.formula(paste("y ~", paste(vars, collapse = " + "))), data = d[!test],
+             family = binomial)
+    q[test] <- predict(m, newdata = d[test], type = "response")
+    q0[test] <- mean(d$y[!test])
+  }
+  1 - binary_deviance(d$y, q) / binary_deviance(d$y, q0)
+}
+
+partition <- list()
+importance <- list()
+cv <- list()
+set.seed(20261028)
+for (ct in names(contrasts)) {
+  d <- droplevels(sp[interaction_type %in% contrasts[[ct]]$rows])
+  d[, y := as.integer(interaction_type %in% contrasts[[ct]]$success)]
+
+  # --- In-sample deviance explained and its parts ---
+  de <- c(climate = d2_fit(d, f_climate), lineage = d2_fit(d, lineage),
+          both = d2_fit(d, paste(f_climate, "+", lineage)),
+          present_lineage = d2_fit(d, paste(f_present, "+", lineage)),
+          past_lineage = d2_fit(d, paste(f_past, "+", lineage)))
+  partition[[ct]] <- data.table(
+    contrast = ct, species = nrow(d), events = sum(d$y), genera = nlevels(d$genus),
+    # Genera containing both outcomes of the contrast, which inform within-genus contrasts
+    mixed_genera = d[, .(mixed = uniqueN(y) == 2), by = genus][, sum(mixed)],
+    climate = de[["climate"]], lineage = de[["lineage"]], both = de[["both"]],
+    climate_only = de[["both"]] - de[["lineage"]],
+    lineage_only = de[["both"]] - de[["climate"]],
+    shared = de[["climate"]] + de[["lineage"]] - de[["both"]],
+    present_only = de[["both"]] - de[["past_lineage"]],
+    past_only = de[["both"]] - de[["present_lineage"]])
+
+  # --- Climate-only prediction of held-out genera and subfamilies ---
+  # Genera: 20 random splits into ten groups; subfamilies: each subfamily held out in turn
+  genera <- levels(d$genus)
+  genus_cv <- rbindlist(lapply(1:20, function(r) {
+    fold <- setNames(sample(rep_len(1:10, length(genera))), genera)
+    data.table(contrast = ct, scheme = "genus", repeat_id = r,
+               cv_d2 = climate_cv_d2(d, fold[as.character(d$genus)]))
+  }))
+  subfamily_cv <- data.table(contrast = ct, scheme = "subfamily", repeat_id = 1L,
+                             cv_d2 = climate_cv_d2(d, as.character(d$subfamily)))
+  cv[[ct]] <- rbind(genus_cv, subfamily_cv)
+
+  # --- Which predictors carry the transfer to held-out subfamilies ---
+  # Each predictor alone, and the loss of cross-validated D2 when it is dropped from all six
+  full <- subfamily_cv$cv_d2
+  importance[[ct]] <- rbindlist(lapply(names(climate_vars), function(v) data.table(
+    contrast = ct, variable = v,
+    cv_d2_alone = climate_cv_d2(d, as.character(d$subfamily), v),
+    cv_d2_loss_when_dropped = full - climate_cv_d2(d, as.character(d$subfamily),
+                                                   setdiff(names(climate_vars), v)),
+    sign_alone = sign(coef(glm(as.formula(paste("y ~", v)), data = d,
+                               family = binomial))[2]))))
+}
+partition <- rbindlist(partition)
+cv <- rbindlist(cv)
+importance <- rbindlist(importance)
+write_table(partition, file.path(dir_data_intermediate, "partition_species.csv"))
+write_table(cv, file.path(dir_data_intermediate, "lineage_cv_species.csv"))
+write_table(importance, file.path(dir_data_intermediate, "lineage_cv_importance.csv"))
+print(importance, digits = 2)
+print(partition, digits = 2)
+print(cv[, .(cv_d2_median = median(cv_d2), cv_d2_min = min(cv_d2), cv_d2_max = max(cv_d2)),
+         by = .(contrast, scheme)], digits = 2)
+```
+
+```{r clear_partition_species, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure: climate and lineage in the species' strategies
+
+Panel A divides the in-sample deviance explained in each contrast into the parts explained by climate alone, shared by climate and lineage, and explained by lineage alone. Panel B shows how well a climate-only model predicts species of lineages it was not fitted to: held-out genera (median and range over 20 random splits) and held-out subfamilies; values below zero mean worse than predicting the training proportion. Panel C shows the climate coefficients of the phylogenetic models on both trees beside those of the same model without phylogeny; filled points have p < 0.05. The three panels use separate axes because they show different quantities.
+
+*Inputs:* s04/ partition_species.csv, lineage_cv_species.csv, phylo_coefficients.csv
+*Outputs:* plot_phylo_climate.png
+
+```{r plot_phylo_climate}
+part <- fread(file.path(dir_data_intermediate, "partition_species.csv"))
+cv <- fread(file.path(dir_data_intermediate, "lineage_cv_species.csv"))
+cf <- fread(file.path(dir_data_intermediate, "phylo_coefficients.csv"))
+contrast_labels <- sapply(contrasts, `[[`, "label")
+contrast_axis <- function(x) factor(contrast_labels[x], rev(contrast_labels))
+
+# Shared theme of the three panels
+panel_theme <- theme_minimal(base_size = 9) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        legend.position = "bottom", legend.text = element_text(size = 8))
+
+# --- A: parts of the in-sample deviance explained ---
+parts <- melt(part[, .(contrast, `Climate only` = climate_only,
+                       `Climate and lineage` = pmax(shared, 0),
+                       `Lineage only` = lineage_only)],
+              id.vars = "contrast", variable.name = "part")
+parts[, `:=`(contrast = contrast_axis(contrast),
+             part = factor(part, rev(names(part_colours))))]
+totals <- part[, .(contrast = contrast_axis(contrast), total = both,
+                   label = sprintf("%.0f%%", 100 * both))]
+panel_a <- ggplot(parts, aes(100 * value, contrast)) +
+  # Stacked parts with a thin white gap between them, and the total at the end of each bar
+  geom_col(aes(fill = part), width = 0.6, colour = "white", linewidth = 0.4) +
+  geom_text(data = totals, aes(x = 100 * total, y = contrast, label = label),
+            inherit.aes = FALSE, hjust = -0.15, size = 2.8, colour = "grey20") +
+  scale_fill_manual(values = part_colours, breaks = names(part_colours), name = NULL) +
+  scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, 25),
+                     expand = expansion(mult = c(0, 0.12))) +
+  labs(x = "Deviance explained (%)", y = NULL, title = "Climate and lineage") +
+  guides(fill = guide_legend(ncol = 1)) +
+  panel_theme
+
+# --- B: transfer of climate-only models to held-out lineages ---
+scheme_labels <- c(genus = "Held-out genera", subfamily = "Held-out subfamilies")
+transfer <- cv[, .(median = median(cv_d2), low = min(cv_d2), high = max(cv_d2)),
+               by = .(contrast, scheme)]
+transfer[, `:=`(contrast = contrast_axis(contrast),
+                scheme = factor(scheme_labels[scheme], scheme_labels))]
+panel_b <- ggplot(transfer, aes(100 * median, contrast, shape = scheme)) +
+  geom_vline(xintercept = 0, colour = "grey55", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = 100 * low, xmax = 100 * high), width = 0, linewidth = 0.5,
+                orientation = "y", position = position_dodge(width = 0.5)) +
+  geom_point(size = 2, position = position_dodge(width = 0.5)) +
+  scale_shape_manual(values = setNames(c(18, 17), scheme_labels), name = NULL) +
+  labs(x = "Cross-validated deviance explained (%)", y = NULL,
+       title = "Transfer to new lineages") +
+  guides(shape = guide_legend(ncol = 1)) +
+  panel_theme +
+  theme(axis.text.y = element_blank())
+
+# --- C: climate coefficients on both trees and without phylogeny ---
+model_labels <- c(yumnam_2025 = "Phylogenetic, Yumnam tree",
+                  schar_2018 = "Phylogenetic, Schär tree",
+                  non_phylogenetic = "Without phylogeny")
+model_colours <- setNames(c("black", "#2166AC", "grey60"), model_labels)
+b <- cf[term %in% names(climate_vars) & (model == "phylogenetic" | tree == "yumnam_2025")]
+b[, model := factor(model_labels[ifelse(model == "phylogenetic", tree, model)], model_labels)]
+b[, `:=`(variable = factor(climate_vars[term], rev(climate_vars)),
+         block = factor(ifelse(term %in% names(present_vars), "Present", "Past"),
+                        c("Present", "Past")),
+         contrast = factor(contrast_labels[contrast], contrast_labels),
+         fill_key = ifelse(p < 0.05, as.character(model), "open"))]
+panel_c <- ggplot(b, aes(estimate, variable, colour = model, group = model)) +
+  geom_vline(xintercept = 0, colour = "grey55", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se),
+                width = 0, linewidth = 0.45, orientation = "y",
+                position = position_dodge(width = 0.7)) +
+  geom_point(aes(fill = fill_key), shape = 21, size = 1.7, stroke = 0.55,
+             position = position_dodge(width = 0.7)) +
+  facet_grid(block ~ contrast, scales = "free_y", space = "free_y") +
+  scale_colour_manual(values = model_colours, name = NULL) +
+  scale_fill_manual(values = c(model_colours, open = "white"), guide = "none") +
+  labs(x = "Log odds ratio per SD (95% CI)", y = NULL, title = "Climate coefficients") +
+  guides(colour = guide_legend(ncol = 1, override.aes = list(fill = model_colours))) +
+  panel_theme +
+  theme(strip.text.y = element_text(angle = 0, hjust = 0, face = "bold"),
+        strip.text.x = element_text(face = "bold"), panel.spacing.x = grid::unit(10, "pt"))
+
+fig <- (panel_a | panel_b | panel_c) + plot_layout(widths = c(1, 0.75, 2.4)) +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(face = "bold", size = 12),
+        plot.title = element_text(size = 9.5, face = "bold"))
+save_figure(fig, "plot_phylo_climate", 11.5, 4.8)
+fig
+```
+
+```{r clear_plot_phylo_climate, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# From species to the maps
+
+Phylogenetic logistic regression gives no species-level predictions of the phylogenetic effect, so the map comparison uses taxonomic models of all classified species with a climate, which need no tree. For each contrast, three binomial models are fitted: lineage only (random intercepts of subfamily and genus), climate only (the six predictors), and lineage with climate. Each species' predicted probabilities of the three contrasts are combined into probabilities of the four strategies (for example, the probability of being a parasite is P(associated) × P(obligate | associated) × P(parasite | obligate)). For each 500-km cell with at least ten classified species with a climate, the predicted proportion of a strategy is the mean of these probabilities over the cell's species.
+
+The fit to the observed cell counts is the deviance explained (D²) relative to a constant proportion in every cell (the overall proportion of the strategy), for each strategy and for the four strategies together (multinomial deviance). The lineage-only model reproduces the map from the composition of lineages in each cell; the gain of the lineage-and-climate model over it is the part of the map that climate adds. The predictions are in-sample, so all three fits are optimistic in the same way; the transfer of climate models between realms in `s03_explore_climate` gives the out-of-sample view.
+
+*Inputs:* s02/ species_climate.csv, presence_500km.csv, cell_data_500km.csv
+*Outputs:* species_predictions.csv, cell_predictions_500km.csv, map_fit_500km.csv
+
+```{r species_to_maps}
+sp <- read_species()
+sp[, `:=`(genus = factor(genus), subfamily = factor(subfamily))]
+f_climate <- paste(names(climate_vars), collapse = " + ")
+rhs <- c(lineage = "s(subfamily, bs = 're') + s(genus, bs = 're')",
+         climate = f_climate,
+         lineage_climate = paste(f_climate, "+ s(subfamily, bs = 're') + s(genus, bs = 're')"))
+
+# --- Probabilities of each contrast for every species, under each model ---
+# Models are fitted to the species of the contrast, with the factor levels of all species, so
+# that a genus absent from a contrast gets the population-level prediction (random effect 0)
+prob <- list()
+for (model in names(rhs)) {
+  for (ct in names(contrasts)) {
+    d <- sp[interaction_type %in% contrasts[[ct]]$rows]
+    d[, y := as.integer(interaction_type %in% contrasts[[ct]]$success)]
+    m <- gam(as.formula(paste("y ~", rhs[[model]])), data = d, family = binomial,
+             method = "REML", drop.unused.levels = FALSE)
+    prob[[model]][[ct]] <- as.numeric(predict(m, newdata = sp, type = "response"))
+  }
+}
+
+# --- Probabilities of the four strategies ---
+pred <- rbindlist(lapply(names(prob), function(model) {
+  pa <- prob[[model]]$associated
+  po <- prob[[model]]$obligate
+  pp <- prob[[model]]$parasite
+  data.table(pool_key = sp$pool_key, model = model, n = 1 - pa, f = pa * (1 - po),
+             m = pa * po * (1 - pp), p = pa * po * pp)
+}))
+write_table(pred, file.path(dir_data_intermediate, "species_predictions.csv"))
+
+# --- Observed and predicted cell proportions ---
+pres <- fread(file.path(dir_s02, "presence_500km.csv"), colClasses = c(pool_key = "character"))
+pres <- pres[pool_key %in% as.character(sp$pool_key)]
+pres[, interaction_type := sp$interaction_type[match(pool_key, as.character(sp$pool_key))]]
+cells <- pres[, .(n_classified = .N, n_n = sum(interaction_type == "n"),
+                  n_f = sum(interaction_type == "f"), n_m = sum(interaction_type == "m"),
+                  n_p = sum(interaction_type == "p")), by = cell_id][n_classified >= min_classified]
+pred[, pool_key := as.character(pool_key)]
+cp <- merge(pres[cell_id %in% cells$cell_id, .(cell_id, pool_key)], pred, by = "pool_key",
+            allow.cartesian = TRUE)[
+  , .(n = mean(n), f = mean(f), m = mean(m), p = mean(p)), by = .(cell_id, model)]
+cp <- merge(cp, cells, by = "cell_id")
+realm <- fread(file.path(dir_s02, "cell_data_500km.csv"))[, .(cell_id, realm, cell_x, cell_y)]
+cp <- merge(cp, realm, by = "cell_id", all.x = TRUE)
+write_table(cp, file.path(dir_data_intermediate, "cell_predictions_500km.csv"))
+
+# --- Deviance explained per strategy and for all strategies together ---
+# Binomial (per strategy) or multinomial (summed over strategies) deviance of counts y out of N
+# under predicted proportions q
+deviance_terms <- function(y, N, q) {
+  q <- pmin(pmax(q, 1e-9), 1 - 1e-9)
+  2 * (ifelse(y > 0, y * log(y / (N * q)), 0) +
+         ifelse(N - y > 0, (N - y) * log((N - y) / (N * (1 - q))), 0))
+}
+fit <- rbindlist(lapply(unique(cp$model), function(mod) {
+  x <- cp[model == mod]
+  per_type <- rbindlist(lapply(c("n", "f", "m", "p"), function(k) {
+    y <- x[[paste0("n_", k)]]
+    q0 <- sum(y) / sum(x$n_classified)
+    data.table(model = mod, strategy = k,
+               d2 = 1 - sum(deviance_terms(y, x$n_classified, x[[k]])) /
+                 sum(deviance_terms(y, x$n_classified, q0)))
+  }))
+  # Multinomial deviance: 2 sum y log(y / (N q)) over the four strategies
+  multi <- function(q_cols) {
+    sum(sapply(c("n", "f", "m", "p"), function(k) {
+      y <- x[[paste0("n_", k)]]
+      q <- pmax(q_cols[[k]], 1e-9)
+      2 * sum(ifelse(y > 0, y * log(y / (x$n_classified * q)), 0))
+    }))
+  }
+  q0 <- lapply(setNames(c("n", "f", "m", "p"), c("n", "f", "m", "p")), function(k)
+    rep(sum(x[[paste0("n_", k)]]) / sum(x$n_classified), nrow(x)))
+  rbind(per_type, data.table(model = mod, strategy = "all",
+                             d2 = 1 - multi(x[, .(n, f, m, p)]) / multi(q0)))
+}))
+write_table(fit, file.path(dir_data_intermediate, "map_fit_500km.csv"))
+print(dcast(fit, strategy ~ model, value.var = "d2"), digits = 2)
+cat("cells:", uniqueN(cp$cell_id), "\n")
+```
+
+```{r clear_species_to_maps, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure: how much of the maps lineage and climate reproduce
+
+Each panel compares the observed proportion of a strategy in the 500-km cells with the proportion predicted from the species' lineages, climates, or both, with the D² of the fit. Cells of the Americas (Nearctic and Neotropic) are drawn in black and the others in grey, because the absence of obligate strategies there is the clearest test of climate against history. The map shows, for each cell, whether adding climate to lineage moved the predicted proportions towards the observed ones (blue) or away from them (red), measured by the change in the cell's multinomial deviance.
+
+*Inputs:* s04/ cell_predictions_500km.csv, map_fit_500km.csv
+*Outputs:* plot_map_fit_500km.png, plot_climate_gain_map_500km.png
+
+```{r plot_map_fit}
+cp <- fread(file.path(dir_data_intermediate, "cell_predictions_500km.csv"))
+fit <- fread(file.path(dir_data_intermediate, "map_fit_500km.csv"))
+model_labels <- c(lineage = "Lineage", climate = "Climate", lineage_climate = "Lineage + climate")
+
+# --- Observed and predicted proportions, long format ---
+long <- rbindlist(lapply(c("n", "f", "m", "p"), function(k)
+  cp[, .(cell_id, model, realm, strategy = k, observed = get(paste0("n_", k)) / n_classified,
+         predicted = get(k), n_classified)]))
+long[, `:=`(americas = realm %in% c("Nearctic", "Neotropic"),
+            model = factor(model_labels[model], model_labels),
+            strategy = factor(type_labels[strategy], type_labels))]
+setorder(long, americas)
+labels <- fit[strategy != "all", .(model = factor(model_labels[model], model_labels),
+                                   strategy = factor(type_labels[strategy], type_labels),
+                                   label = sprintf("D² = %.2f", d2))]
+
+# Equal observed and predicted axes, shared by the three models of a strategy: invisible points
+# at 0 and at the largest value of the strategy in every panel
+lims <- long[, .(lim = max(c(observed, predicted))), by = strategy]
+blank <- CJ(model = factor(model_labels, model_labels), strategy = lims$strategy)
+blank[, lim := lims$lim[match(strategy, lims$strategy)]]
+blank <- rbind(blank[, .(model, strategy, observed = 0, predicted = 0)],
+               blank[, .(model, strategy, observed = lim, predicted = lim)])
+
+# Rows are strategies and columns models, each panel with its own (equal) axes
+fig <- ggplot(long, aes(predicted, observed)) +
+  geom_blank(data = blank) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_point(aes(colour = americas, size = n_classified), alpha = 0.75, stroke = 0) +
+  geom_text(data = labels, aes(x = -Inf, y = Inf, label = label), hjust = -0.1, vjust = 1.4,
+            size = 2.8, colour = "grey15") +
+  facet_wrap(strategy ~ model, ncol = 3, scales = "free",
+             labeller = labeller(.multi_line = FALSE)) +
+  scale_colour_manual(values = c(`TRUE` = "black", `FALSE` = "grey70"),
+                      labels = c(`TRUE` = "Americas", `FALSE` = "Other realms"),
+                      breaks = c("TRUE", "FALSE"), name = NULL) +
+  scale_size_area(max_size = 2.2, breaks = c(10, 50, 100), name = "Classified species") +
+  labs(x = "Predicted proportion", y = "Observed proportion") +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid.minor = element_blank(), strip.text = element_text(face = "bold"),
+        legend.position = "bottom", panel.spacing = grid::unit(8, "pt"))
+ggsave(file.path(dir_data_intermediate, "plot_map_fit_500km.png"), fig, width = 7.5, height = 9.5,
+       dpi = 300, bg = "white", device = ragg::agg_png)
+fig
+
+# --- Map: change in each cell's multinomial deviance when climate is added to lineage ---
+cell_dev <- function(x) {
+  rowSums(sapply(c("n", "f", "m", "p"), function(k) {
+    y <- x[[paste0("n_", k)]]
+    2 * ifelse(y > 0, y * log(y / (x$n_classified * pmax(x[[k]], 1e-9))), 0)
+  }))
+}
+a <- cp[model == "lineage"][order(cell_id)]
+b <- cp[model == "lineage_climate"][order(cell_id)]
+stopifnot(identical(a$cell_id, b$cell_id))
+gain <- data.frame(cell_id = a$cell_id, cell_x = a$cell_x, cell_y = a$cell_y,
+                   gain = (cell_dev(a) - cell_dev(b)) / a$n_classified)
+layers <- map_layers(equal_area_cell_polygons(gain, cell_km = 500))
+lim <- max(abs(stats::quantile(gain$gain, c(0.02, 0.98))))
+map <- plot_grid_map(layers, "gain",
+                     "Deviance reduction per species when climate is added to lineage",
+                     palette = c("#B2182B", "grey92", "#2166AC"), midpoint = 0,
+                     limits = c(-lim, lim))
+ggsave(file.path(dir_data_intermediate, "plot_climate_gain_map_500km.png"), map, width = 7,
+       height = 4.2, dpi = 300, bg = "white", device = ragg::agg_png)
+map
+```
+
+```{r clear_plot_map_fit, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+The R version and packages used to render this notebook are printed below.
+
+```{r save_r_environment}
+print(sessionInfo())
+```

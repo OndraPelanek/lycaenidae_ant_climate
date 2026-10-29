@@ -22,13 +22,22 @@ code/*.rdb
 code/*.rdx
 
 ## Data directory
-## ignore everything in data, except for *.md (used for additional metadata documentation) and data_source_list.csv
-#/data/raw/*
-#!/data/raw/*.md
-#/data/intermediate/*
-#!/data/intermediate/*.md
-#/data/archive/*
-#!/data/archive/*.md
+## Raw and intermediate data are excluded; documentation and metadata remain tracked.
 versions
 data/raw
 data/intermediate
+.Rproj.user
+
+## renv local state
+renv/library/
+renv/staging/
+renv/local/
+
+## Rendered documents and notebooks
+writing/*.docx
+!writing/docx_template.docx
+writing/*.html
+writing/*.pdf
+writing/*_files/
+results/**/*.html
+results/**/*_files/

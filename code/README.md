@@ -1,7 +1,46 @@
-# Code
+# Analysis code
 
-The code for your analysis goes here. Scripts should use relative paths to find data (e.g. `../data/raw/defaults/my_data.txt`) as well as to write to results (e.g. `../results/Fig_1png`).
-If you have many scripts, it is often better to have them writing results into separate sub-directories
-under `results`, as it helps tracking where each result file comes from. This strategy also allows to have a simple command at the beginning of a script which wipes the results directory before generating the new set of results (thus avoiding the risk of having old files from obsolete analysis floating around the repository)
+The analysis consists of R Markdown notebooks, run in numerical order, and a few shared R functions. Each notebook is a documented, self-contained analysis: it reads the raw data and the outputs of earlier notebooks, writes its outputs to its own folder in `data/intermediate/`, and saves its rendered HTML in `results/`.
 
-It is good practice to add a metafile that tells what every script does (e.g. you can add this info here in the readme).
+| File | Purpose | Principal output |
+|----|----|----|
+| `setup_environment.R` | Restore the recorded package library | Project `renv` package library |
+| `s01_prepare_climate.Rmd` | Present climate, aridity, productivity, LGM anomaly and velocity, 800-kyr climate variability, realms and biomes, summarised in 250-, 500- and 1,000-km Equal Earth cells | `data/intermediate/s01_prepare_climate/cell_climate_500km.csv` and the 10-arc-minute layers |
+| `s02_build_assemblages.Rmd` | Species-by-cell presence from the `butterfly_ant_interactions` records, strategy counts per cell, species climates, and the joined cell tables | `data/intermediate/s02_build_assemblages/cell_data_500km.csv`, `species_climate.csv` |
+| `s03_explore_climate.Rmd` | Exploratory analyses: collinearity, single predictors, deviance partitioning (present climate, past climate, space, realm), transfer between realms and species-level within- and between-genus models | Tables and figures in `data/intermediate/s03_explore_climate/` |
+| `s04_fit_phylogenetic_models.Rmd` | Species-level models of three nested contrasts: phylogenetic logistic regression on the genus-grafted Yumnam and Schär trees, partition of climate and lineage with taxonomic models, transfer of climate-only models to held-out genera and subfamilies, and the aggregation of species predictions to the cell maps | Tables and figures in `data/intermediate/s04_fit_phylogenetic_models/` |
+| `s05_compare_regions.Rmd` | Climate and strategies within eight biogeographic regions: lineages behind each strategy, species-level regional slopes and their heterogeneity, ISEA hexagonal grids (`dggridR`), composition along gradients compared with the composition expected from the lineages present, and robustness to grain, grid, weighting and minimum species | Tables and figures in `data/intermediate/s05_compare_regions/` |
+| `s06_test_stability.Rmd` | Tests whether the obligacy signal is glacial stability or southern geography: cross-validated prediction of held-out subfamilies and genera by region, latitude and hemisphere with and without the LGM anomaly; anomaly effects given region and lineage across subsets, within genera and with a second reconstruction | Tables and figure in `data/intermediate/s06_test_stability/` |
+| `s07_compare_mediterranean.Rmd` | The five Mediterranean-climate regions: Köppen–Geiger Cs pixels, the strategies of their species pools, their climates and climate-matched hexagons | Tables and figure in `data/intermediate/s07_compare_mediterranean/` |
+| `s08_test_southern_drivers.Rmd` | Soils (SoilGrids), fire (GFED5) and seasonal drought as explanations of the southern concentration of obligate associates: prediction of held-out lineages beyond latitude and hemisphere, and effects given region and lineage; uses soil phosphorus and 5-Myr aridity when their files are present | Tables and figure in `data/intermediate/s08_test_southern_drivers/` |
+| `s09_test_history.Rmd` | How the southern concentration of obligate associates arose: correlated evolution of obligacy and hemisphere (Pagel 1994) on both trees, and origins of obligacy by region in 100 stochastic character maps | Tables and figures in `data/intermediate/s09_test_history/` |
+| `s10_test_diversification.Rmd` | Robustness of the origins of obligacy (20 random resolutions of the grafted polytomies; a tree of genera from matched species) and net diversification rates of genera (Magallón & Sanderson 2001) by strategy and region | Tables and figure in `data/intermediate/s10_test_diversification/` |
+| `s11_test_seasonality.Rmd` | Precipitation seasonality and obligacy under strong controls: split contrasts, species-specific evidence only, without large genera, within regions and genera, phylogenetic logistic regression; prediction of each held-out subfamily; the genera with obligate and facultative species | Tables and figure in `data/intermediate/s11_test_seasonality/` |
+| `s12_audit_evidence.Rmd` | Evidence basis of the strategies by region, strategy and lineage; deviance explained by lineage and climate in sample and for held-out species and genera; the tests of s06 with species-specific evidence only | Tables and figure in `data/intermediate/s12_audit_evidence/` |
+| `s13_compare_matched_climates.Rmd` | Strategies of regions within shared climate strata (coarsened exact matching): pairs of Mediterranean-climate regions, the same climates outside them, completeness bounds, genus bootstrap, species climates and shared genera | Tables and figure in `data/intermediate/s13_compare_matched_climates/` |
+| `s14_test_null_models.Rmd` | Permutation nulls within genera for the within-genus seasonality effect and the lineage turnover along gradients; origins of obligacy on matched-only trees | Tables and figure in `data/intermediate/s14_test_null_models/` |
+| `s15_test_association.Rmd` | Ant association along latitude in Europe, the eastern Palaearctic and the Nearctic (ISEA hexagons of resolution 7): richness and share by strategy, latitude against temperature, lineage expectation with a within-genus null, genera persisting northwards; temperature effects on association by region | Tables and figures in `data/intermediate/s15_test_association/` |
+| `s16_make_maps.Rmd` | World maps of the strategies, classification completeness and the genera of obligate associates; map of the climates shared with the Cape and southern Australia | Figures in `data/intermediate/s16_make_maps/` |
+| `s17_make_figures.Rmd` | Main figures of the working manuscript (lineages and prediction; shared climates; predictors of obligacy; history), combined from the outputs of s05–s14 in one style | Figures in `data/intermediate/s17_make_figures/` |
+| `s18_audit_shared_climates.Rmd` | Audit of the comparison within shared climates: strategy shares standardised over common stratum weights, climatic balance before and after matching, area and species retained, sensitivity to the strata, the four strategies, and genus-weighted composition with the decomposition of regional contrasts | Tables and figure in `data/intermediate/s18_audit_shared_climates/` |
+| `s19_test_mixed_genera.Rmd` | Seasonality against drought (dry months, longest dry spell, driest-month precipitation) given region and lineage, Holm adjustment over all properties, within-genus permutation tests (9,999), every genus with obligate and facultative species, and larval carnivory | Tables and figure in `data/intermediate/s19_test_mixed_genera/` |
+| `s20_predict_held_out.Rmd` | Prediction of held-out realms and subfamilies by climate, latitude and hemisphere, lineage and both, against a baseline: calibration, discrimination, deviance explained, genus-bootstrap intervals and climatic novelty | Tables and figure in `data/intermediate/s20_predict_held_out/` |
+| `s21_test_ant_partners.Rmd` | Ant richness (Kass et al. 2022) as a baseline predictor; the recorded partner genera of each strategy; availability and use of the partner genera of obligate species across regions (GABI records) | Tables and figure in `data/intermediate/s21_test_ant_partners/` |
+| `s22_make_paper_figures.Rmd` | Main figures 2–4 of the paper, combined from the outputs of s05–s21 | Figures in `data/intermediate/s22_make_paper_figures/` |
+| `render_manuscript.R` | Render the working manuscript `writing/climate_manuscript.Rmd` and the paper draft `writing/paper_draft.Rmd` (with its Supporting Information) to Word and HTML from the notebook outputs | `writing/climate_manuscript.{docx,html}`, `writing/paper_draft.{docx,html}` |
+| `run_all.R` | Knit all notebooks in order, each in a fresh R session; optional first and last notebook (`Rscript code/run_all.R s02`) | All of the above |
+
+All notebooks have the structure of the `butterfly_ant_interactions` notebooks: an introduction, a setup (packages, variables, folders and functions), one section per analysis step with its inputs and outputs, and a record of the R session. Each section reads its inputs from disk and removes its objects at the end.
+
+## Shared functions
+
+`R/` holds the functions used by more than one notebook; functions needed by one notebook only are defined in that notebook. `projections.R`, `geography.R`, `maps.R` and `write_table.R` are copies of the `butterfly_ant_interactions` functions (the map functions come from its `s06_summarise_results.Rmd`), so that cells, projections and map style are identical in the two repositories.
+
+| File | Contents | Used by |
+|----|----|----|
+| `write_table.R` | Writing the output tables | all notebooks |
+| `projections.R` | Equal Earth projection (chosen with `crstools`) and the projection of records | all notebooks |
+| `geography.R` | Species-by-cell presence on the Equal Earth grid | s02 |
+| `maps.R` | Cell polygons, land clipping and the map style | s01, s03 |
+| `climate.R` | Hargreaves PET, spatial gradients and climate-change velocity, assignment of raster pixels to cells and their summaries | s01 |
+| `phylogeny.R` | Reading, pruning and genus-grafting of the published trees (copied from `butterfly_ant_interactions`) | s04 |

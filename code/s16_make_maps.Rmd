@@ -1,0 +1,350 @@
+---
+title: "Lycaenidae ant-interaction climate 16 - maps of strategies and shared climates"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+Two maps for the manuscript, drawn from the outputs of earlier notebooks:
+
+1. **The global geography of the strategies.** Comparable to Fig. 1 of `butterfly_ant_interactions`, on hexagons of about 210,000 km² (resolution 5 of `s05`) instead of 500-km squares: the share of each strategy among the classified species of each hexagon with at least 10 classified species, each panel on its own square-root colour scale spanning the 1st to 99th percentiles of its hexagons (so colours are not comparable between panels), with one hue per strategy ending in the strategy colour. The number of classified species and the share of recorded species that is classified (low in the Neotropics, tropical Africa and New Guinea) show where the maps rest on few species. The obligate species of each region by genus are drawn as a separate figure.
+2. **The same climates, different strategies.** Every land pixel whose climate falls in a stratum occupied by the Mediterranean-climate parts of the Cape or southern Australia (`s13`), coloured by the obligate share of its region's species in these climates.
+
+Design choices: Equal Earth projection for world maps; land in light grey and the sea white; sequential ramps of a single hue from light grey to the strategy colour of `butterfly_ant_interactions` (a colour-blind-safe set); hexagons with too few classified species left as land; legends as thin horizontal bars; direct labels instead of legends wherever possible.
+
+A full run takes about 3 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(sf)
+library(dggridR)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+min_classified <- 10
+strata_widths <- c(bio01 = 2, bio06 = 3, log_aridity = 0.15, bio15 = 15)
+min_pixels <- 5
+min_pool <- 5
+
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+region_short <- c(Nearctic = "Nearctic", Neotropic = "Neotropics", Palearctic = "Palaearctic",
+                  `Tropical Africa` = "Tropical Africa", `Southern Africa` = "Southern Africa",
+                  Indomalayan = "Indomalaya", Australia = "Australia",
+                  `New Guinea and islands` = "New Guinea")
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+type_labels <- c(n = "Non-associated", f = "Facultative", m = "Obligate mutualist",
+                 p = "Obligate parasite")
+
+# Equal Earth, and the colours of land and empty land
+crs_world <- "+proj=eqearth +datum=WGS84"
+land_fill <- "#ECECEA"
+land_line <- "#BDBDBA"
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_s13 <- path_resrepo("data/intermediate/s13_compare_matched_climates")
+dir_data_intermediate <- path_resrepo("data/intermediate/s16_make_maps")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# World land, in Equal Earth
+# World land without Antarctica, dissolved (planar geometry; the spherical union fails on this
+# layer), in Equal Earth
+world_land <- function() {
+  sf_use_s2(FALSE)
+  on.exit(sf_use_s2(TRUE))
+  land <- rnaturalearth::ne_countries(scale = "small", returnclass = "sf")
+  land <- st_make_valid(land[land$continent != "Antarctica", "geometry"])
+  st_transform(st_union(land), crs_world)
+}
+
+# Map extent in Equal Earth: Antarctica and the high Arctic are left out
+map_ylim <- c(-6.2e6, 8.0e6)
+
+# A sequential ramp of one hue, from light grey to the given colour
+ramp_to <- function(colour, n = 5) colorRampPalette(c("#F2F2F0", colour))(n)
+
+# Shared map theme
+theme_map <- function(base_size = 8.5) {
+  theme_void(base_size = base_size) +
+    theme(plot.title = element_text(face = "bold", size = base_size + 0.5, hjust = 0.02),
+          legend.position = "bottom", legend.title = element_text(size = base_size - 1),
+          legend.text = element_text(size = base_size - 1.5, colour = "grey30"),
+          legend.key.height = unit(0.18, "cm"), legend.key.width = unit(1.4, "cm"),
+          plot.margin = margin(2, 2, 2, 2))
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# The global geography of the strategies
+
+*Inputs:* s05/ cell_data_hex5.csv, hex_polygons.rds, species_regions.csv
+*Outputs:* plot_world_strategies.png, plot_obligate_genera.png
+
+```{r world_strategies}
+cells <- fread(file.path(dir_s05, "cell_data_hex5.csv"))
+hex <- readRDS(file.path(dir_s05, "hex_polygons.rds"))$hex5
+hex <- st_wrap_dateline(hex, options = c("WRAPDATELINE=YES", "DATELINEOFFSET=180"))
+hex <- merge(hex, cells, by.x = "seqnum", by.y = "cell_id")
+hex <- st_transform(hex, crs_world)
+land <- world_land()
+
+# --- Colour scales as in Fig. 1 of butterfly_ant_interactions: square-root scales whose limits
+# span the 1st to 99th percentiles of the panel's cells, rounded outwards to 0.1; more extreme
+# cells take the end colour, marked "≤" or "≥" in the legend ---
+proportion_limits <- function(x) {
+  q <- quantile(x[is.finite(x)], c(0.01, 0.99), names = FALSE)
+  c(max(0, floor(round(q[1] * 10, 6)) / 10), min(1, ceiling(round(q[2] * 10, 6)) / 10))
+}
+proportion_breaks <- function(limits, x) {
+  inner <- if (limits[1] > 0) c(0.5, 0.7) else if (limits[2] <= 0.2) c(0.025, 0.05, 0.1) else
+    if (limits[2] <= 0.4) c(0.05, 0.1, 0.2) else c(0.1, 0.2, 0.4)
+  breaks <- sort(unique(c(limits[1], inner[inner > limits[1] & inner < limits[2]], limits[2])))
+  labels <- paste0(format(100 * breaks, trim = TRUE, drop0trailing = TRUE), "%")
+  if (min(x, na.rm = TRUE) < limits[1]) labels[1] <- paste("≤", labels[1])
+  if (max(x, na.rm = TRUE) > limits[2]) labels[length(labels)] <- paste("≥", labels[length(labels)])
+  list(breaks = breaks, labels = labels)
+}
+
+# One hexagon map with a vertical colour bar at its right
+map_hex <- function(d, title, colours, trans = "identity", limits = NULL,
+                    breaks = waiver(), labels = waiver()) {
+  ggplot() +
+    geom_sf(data = land, fill = land_fill, colour = NA) +
+    geom_sf(data = d, aes(fill = value), colour = NA) +
+    geom_sf(data = land, fill = NA, colour = land_line, linewidth = 0.1) +
+    scale_fill_gradientn(colours = colours, trans = trans, limits = limits, breaks = breaks,
+                         labels = labels, oob = scales::squish, name = NULL,
+                         guide = guide_colourbar(barwidth = unit(2.4, "mm"),
+                                                 barheight = unit(22, "mm"))) +
+    coord_sf(crs = crs_world, expand = FALSE, ylim = map_ylim) +
+    labs(title = title) +
+    theme_map() +
+    theme(legend.position = "right", legend.margin = margin(0, 0, 0, 0),
+          legend.box.spacing = unit(2, "pt"))
+}
+
+# --- A-D: the share of each strategy ---
+classified <- hex[hex$n_classified >= min_classified, ]
+share_map <- function(k) {
+  d <- classified
+  d$value <- d[[paste0("n_", k)]] / d$n_classified
+  limits <- proportion_limits(d$value)
+  scale <- proportion_breaks(limits, d$value)
+  map_hex(d, type_labels[[k]], ramp_to(type_colours[[k]]), trans = "sqrt", limits = limits,
+          breaks = scale$breaks, labels = scale$labels)
+}
+
+# --- E: classified species per hexagon; F: share of the recorded species classified ---
+d <- hex[hex$n_classified > 0, ]
+d$value <- d$n_classified
+richness <- map_hex(d, "Classified species", ramp_to("#3B3B3B"), trans = "log10",
+                    breaks = c(1, 3, 10, 30, 100))
+d <- hex[hex$n_total >= min_classified, ]
+d$value <- d$n_classified / d$n_total
+completeness <- map_hex(d, "Recorded species that are classified", ramp_to("#3B3B3B"),
+                        limits = c(0, 1), breaks = c(0, 0.5, 1),
+                        labels = scales::label_percent())
+
+# --- Obligate species of each region by genus ---
+sp <- fread(file.path(dir_s05, "species_regions.csv"))
+ob <- sp[interaction_type %in% c("m", "p") & !is.na(region), .N, by = .(region, genus)]
+ob[, rank := frank(-N, ties.method = "first"), by = region]
+ob[, label := fifelse(rank <= 3, genus, "Other genera")]
+obs <- ob[, .(N = sum(N), genera = .N), by = .(region, label)]
+obs[, region_total := sum(N), by = region]
+obs <- obs[region_total > 0]
+obs[, `:=`(region = factor(region_short[region], rev(region_short[region_levels])),
+           is_other = label == "Other genera")]
+obs[, order := fifelse(is_other, 99L, frank(-N, ties.method = "first")), by = region]
+setorder(obs, region, order)
+obs[, `:=`(xmax = cumsum(N), xmin = cumsum(N) - N), by = region]
+obs[, genus_label := fifelse(is_other, paste0(genera, " other genera"), label)]
+regions_all <- data.table(region = factor(region_short[region_levels],
+                                          rev(region_short[region_levels])))
+lineages <- ggplot(obs) +
+  geom_rect(aes(xmin = xmin, xmax = xmax, ymin = as.numeric(region) - 0.36,
+                ymax = as.numeric(region) + 0.36, fill = is_other),
+            colour = "white", linewidth = 0.6) +
+  # Segment labels only where the text fits (about 1.9 species per character at this width)
+  geom_text(data = obs[N >= 1.9 * nchar(genus_label)],
+            aes(x = (xmin + xmax) / 2, y = as.numeric(region),
+                                     label = genus_label,
+                                     fontface = ifelse(is_other, "plain", "italic")),
+            size = 2.2, colour = "white") +
+  geom_text(data = unique(obs[, .(region, region_total)]),
+            aes(x = region_total, y = as.numeric(region), label = region_total),
+            hjust = -0.3, size = 2.4, colour = "grey30") +
+  scale_fill_manual(values = c(`FALSE` = type_colours[["m"]], `TRUE` = "#F2C46D"),
+                    guide = "none") +
+  scale_y_continuous(breaks = seq_along(levels(obs$region)), labels = levels(obs$region),
+                     expand = expansion(add = 0.5)) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.08))) +
+  labs(x = "Obligate species (three largest genera named)", y = NULL,
+       title = "Few genera carry the obligate associates") +
+  theme_minimal(base_size = 8.5) +
+  theme(panel.grid = element_blank(), axis.text.y = element_text(colour = "grey25"),
+        axis.text.x = element_text(colour = "grey40"),
+        plot.title = element_text(face = "bold", size = 9), plot.title.position = "plot")
+
+fig <- wrap_plots(share_map("n"), share_map("f"), share_map("m"), share_map("p"), richness,
+                  completeness, ncol = 2) +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")") & theme(plot.tag = element_text(face = "bold", size = 11))
+save_figure(fig, "plot_world_strategies", 7.4, 6)
+save_figure(lineages, "plot_obligate_genera", 5, 2.6)
+fig
+```
+
+```{r clear_world_strategies, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# The same climates, different strategies
+
+The climate strata of `s13` occupied (at least `r min_pixels` pixels) by the Mediterranean-climate pixels of the Cape or southern Australia are found anywhere on land. In each biogeographic region, the pool is every classified species recorded in its pixels of these strata, and the pixels are coloured by the pool's obligate share (regions with fewer than `r min_pool` classified species in grey).
+
+*Inputs:* s13/ pixel_strata.rds, record_pixels.rds, taxa.csv; s01/climate_present_10m.tif
+*Outputs:* shared_climate_pools.csv, plot_shared_climates.png, plot_shared_climates_panel.png
+
+```{r shared_climates}
+pix <- readRDS(file.path(dir_s13, "pixel_strata.rds"))
+rec <- readRDS(file.path(dir_s13, "record_pixels.rds"))
+taxa <- fread(file.path(dir_s13, "taxa.csv"), colClasses = c(pool_key = "character"))
+target <- unique(pix[med_region %in% c("Cape", "Southern Australia"), .N,
+                     by = .(med_region, stratum)][N >= min_pixels]$stratum)
+tp <- pix[stratum %in% target & !is.na(region)]
+pools <- rbindlist(lapply(region_levels, function(rg) {
+  keys <- unique(rec[cell %in% tp[region == rg]$cell]$pool_key)
+  t <- taxa[pool_key %in% keys & classified == TRUE]
+  data.table(region = rg, pixels = tp[region == rg, .N], classified = nrow(t),
+             obligate = sum(t$obligate), obligate_share = if (nrow(t)) mean(t$obligate) else NA)
+}))
+write_table(pools, file.path(dir_data_intermediate, "shared_climate_pools.csv"))
+print(pools, digits = 2)
+
+# --- Hexagons (resolution 6, about 70,000 km²) holding target pixels, coloured by the obligate
+# share of the region holding most of their target pixels; the pixels alone are too small to
+# see on a world map ---
+template <- rast(file.path(dir_s01, "climate_present_10m.tif"))[["bio01"]]
+dg <- dgconstruct(res = 6)
+xy <- xyFromCell(template, tp$cell)
+tp[, hex := dgGEO_to_SEQNUM(dg, xy[, 1], xy[, 2])$seqnum]
+hx <- tp[, .(target_pixels = .N, region = names(which.max(table(region)))), by = hex]
+hx <- hx[target_pixels >= min_pixels]
+hx <- merge(hx, pools[, .(region, obligate_share, classified)], by = "region")
+hx[classified < min_pool, obligate_share := NA]
+polys <- st_wrap_dateline(dgcellstogrid(dg, hx$hex),
+                          options = c("WRAPDATELINE=YES", "DATELINEOFFSET=180"))
+polys <- st_transform(merge(polys, hx, by.x = "seqnum", by.y = "hex"), crs_world)
+land <- world_land()
+
+# Labels of the regions at the centroid of their target pixels
+lab <- merge(tp[, .(x = mean(xyFromCell(template, cell)[, 1]),
+                    y = mean(xyFromCell(template, cell)[, 2])), by = region],
+             pools, by = "region")
+lab <- lab[classified >= min_pool]
+lab_sf <- st_transform(st_as_sf(lab, coords = c("x", "y"), crs = 4326), crs_world)
+lab[, c("X", "Y") := as.data.table(st_coordinates(lab_sf))]
+lab[, text := paste0(region_short[region], "\n", round(100 * obligate_share), "% obligate (n = ",
+                     classified, ")")]
+# Labels moved off the hexagons, mostly into the sea, with a leader line (metres, Equal Earth)
+offsets <- data.table(region = region_levels,
+                      dx = c(-0.3e6, -2.6e6, -3.4e6, 2.6e6, -3.0e6, 3.0e6, -1.6e6, 0),
+                      dy = c(-1.8e6, 0, 0.9e6, -0.4e6, -0.5e6, -0.6e6, 1.7e6, 0))
+lab <- merge(lab, offsets, by = "region")
+lab[, `:=`(LX = X + dx, LY = Y + dy)]
+
+shared <- ggplot() +
+  geom_sf(data = land, fill = land_fill, colour = NA) +
+  geom_sf(data = polys[!is.na(polys$obligate_share), ], aes(fill = obligate_share),
+          colour = "white", linewidth = 0.15) +
+  geom_sf(data = polys[is.na(polys$obligate_share), ], fill = "#B8B8B8", colour = "white",
+          linewidth = 0.15) +
+  geom_sf(data = land, fill = NA, colour = land_line, linewidth = 0.1) +
+  geom_segment(data = lab, aes(x = X, y = Y, xend = LX, yend = LY), colour = "grey45",
+               linewidth = 0.25) +
+  geom_label(data = lab, aes(LX, LY, label = text), size = 2.2, label.size = 0,
+             fill = scales::alpha("white", 0.85), lineheight = 0.9,
+             label.padding = unit(0.12, "lines")) +
+  scale_fill_gradientn(colours = ramp_to(type_colours[["m"]], 6)[-1], limits = c(0, 0.5),
+                       oob = scales::squish, labels = scales::label_percent(),
+                       name = "Obligate associates among the classified species of the region in these climates") +
+  coord_sf(crs = crs_world, expand = FALSE, ylim = c(-5.2e6, 6.6e6), xlim = c(-1.25e7, 1.65e7)) +
+  labs(title = "Climates like those of the Cape and southern Australia, and how obligate-rich they are",
+       subtitle = "Hexagons with land in the climate strata of the Mediterranean-climate Cape or southern Australia; grey: fewer than 5 classified species") +
+  theme_map() +
+  theme(plot.subtitle = element_text(colour = "grey35", size = 7.5, hjust = 0.02),
+        legend.key.width = unit(2.5, "cm"), legend.title.position = "top")
+save_figure(shared, "plot_shared_climates", 9, 5.2)
+
+# --- The same map as a panel of the paper's Figure 2: printed width, larger labels, no title ---
+shared_panel <- shared +
+  geom_label(data = lab, aes(LX, LY, label = text), size = 3, label.size = 0,
+             fill = scales::alpha("white", 0.9), lineheight = 0.9,
+             label.padding = unit(0.12, "lines")) +
+  labs(title = NULL, subtitle = NULL) +
+  scale_fill_gradientn(colours = ramp_to(type_colours[["m"]], 6)[-1], limits = c(0, 0.5),
+                       oob = scales::squish, labels = scales::label_percent(),
+                       name = "Obligate share of the classified species of each region in these climates") +
+  theme_map(base_size = 10) +
+  theme(legend.key.width = unit(2.2, "cm"), legend.title.position = "top",
+        legend.margin = margin(0, 0, 0, 0))
+shared_panel$layers[[6]] <- NULL
+save_figure(shared_panel, "plot_shared_climates_panel", 7.5, 4.3)
+shared
+```
+
+```{r clear_shared_climates, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

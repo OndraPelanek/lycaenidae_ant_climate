@@ -1,0 +1,444 @@
+---
+title: "Lycaenidae ant-interaction climate 13 - strategies in shared climates"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+`s07_compare_mediterranean` showed that the five Mediterranean-climate regions hold very different strategy mixes, and that each Cape or southern Australian hexagon is obligate-richer than the most similar hexagons of California and the Mediterranean Basin. The external review of 28 October 2026 asked for this comparison to be made stronger:
+
+1. **Genuine climatic overlap.** Nearest neighbours can be distant in climate. Here the regions are compared only within climate strata that both of them occupy (coarsened exact matching): cells of 2 °C annual mean temperature, 3 °C minimum temperature of the coldest month, 0.15 log10 aridity index and 15% precipitation seasonality.
+2. **Classification completeness.** Many recorded species are not classified. Each obligate share is given with its bounds (all unclassified species non-obligate, or all obligate) and with the unclassified species given the obligate share of their classified congeners.
+3. **Uncertainty from lineages.** Species of a genus are not independent, so obligate shares and their differences get 95% intervals from resampling genera (cluster bootstrap).
+4. **Beyond the five regions.** The same climates also occur outside the Mediterranean-climate regions. The species pools of every biogeographic region within the climate strata of the Cape and southern Australia (and, conversely, of the Mediterranean Basin) show whether the contrast generalises.
+5. **Species climates and shared lineages.** A species-level model compares the regions given each species' own climate; and within the genera that two regions share, the obligate shares of the two regions are compared.
+
+Central Chile has very few classified species and is shown but not interpreted.
+
+A full run takes about 5 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(mgcv)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+# Widths of the climate strata, and the factor of the coarse strata used as a check
+strata_widths <- c(bio01 = 2, bio06 = 3, log_aridity = 0.15, bio15 = 15)
+coarse_factor <- 2
+
+# A region occupies a stratum when it has at least this many pixels in it
+min_pixels <- 5
+
+# Mediterranean regions (s07) and biogeographic regions (s05)
+med_levels <- c("Mediterranean Basin", "California", "Central Chile", "Cape",
+                "Southern Australia")
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+
+# Pairs of Mediterranean regions compared in their shared climate
+med_pairs <- list(c("Cape", "Mediterranean Basin"), c("Southern Australia", "Mediterranean Basin"),
+                  c("Cape", "California"), c("Southern Australia", "California"),
+                  c("Cape", "Southern Australia"), c("Mediterranean Basin", "California"))
+
+# Target climates of the comparison beyond the five regions
+targets <- list(`Cape and S. Australia` = c("Cape", "Southern Australia"),
+                `Mediterranean Basin` = "Mediterranean Basin")
+
+# Bootstrap replicates (genera resampled)
+n_boot <- 1000
+
+# Colours
+med_colours <- c(`Mediterranean Basin` = "#0072B2", California = "#56B4E9",
+                 `Central Chile` = "#999999", Cape = "#E69F00",
+                 `Southern Australia` = "#D55E00")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s07 <- path_resrepo("data/intermediate/s07_compare_mediterranean")
+dir_data_intermediate <- path_resrepo("data/intermediate/s13_compare_matched_climates")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Region of points from their RESOLVE realm and coordinates, as in s05
+assign_region <- function(realm, lon, lat) {
+  r <- as.character(realm)
+  afr <- !is.na(r) & r == "Afrotropic"
+  r[afr] <- ifelse(lat[afr] < -15, "Southern Africa", "Tropical Africa")
+  aus <- !is.na(r) & r == "Australasia"
+  r[aus] <- ifelse(lat[aus] < -10 & lon[aus] < 160, "Australia", "New Guinea and islands")
+  r[!is.na(r) & r == "Oceania"] <- "New Guinea and islands"
+  factor(r, region_levels)
+}
+
+# Species (all units with records, classified or not) recorded in a set of pixels
+pool_of <- function(cells, records, taxa) {
+  taxa[pool_key %in% unique(records[cell %in% cells]$pool_key)]
+}
+
+# Obligate share of a pool: among classified species; its completeness bounds; with the
+# unclassified species given the obligate share of their classified congeners (anywhere), or
+# of the classified species of the pool when they have none; and a genus bootstrap
+summarise_pool <- function(pool, genus_share, boot = TRUE) {
+  cl <- pool[classified == TRUE]
+  uc <- pool[classified == FALSE]
+  imputed <- genus_share[match(uc$genus, genus)]$obligate_share
+  imputed[is.na(imputed)] <- if (nrow(cl)) mean(cl$obligate) else NA
+  out <- data.table(recorded = nrow(pool), classified = nrow(cl), obligate = sum(cl$obligate),
+                    genera = uniqueN(cl$genus),
+                    obligate_share = if (nrow(cl)) mean(cl$obligate) else NA_real_,
+                    lower_bound = sum(cl$obligate) / nrow(pool),
+                    upper_bound = (sum(cl$obligate) + nrow(uc)) / nrow(pool),
+                    imputed_share = (sum(cl$obligate) + sum(imputed)) / nrow(pool))
+  draws <- if (boot && nrow(cl)) boot_share(cl) else rep(NA_real_, n_boot)
+  out[, `:=`(boot_low = quantile(draws, 0.025, na.rm = TRUE),
+             boot_high = quantile(draws, 0.975, na.rm = TRUE))]
+  list(summary = out, draws = draws)
+}
+
+# Bootstrap of the obligate share of classified species, resampling genera with replacement
+boot_share <- function(cl) {
+  g <- cl[, .(n = .N, k = sum(obligate)), by = genus]
+  replicate(n_boot, {
+    i <- sample.int(nrow(g), replace = TRUE)
+    sum(g$k[i]) / sum(g$n[i])
+  })
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Climate strata of every land pixel, and the records in them
+
+Every 10-arc-minute land pixel with a climate gets its climate stratum, its biogeographic region (as in `s05`) and, for the Köppen–Geiger Cs pixels of `s07`, its Mediterranean region. Each record of a species is placed in its pixel. Species are taken with their strategy (if classified), genus and subfamily; obligate means obligate mutualist or parasite.
+
+*Inputs:* s01/ climate_present_10m.tif, realm_biome_10m.tif, realm_biome_codes.csv; s07/mediterranean_10m.tif; s02/ species_records.rds, species_climate.csv
+*Outputs:* pixel_strata.rds, record_pixels.rds, taxa.csv
+
+```{r pixel_strata}
+present <- rast(file.path(dir_s01, "climate_present_10m.tif"))[[c("bio01", "bio06", "bio15",
+                                                                   "aridity_index")]]
+rb <- rast(file.path(dir_s01, "realm_biome_10m.tif"))[["realm"]]
+codes <- fread(file.path(dir_s01, "realm_biome_codes.csv"))[layer == "realm"]
+med <- rast(file.path(dir_s07, "mediterranean_10m.tif"))
+
+pix <- as.data.table(as.data.frame(c(present, rb, med), cells = TRUE, na.rm = FALSE))
+pix <- pix[is.finite(bio01) & is.finite(bio06) & is.finite(bio15) & aridity_index > 0]
+xy <- xyFromCell(present, pix$cell)
+pix[, `:=`(log_aridity = log10(aridity_index),
+           region = assign_region(codes$name[match(realm, codes$code)], xy[, 1], xy[, 2]),
+           med_region = factor(med_levels[med_region], med_levels))]
+stratum_of <- function(w) paste(floor(pix$bio01 / w[["bio01"]]), floor(pix$bio06 / w[["bio06"]]),
+                                 floor(pix$log_aridity / w[["log_aridity"]]),
+                                 floor(pix$bio15 / w[["bio15"]]), sep = "_")
+pix[, `:=`(stratum = stratum_of(strata_widths),
+           stratum_coarse = stratum_of(coarse_factor * strata_widths))]
+pix <- pix[, .(cell, bio01, bio06, bio15, log_aridity, region, med_region, stratum,
+               stratum_coarse)]
+saveRDS(pix, file.path(dir_data_intermediate, "pixel_strata.rds"))
+
+# --- Records in pixels, and the species ---
+x <- readRDS(file.path(dir_s02, "species_records.rds"))
+x[, cell := cellFromXY(present, cbind(decimalLongitude, decimalLatitude))]
+rec <- unique(x[cell %in% pix$cell, .(pool_key, cell)])
+saveRDS(rec, file.path(dir_data_intermediate, "record_pixels.rds"))
+taxa <- fread(file.path(dir_s02, "species_climate.csv"),
+              colClasses = c(pool_key = "character"))[
+  , .(pool_key, species, genus, subfamily, interaction_type,
+      classified = interaction_type %in% c("n", "f", "m", "p"),
+      obligate = interaction_type %in% c("m", "p"))]
+write_table(taxa, file.path(dir_data_intermediate, "taxa.csv"))
+cat("land pixels:", nrow(pix), "; strata:", uniqueN(pix$stratum), "; Cs pixels:",
+    sum(!is.na(pix$med_region)), "; species-pixel records:", nrow(rec), "\n")
+print(pix[!is.na(med_region), .(pixels = .N, strata = uniqueN(stratum)), by = med_region])
+```
+
+```{r clear_pixel_strata, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Pairs of Mediterranean regions in their shared climate
+
+For each pair, the shared strata are those in which both regions have at least `r min_pixels` Cs pixels. Each region's pool is the species recorded in its Cs pixels of the shared strata. The difference in obligate share between the two regions gets a 95% interval from independent genus bootstraps of the two pools. The comparison is repeated with strata twice as wide, which lets more distant climates count as shared.
+
+*Inputs:* s13/ pixel_strata.rds, record_pixels.rds, taxa.csv
+*Outputs:* pair_comparisons.csv
+
+```{r pair_comparisons}
+pix <- readRDS(file.path(dir_data_intermediate, "pixel_strata.rds"))
+rec <- readRDS(file.path(dir_data_intermediate, "record_pixels.rds"))
+taxa <- fread(file.path(dir_data_intermediate, "taxa.csv"), colClasses = c(pool_key = "character"))
+genus_share <- taxa[classified == TRUE, .(obligate_share = mean(obligate)), by = genus]
+cs <- pix[!is.na(med_region)]
+
+set.seed(20261029)
+pairs <- rbindlist(lapply(c("standard", "coarse"), function(grain) {
+  cs[, s := if (grain == "standard") stratum else stratum_coarse]
+  occupied <- cs[, .N, by = .(med_region, s)][N >= min_pixels]
+  rbindlist(lapply(med_pairs, function(pr) {
+    shared <- intersect(occupied[med_region == pr[1]]$s, occupied[med_region == pr[2]]$s)
+    res <- lapply(pr, function(m) {
+      cells <- cs[med_region == m & s %in% shared]$cell
+      out <- summarise_pool(pool_of(cells, rec, taxa), genus_share)
+      out$summary[, `:=`(region = m, cs_share_in_shared = length(cells) / cs[med_region == m, .N])]
+      out
+    })
+    diff <- res[[1]]$draws - res[[2]]$draws
+    rbind(res[[1]]$summary, res[[2]]$summary)[
+      , `:=`(strata = grain, pair =paste(pr, collapse = " vs "), shared_strata = length(shared),
+             difference = res[[1]]$summary$obligate_share - res[[2]]$summary$obligate_share,
+             difference_low = quantile(diff, 0.025, na.rm = TRUE),
+             difference_high = quantile(diff, 0.975, na.rm = TRUE))]
+  }))
+}))
+write_table(pairs, file.path(dir_data_intermediate, "pair_comparisons.csv"))
+print(pairs[, .(strata, pair, region, shared_strata,
+                cs_share_in_shared = round(cs_share_in_shared, 2),
+                recorded, classified, genera, obligate_share = round(obligate_share, 2),
+                boot = paste0(round(boot_low, 2), "-", round(boot_high, 2)),
+                bounds = paste0(round(lower_bound, 2), "-", round(upper_bound, 2)),
+                imputed = round(imputed_share, 2), difference = round(difference, 2),
+                diff_ci = paste0(round(difference_low, 2), "-", round(difference_high, 2)))])
+```
+
+```{r clear_pair_comparisons, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# The same climates beyond the Mediterranean-climate regions
+
+For each target climate (the strata occupied by the Cs pixels of the Cape and southern Australia, and those of the Mediterranean Basin), the pool of each biogeographic region is the species recorded in its pixels of these strata, Cs pixels of the five regions excluded. If obligate associates were favoured by these climates as such, obligate-rich pools should occur in them wherever they are; if the contrast follows regional history, southern regions should be obligate-rich in them and northern and American regions obligate-poor.
+
+*Inputs:* s13/ pixel_strata.rds, record_pixels.rds, taxa.csv
+*Outputs:* beyond_mediterranean.csv
+
+```{r beyond_mediterranean}
+pix <- readRDS(file.path(dir_data_intermediate, "pixel_strata.rds"))
+rec <- readRDS(file.path(dir_data_intermediate, "record_pixels.rds"))
+taxa <- fread(file.path(dir_data_intermediate, "taxa.csv"), colClasses = c(pool_key = "character"))
+genus_share <- taxa[classified == TRUE, .(obligate_share = mean(obligate)), by = genus]
+occupied <- pix[!is.na(med_region), .N, by = .(med_region, stratum)][N >= min_pixels]
+
+set.seed(20261029)
+beyond <- rbindlist(lapply(names(targets), function(tg) {
+  strata <- unique(occupied[med_region %in% targets[[tg]]]$stratum)
+  outside <- pix[is.na(med_region) & !is.na(region) & stratum %in% strata]
+  rbindlist(lapply(region_levels, function(rg) {
+    cells <- outside[region == rg]$cell
+    if (!length(cells)) return(NULL)
+    s <- summarise_pool(pool_of(cells, rec, taxa), genus_share)$summary
+    s[, `:=`(target = tg, region = rg, pixels = length(cells))]
+  }))
+}))
+write_table(beyond, file.path(dir_data_intermediate, "beyond_mediterranean.csv"))
+print(beyond[, .(target, region, pixels, recorded, classified, genera,
+                 obligate_share = round(obligate_share, 2),
+                 boot = paste0(round(boot_low, 2), "-", round(boot_high, 2)),
+                 imputed = round(imputed_share, 2))])
+```
+
+```{r clear_beyond_mediterranean, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Species climates and shared lineages
+
+**Species climates.** The classified species of the Cs pools of the Cape, southern Australia and the Mediterranean Basin (`s07`) are related to their region with logistic models, without and with smooth terms of each species' own median climate (annual mean temperature, minimum temperature, aridity and seasonality, from `s02`); species in more than one pool are omitted. California has no obligate species, so its effect is not estimable, and a model with genus random effects separates completely (obligate genera are wholly obligate here), so lineage is examined through the shared genera instead.
+
+**Shared lineages.** For each pair of Cs pools, the genera with classified species in both are listed, and the obligate share of the species of these genera is compared between the two regions: a difference within shared genera is a difference that the lineages present do not explain.
+
+*Inputs:* s07/mediterranean_pool_species.csv; s02/species_climate.csv
+*Outputs:* species_region_effects.csv, shared_genera.csv
+
+```{r species_and_lineages}
+pool <- fread(file.path(dir_s07, "mediterranean_pool_species.csv"),
+              colClasses = c(pool_key = "character"))
+clim <- fread(file.path(dir_s02, "species_climate.csv"), colClasses = c(pool_key = "character"))
+pool <- pool[interaction_type %in% c("n", "f", "m", "p")]
+pool[, obligate := as.integer(interaction_type %in% c("m", "p"))]
+
+# --- Species climates ---
+d <- pool[med_region %in% c("Mediterranean Basin", "Cape", "Southern Australia")]
+d <- d[!pool_key %in% d[duplicated(pool_key)]$pool_key]
+d <- merge(d, clim[, .(pool_key, bio01, bio06, bio15, aridity_index)], by = "pool_key")
+d[, log_aridity := log10(aridity_index)]
+d <- d[complete.cases(d[, .(bio01, bio06, bio15, log_aridity)])]
+d[, med_region := factor(med_region, c("Mediterranean Basin", "Cape", "Southern Australia"))]
+smooths <- "s(bio01, k = 4) + s(bio06, k = 4) + s(log_aridity, k = 4) + s(bio15, k = 4)"
+fits <- list(`Region only` = "med_region",
+             `Region + species climate` = paste("med_region +", smooths))
+effects <- rbindlist(lapply(names(fits), function(f) {
+  m <- gam(as.formula(paste("obligate ~", fits[[f]])), data = d, family = binomial,
+           method = "REML")
+  cf <- summary(m)$p.table
+  cf <- cf[grepl("^med_region", rownames(cf)), , drop = FALSE]
+  data.table(model = f, region = sub("^med_region", "", rownames(cf)), estimate = cf[, 1],
+             se = cf[, 2], p = cf[, 4], species = nrow(d), dev_expl = summary(m)$dev.expl)
+}))
+write_table(effects, file.path(dir_data_intermediate, "species_region_effects.csv"))
+print(effects, digits = 3)
+print(d[, .(species = .N, obligate = sum(obligate)), by = med_region])
+
+# --- Shared genera ---
+shared <- rbindlist(lapply(med_pairs, function(pr) {
+  a <- pool[med_region == pr[1]]
+  b <- pool[med_region == pr[2]]
+  g <- intersect(a$genus, b$genus)
+  data.table(pair = paste(pr, collapse = " vs "), shared_genera = length(g),
+             genera = paste(sort(g), collapse = ", "),
+             species_1 = a[genus %in% g, .N], obligate_1 = a[genus %in% g, sum(obligate)],
+             species_2 = b[genus %in% g, .N], obligate_2 = b[genus %in% g, sum(obligate)],
+             share_of_obligate_1_in_shared = a[genus %in% g, sum(obligate)] / sum(a$obligate),
+             share_of_obligate_2_in_shared = b[genus %in% g, sum(obligate)] / sum(b$obligate))
+}))
+write_table(shared, file.path(dir_data_intermediate, "shared_genera.csv"))
+print(shared[, !"genera"], digits = 2)
+print(shared[, .(pair, genera)])
+```
+
+```{r clear_species_and_lineages, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(A) Obligate share of the classified species of each region in the climate strata it shares with the other region of the pair, for standard (filled) and coarse (open) strata: points with 95% genus-bootstrap intervals; grey bars span the completeness bounds; crosses give the share with unclassified species imputed from their congeners; labels give the classified species. Pairs without shared strata have no points. (B) The same for each biogeographic region in the climates of the Cape and southern Australia, and of the Mediterranean Basin, outside the five Mediterranean-climate regions (regions with at least five classified species). (C) Region effects on obligacy against the Mediterranean Basin among the classified species of the Cs pools, without and with each species' own climate (log odds, 95% intervals, truncated).
+
+*Inputs:* s13/ pair_comparisons.csv, beyond_mediterranean.csv, species_region_effects.csv
+*Outputs:* plot_matched_climates.png
+
+```{r plot_matched_climates}
+pairs <- fread(file.path(dir_data_intermediate, "pair_comparisons.csv"))
+beyond <- fread(file.path(dir_data_intermediate, "beyond_mediterranean.csv"))
+effects <- fread(file.path(dir_data_intermediate, "species_region_effects.csv"))
+base <- theme_minimal(base_size = 8.5) +
+  theme(panel.grid.minor = element_blank(), plot.title = element_text(face = "bold", size = 9.5),
+        strip.text = element_text(face = "bold"), legend.position = "bottom")
+
+# --- A: pairs, in standard and coarse strata ---
+strata_n <- dcast(unique(pairs[, .(pair, strata, shared_strata)]), pair ~ strata,
+                  value.var = "shared_strata")
+pairs <- merge(pairs, strata_n[, .(pair, pair_label = paste0(
+  pair, "\n(shared strata: ", standard, " standard, ", coarse, " coarse)"))], by = "pair")
+pairs[, `:=`(pair_label = factor(pair_label, pair_label[match(sapply(med_pairs, paste,
+                                                                       collapse = " vs "), pair)]),
+             region = factor(region, med_levels),
+             strata = factor(strata, c("standard", "coarse")))]
+pairs <- pairs[classified > 0]
+dodge <- position_dodge(width = 0.6)
+panel_a <- ggplot(pairs, aes(y = region, group = strata)) +
+  geom_linerange(aes(xmin = 100 * lower_bound, xmax = 100 * upper_bound), colour = "grey85",
+                 linewidth = 2.2, position = dodge) +
+  geom_errorbar(aes(xmin = 100 * boot_low, xmax = 100 * boot_high, colour = region),
+                width = 0, linewidth = 0.6, orientation = "y", position = dodge) +
+  geom_point(aes(x = 100 * obligate_share, colour = region, shape = strata), size = 2,
+             fill = "white", position = dodge) +
+  geom_point(aes(x = 100 * imputed_share), shape = 4, size = 1.4, position = dodge) +
+  geom_text(aes(x = 102, label = classified), hjust = 0, size = 2.1, colour = "grey40",
+            position = dodge) +
+  facet_wrap(~ pair_label, ncol = 2, scales = "free_y", drop = FALSE) +
+  scale_colour_manual(values = med_colours, guide = "none") +
+  scale_shape_manual(values = c(standard = 16, coarse = 21), name = "Climate strata") +
+  scale_x_continuous(limits = c(0, 110), breaks = seq(0, 100, 25)) +
+  labs(x = "Obligate associates (% of classified species)", y = NULL,
+       title = "Pairs of Mediterranean-climate regions in shared climate strata") +
+  base
+
+# --- B: beyond the Mediterranean-climate regions ---
+beyond[, `:=`(region = factor(region, rev(region_levels)),
+              target = factor(paste(target, "climates"),
+                              paste(names(targets), "climates")))]
+panel_b <- ggplot(beyond[classified >= 5], aes(y = region)) +
+  geom_linerange(aes(xmin = 100 * lower_bound, xmax = 100 * upper_bound), colour = "grey85",
+                 linewidth = 2.5) +
+  geom_errorbar(aes(xmin = 100 * boot_low, xmax = 100 * boot_high), width = 0,
+                linewidth = 0.6, orientation = "y") +
+  geom_point(aes(x = 100 * obligate_share), size = 2) +
+  geom_point(aes(x = 100 * imputed_share), shape = 4, size = 1.6) +
+  geom_text(aes(x = 102, label = classified), hjust = 0, size = 2.2, colour = "grey40") +
+  facet_wrap(~ target, nrow = 1) +
+  scale_x_continuous(limits = c(0, 110), breaks = seq(0, 100, 25)) +
+  labs(x = "Obligate associates (% of classified species)", y = NULL,
+       title = "The same climates outside the Mediterranean-climate regions") +
+  base
+
+# --- C: species-level region effects ---
+lim <- 8
+effects[, `:=`(region = factor(region, rev(c("Cape", "Southern Australia"))),
+               model = factor(model, unique(model)),
+               low = pmax(estimate - 1.96 * se, -lim), high = pmin(estimate + 1.96 * se, lim))]
+panel_c <- ggplot(effects, aes(estimate, region, shape = model)) +
+  geom_vline(xintercept = 0, colour = "grey55", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = low, xmax = high), width = 0, linewidth = 0.45, orientation = "y",
+                 position = position_dodge(width = 0.6)) +
+  geom_point(size = 1.9, fill = "white", position = position_dodge(width = 0.6)) +
+  scale_shape_manual(values = c(16, 21), name = NULL) +
+  coord_cartesian(xlim = c(-1, lim)) +
+  labs(x = "Log odds of obligacy against
+the Mediterranean Basin (95% CI)", y = NULL,
+       title = "Species of the Cs pools") +
+  guides(shape = guide_legend(ncol = 1)) +
+  base
+
+fig <- panel_a / (panel_b + panel_c + plot_layout(widths = c(1.7, 1))) +
+  plot_layout(heights = c(1.3, 1)) +
+  plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(face = "bold", size = 12))
+save_figure(fig, "plot_matched_climates", 10, 10)
+fig
+```
+
+```{r clear_plot_matched_climates, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

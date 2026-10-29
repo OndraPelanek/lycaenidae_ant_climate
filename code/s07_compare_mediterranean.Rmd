@@ -1,0 +1,355 @@
+---
+title: "Lycaenidae ant-interaction climate 07 - the five Mediterranean-climate regions"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+The five regions with a Mediterranean climate (the Cape of southern Africa, south-western and southern Australia, the Mediterranean Basin, California and central Chile) have similar climates, with mild wet winters and dry summers, but their faunas have different histories. If present climate shaped the strategies of lycaenids, their assemblages should be similar; if the regional species pool did, they should differ in the way their lineages differ. This makes them a matched comparison of climate against history.
+
+1. Mediterranean climate is defined as the Köppen–Geiger class Cs (temperate with a dry summer; Beck et al. 2023), computed from the monthly temperature and precipitation of WorldClim 2.1 with `pastclim::koeppen_geiger()`. Cs pixels are assigned to the five regions by their coordinates.
+2. The species pool of each region is every classified species with records in its Cs pixels. The composition of the pools and the genera behind each strategy are compared.
+3. The climates of the five regions are compared, to show how similar they are.
+4. For each hexagon (about 70,000 km², resolution 6 of `s05_compare_regions`) of the Cape and of Australia that is mostly Cs, the most similar hexagons in climate in California, Chile and the Mediterranean Basin are found, and their obligate shares are compared.
+
+A full run takes about 5 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(pastclim)
+library(dggridR)
+library(sf)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+# Bounding boxes (longitude and latitude) of the five Mediterranean-climate regions; Cs pixels
+# outside them (e.g. in central Asia or highlands) are not used
+med_regions <- list(
+  `Mediterranean Basin` = c(-20, 60, 28, 48),
+  California = c(-126, -114, 28, 45),
+  `Central Chile` = c(-76, -68, -42, -27),
+  Cape = c(15, 30, -36, -29),
+  `Southern Australia` = c(110, 155, -40, -25))
+med_levels <- names(med_regions)
+
+# Hexagons of resolution 6 count as Mediterranean when at least 30% of their land is Cs (the Cs area
+# of the Cape is small), and enter
+# the comparison with at least this many classified species
+min_cs_share <- 0.3
+min_classified <- 5
+
+# Climate variables of the matching (standardised); each southern hexagon is matched with the
+# nearest hexagons in the climate space of each northern or American region
+match_vars <- c("bio01", "bio06", "log_aridity", "bio15")
+match_k <- 3
+
+# Colours of the interaction types, as in butterfly_ant_interactions
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+type_labels <- c(n = "Non-associated", f = "Facultative", m = "Obligate mutualist",
+                 p = "Obligate parasite")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_data_intermediate <- path_resrepo("data/intermediate/s07_compare_mediterranean")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+source(here::here("code", "R", "projections.R"))
+```
+
+```{r define_helpers}
+# Read the 12 monthly WorldClim 2.1 layers of one variable from its zip archive
+read_monthly <- function(variable) {
+  zip <- file.path(dir_data_raw, "worldclim_2.1", paste0("wc2.1_10m_", variable, ".zip"))
+  files <- sort(grep("\\.tif$", unzip(zip, list = TRUE)$Name, value = TRUE))
+  rast(file.path("/vsizip", zip, files))
+}
+
+# Mediterranean region of points, from the bounding boxes (NA outside all of them)
+med_region_of <- function(lon, lat) {
+  r <- rep(NA_character_, length(lon))
+  for (m in med_levels) {
+    b <- med_regions[[m]]
+    r[is.na(r) & lon >= b[1] & lon <= b[2] & lat >= b[3] & lat <= b[4]] <- m
+  }
+  factor(r, med_levels)
+}
+
+# Save a figure with ragg; width and height in inches
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Mediterranean climate
+
+The Köppen–Geiger class of each 10-arc-minute pixel is computed from the WorldClim monthly precipitation and mean temperature (the mean of the monthly minimum and maximum). Pixels of classes Csa, Csb and Csc inside the bounding box of one of the five regions are Mediterranean.
+
+*Inputs:* raw/worldclim_2.1/ wc2.1_10m_prec.zip, wc2.1_10m_tmin.zip, wc2.1_10m_tmax.zip; s01/climate_present_10m.tif
+*Outputs:* mediterranean_10m.tif, mediterranean_pixels.csv
+
+```{r mediterranean_climate}
+prec <- read_monthly("prec")
+tavg <- (read_monthly("tmin") + read_monthly("tmax")) / 2
+kg <- koeppen_geiger(prec = prec, tavg = tavg)
+cls <- levels(kg)[[1]]
+cs_codes <- cls[[1]][grepl("^Cs", cls[[2]])]
+cs <- ifel(kg %in% cs_codes, 1, NA)
+
+# --- Region of the Cs pixels and their climate ---
+present <- rast(file.path(dir_s01, "climate_present_10m.tif"))
+d <- as.data.table(as.data.frame(c(cs, present[[c("bio01", "bio06", "bio15", "aridity_index")]]),
+                                 xy = TRUE, na.rm = FALSE))
+setnames(d, 3, "cs")
+d <- d[cs == 1 & !is.na(bio01)]
+d[, med_region := med_region_of(x, y)]
+d <- d[!is.na(med_region)]
+d[, log_aridity := log10(aridity_index)]
+write_table(d, file.path(dir_data_intermediate, "mediterranean_pixels.csv"))
+
+med_r <- rasterize(as.matrix(d[, .(x, y)]), present, values = as.integer(d$med_region))
+names(med_r) <- "med_region"
+writeRaster(med_r, file.path(dir_data_intermediate, "mediterranean_10m.tif"), overwrite = TRUE)
+print(d[, .(pixels = .N, area_index = round(sum(cos(y * pi / 180)))), by = med_region])
+```
+
+```{r clear_mediterranean_climate, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Species pools of the five regions
+
+The pool of a region is every unit with at least one stringently cleaned record in its Cs pixels. Classified species are counted by strategy, with the number of genera behind each strategy.
+
+*Inputs:* s02/species_records.rds, species_climate.csv; s07/mediterranean_10m.tif
+*Outputs:* mediterranean_pools.csv, mediterranean_pool_species.csv
+
+```{r species_pools}
+x <- readRDS(file.path(dir_s02, "species_records.rds"))
+tab <- fread(file.path(dir_s02, "species_climate.csv"), colClasses = c(pool_key = "character"))
+med_r <- rast(file.path(dir_data_intermediate, "mediterranean_10m.tif"))
+
+x[, med := extract(med_r, cbind(decimalLongitude, decimalLatitude))[, 1]]
+pool <- unique(x[!is.na(med), .(pool_key, med_region = factor(med_levels[med], med_levels))])
+pool <- merge(pool, tab[, .(pool_key, species, genus, subfamily, interaction_type)],
+              by = "pool_key")
+write_table(pool, file.path(dir_data_intermediate, "mediterranean_pool_species.csv"))
+
+pools <- pool[interaction_type %in% names(type_colours),
+              .(species = .N, genera = uniqueN(genus)), by = .(med_region, interaction_type)]
+pools[, share := species / sum(species), by = med_region]
+pools <- merge(pools, pool[, .(recorded = .N), by = med_region], by = "med_region")
+write_table(pools[order(med_region, interaction_type)],
+            file.path(dir_data_intermediate, "mediterranean_pools.csv"))
+print(dcast(pools, med_region + recorded ~ interaction_type, value.var = c("species", "genera")))
+```
+
+```{r clear_species_pools, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Climate-matched hexagons
+
+Each 10-arc-minute pixel is assigned to its hexagon of resolution 6 (about 70,000 km²); a hexagon is Mediterranean when at least 30% of its land pixels are Cs pixels of one region (the Cs area of the Cape is too small for a stricter threshold), and its climate is the mean of its Cs pixels. The species of each hexagon and their strategies come from `s05_compare_regions`. For each Mediterranean hexagon of the Cape and of southern Australia with enough classified species, the `r match_k` hexagons with the most similar climate (Euclidean distance of the standardised climate variables) are found in each of California, central Chile and the Mediterranean Basin, and the obligate shares (of all classified species) of the southern hexagon and of its matches are compared.
+
+*Inputs:* s07/mediterranean_pixels.csv; s05/ presence_hex6.csv, species_regions.csv
+*Outputs:* mediterranean_hexagons.csv, mediterranean_matches.csv
+
+```{r matched_hexagons}
+d <- fread(file.path(dir_data_intermediate, "mediterranean_pixels.csv"))
+d[, med_region := factor(med_region, med_levels)]
+dg <- dgconstruct(res = 6)
+
+# --- Mediterranean hexagons and their climate ---
+d[, cell_id := dgGEO_to_SEQNUM(dg, x, y)$seqnum]
+present <- rast(file.path(dir_s01, "climate_present_10m.tif"))
+land <- as.data.table(as.data.frame(present[["bio01"]], xy = TRUE, na.rm = TRUE))
+land[, cell_id := dgGEO_to_SEQNUM(dg, x, y)$seqnum]
+land_n <- land[, .(land_pixels = .N), by = cell_id]
+hex <- d[, c(list(cs_pixels = .N, med_region = med_region[which.max(tabulate(med_region))]),
+             lapply(.SD, mean)), by = cell_id, .SDcols = match_vars]
+hex <- merge(hex, land_n, by = "cell_id")
+hex[, cs_share := cs_pixels / land_pixels]
+hex <- hex[cs_share >= min_cs_share]
+
+# --- Their classified species ---
+pres <- fread(file.path(dir_s05, "presence_hex6.csv"), colClasses = c(pool_key = "character"))
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+pres <- merge(pres[cell_id %in% hex$cell_id], sp[, .(pool_key, interaction_type)], by = "pool_key")
+counts <- pres[interaction_type %in% names(type_colours),
+               .(n_classified = .N, n_n = sum(interaction_type == "n"),
+                 n_f = sum(interaction_type == "f"), n_m = sum(interaction_type == "m"),
+                 n_p = sum(interaction_type == "p")), by = cell_id]
+hex <- merge(hex, counts, by = "cell_id")[n_classified >= min_classified]
+hex[, obligate_share := (n_m + n_p) / n_classified]
+write_table(hex, file.path(dir_data_intermediate, "mediterranean_hexagons.csv"))
+print(hex[, .(hexagons = .N, classified_median = median(n_classified),
+              obligate_share_mean = mean(obligate_share)), by = med_region])
+
+# --- Climate matching ---
+z <- scale(as.matrix(hex[, ..match_vars]))
+south <- which(hex$med_region %in% c("Cape", "Southern Australia"))
+targets <- c("California", "Central Chile", "Mediterranean Basin")
+matches <- rbindlist(lapply(south, function(i) rbindlist(lapply(targets, function(tg) {
+  j <- which(hex$med_region == tg)
+  if (!length(j)) return(NULL)
+  dist <- sqrt(colSums((t(z[j, , drop = FALSE]) - z[i, ])^2))
+  best <- j[order(dist)][seq_len(min(match_k, length(j)))]
+  data.table(source_cell = hex$cell_id[i], source_region = hex$med_region[i],
+             source_obligate = hex$obligate_share[i], target_region = tg,
+             target_obligate = mean(hex$obligate_share[best]),
+             climate_distance = mean(sort(dist)[seq_len(length(best))]))
+}))))
+write_table(matches, file.path(dir_data_intermediate, "mediterranean_matches.csv"))
+print(matches[, .(pairs = .N, source_obligate = mean(source_obligate),
+                  target_obligate = mean(target_obligate),
+                  climate_distance = median(climate_distance)),
+              by = .(source_region, target_region)], digits = 2)
+```
+
+```{r clear_matched_hexagons, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(A) The Cs pixels of the five regions. (B) The strategies of their species pools, with the number of genera behind each strategy. (C) Their climates: annual mean temperature, the minimum temperature of the coldest month, the aridity index and precipitation seasonality of the Cs pixels. (D) The obligate share of the classified species in each Mediterranean hexagon of the Cape and southern Australia against the mean obligate share of its climate-matched hexagons in each northern or American region.
+
+*Inputs:* s07/ mediterranean_pixels.csv, mediterranean_pools.csv, mediterranean_matches.csv
+*Outputs:* plot_mediterranean.png
+
+```{r plot_mediterranean}
+d <- fread(file.path(dir_data_intermediate, "mediterranean_pixels.csv"))
+pools <- fread(file.path(dir_data_intermediate, "mediterranean_pools.csv"))
+matches <- fread(file.path(dir_data_intermediate, "mediterranean_matches.csv"))
+for (z in list(d, pools)) z[, med_region := factor(med_region, med_levels)]
+
+# --- A: map of the Cs pixels of the five regions ---
+crs <- global_equal_area_crs()
+world <- st_transform(rnaturalearth::ne_countries(scale = "small", returnclass = "sf")[, "geometry"],
+                      crs)
+pts <- st_transform(st_as_sf(d[, .(x, y)], coords = c("x", "y"), crs = 4326), crs)
+lab <- d[, .(x = mean(x), y = mean(y)), by = med_region]
+lab <- cbind(lab, st_coordinates(st_transform(st_as_sf(lab, coords = c("x", "y"), crs = 4326),
+                                              crs)))
+panel_a <- ggplot() +
+  geom_sf(data = world, fill = "grey88", colour = "grey60", linewidth = 0.1) +
+  geom_sf(data = pts, colour = "grey15", size = 0.05, shape = 15) +
+  # Labels above the northern and below the southern regions, inside the map
+  geom_text(data = lab, aes(X, Y + ifelse(Y > 0, 1.1e6, -1.1e6), label = med_region),
+            size = 2.6, fontface = "bold", colour = "grey10") +
+  coord_sf(crs = crs, ylim = c(-6.4e6, 7e6), expand = FALSE, datum = NA) +
+  labs(title = "Mediterranean climate (Köppen Cs)") +
+  theme_void(base_size = 9) +
+  theme(plot.title = element_text(face = "bold", size = 9.5, hjust = 0),
+        panel.background = element_rect(fill = "#ADD8E6", colour = NA))
+
+# --- B: strategies of the species pools ---
+pools[, interaction_type := factor(interaction_type, rev(names(type_colours)))]
+totals <- pools[, .(n = sum(species)), by = med_region]
+panel_b <- ggplot(pools, aes(share, med_region, fill = interaction_type)) +
+  geom_col(width = 0.7, colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = ifelse(share > 0.07, paste0(genera, " g"), "")),
+            position = position_stack(vjust = 0.5), size = 2.4, colour = "white") +
+  geom_text(data = totals, aes(x = 1.01, y = med_region, label = paste0("n = ", n)),
+            inherit.aes = FALSE, hjust = 0, size = 2.5, colour = "grey25") +
+  scale_y_discrete(limits = rev(med_levels)) +
+  scale_fill_manual(values = type_colours, labels = type_labels, breaks = names(type_colours),
+                    name = NULL) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1.17), breaks = seq(0, 1, 0.5),
+                     expand = expansion(mult = 0)) +
+  labs(x = "Share of classified species (labels: genera)", y = NULL, title = "Species pools") +
+  guides(fill = guide_legend(nrow = 2)) +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        legend.position = "bottom", plot.title = element_text(face = "bold", size = 9.5))
+
+# --- C: climates of the Cs pixels ---
+clim <- melt(d[, .(med_region, `Annual mean temperature (°C)` = bio01,
+                   `Min. temperature, coldest month (°C)` = bio06,
+                   `Aridity index (log10 P/PET)` = log_aridity,
+                   `Precipitation seasonality` = bio15)],
+             id.vars = "med_region")
+panel_c <- ggplot(clim, aes(value, med_region)) +
+  geom_boxplot(outlier.size = 0.2, outlier.alpha = 0.3, width = 0.6, fill = "grey92",
+               colour = "grey25", linewidth = 0.35) +
+  facet_wrap(~ variable, nrow = 1, scales = "free_x", labeller = label_wrap_gen(width = 20)) +
+  scale_y_discrete(limits = rev(med_levels)) +
+  labs(x = NULL, y = NULL, title = "Their climates") +
+  theme_minimal(base_size = 8.5) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        strip.text = element_text(size = 7.5), plot.title = element_text(face = "bold", size = 9.5))
+
+# --- D: obligate shares of climate-matched hexagons ---
+panel_d <- ggplot(matches, aes(source_obligate, target_obligate, shape = source_region)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_point(size = 1.6, alpha = 0.8) +
+  facet_wrap(~ target_region, nrow = 1) +
+  scale_shape_manual(values = c(Cape = 16, `Southern Australia` = 1), name = NULL) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = "Obligate share, Cape or Australian hexagon",
+       y = "Obligate share, matched hexagons", title = "Climate-matched comparison") +
+  coord_equal() +
+  theme_minimal(base_size = 8.5) +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom",
+        strip.text = element_text(face = "bold"),
+        plot.title = element_text(face = "bold", size = 9.5))
+
+fig <- ((panel_a | panel_b) + plot_layout(widths = c(1.35, 1))) / panel_c / panel_d +
+  plot_layout(heights = c(1, 0.75, 0.95)) + plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(face = "bold", size = 12))
+save_figure(fig, "plot_mediterranean", 10.5, 10)
+fig
+```
+
+```{r clear_plot_mediterranean, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

@@ -1,0 +1,385 @@
+---
+title: "Lycaenidae ant-interaction climate 11 - precipitation seasonality under strong controls"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+Of the climatic and environmental properties tested so far, precipitation seasonality is the only one associated with obligacy after accounting for both region and lineage (`s08_test_southern_drivers`). It also has a plausible mechanism: where long dry seasons limit food and expose larvae, life histories tied to ants, and especially to their nests, may be favoured (Espeland et al. 2023). This notebook asks whether the association is robust enough to build on, following an external review of the study (28 October 2026).
+
+1. **The effect under strong controls.** The effect of precipitation seasonality is estimated given region and lineage for three contrasts that separate dependence from exploitation (obligate against facultative, obligate mutualist against facultative, parasite against mutualist), and repeated:
+   - jointly with temperature and aridity;
+   - with species-specific evidence only (many types, especially of parasites, were assigned from statements about relatives or genera): a directly recorded class, and for parasite against mutualist also a directly recorded subtype;
+   - without each of the large obligate genera;
+   - within each region;
+   - within genera;
+   - with phylogenetic logistic regression on both trees.
+2. **Transfer to each held-out subfamily**, for the predictor sets of `s06` and `s08`, so that a pooled score cannot hide subfamilies the models fail on.
+3. **The genera that contain both obligate and facultative species**, the only direct evolutionary information on climate and obligacy within lineages: their species, regions, evidence and tree coverage.
+
+A full run takes about 5 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(mgcv)
+library(ape)
+library(phylolm)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+# Contrasts: the species included and the strategies coded 1
+contrasts <- list(
+  obligate = list(rows = c("f", "m", "p"), success = c("m", "p"),
+                  label = "Obligate vs facultative"),
+  mutualist = list(rows = c("f", "m"), success = "m",
+                   label = "Obligate mutualist vs facultative"),
+  parasite = list(rows = c("m", "p"), success = "p", label = "Parasite vs mutualist"))
+
+# Large obligate genera dropped in turn
+large_genera <- c("Lepidochrysops", "Thestor", "Chrysoritis")
+
+# Regions with enough species of both outcomes for a within-region estimate
+min_outcome <- 8
+
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+phyloglm_btol <- 30
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s04 <- path_resrepo("data/intermediate/s04_fit_phylogenetic_models")
+dir_s08 <- path_resrepo("data/intermediate/s08_test_southern_drivers")
+dir_data_intermediate <- path_resrepo("data/intermediate/s11_test_seasonality")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Associated species with drivers (s08), their evidence basis and the strategy codes; predictors
+# are restandardised over each analysed subset by the model function
+read_species <- function() {
+  sp <- fread(file.path(dir_s08, "species_drivers.csv"), colClasses = c(pool_key = "character"))
+  tab <- fread(file.path(dir_data_raw, "butterfly_ant_interactions", "species_table.csv"),
+               colClasses = c(pool_key = "character"))
+  sp <- merge(sp, tab[, .(pool_key, interaction_type_basis)], by = "pool_key")
+  sp[, direct := interaction_type_basis %in% c("direct", "direct_class_inferred_subtype")]
+  sp
+}
+
+# Species with species-specific evidence for a contrast: a directly recorded class, and for
+# parasite against mutualist also a directly recorded subtype
+specific <- function(sp, ct) {
+  sp[direct == TRUE & (ct != "parasite" | interaction_type_basis == "direct")]
+}
+
+# Effect of precipitation seasonality on a contrast, given region (when several) and lineage;
+# `extra` adds covariates, `within` replaces bio15 by its deviation from the genus mean
+fit_seasonality <- function(sp, ct, label, extra = character(), region = TRUE,
+                            within = FALSE) {
+  d <- copy(sp[interaction_type %in% contrasts[[ct]]$rows])
+  d[, y := as.integer(interaction_type %in% contrasts[[ct]]$success)]
+  if (sum(d$y) < min_outcome || sum(1 - d$y) < min_outcome) return(NULL)
+  d[, `:=`(region = factor(region), genus = factor(genus), subfamily = factor(subfamily))]
+  for (v in c("bio15", "bio01", "log_aridity")) set(d, j = paste0(v, "_s"),
+                                                    value = as.numeric(scale(d[[v]])))
+  term <- "bio15_s"
+  if (within) {
+    d[, `:=`(bio15_within = bio15_s - ave(bio15_s, genus), bio15_between = ave(bio15_s, genus))]
+    term <- "bio15_within"
+  }
+  rhs <- c(if (region && nlevels(d$region) > 1) "region",
+           if (within) c("bio15_within", "bio15_between") else "bio15_s",
+           paste0(extra, "_s"),
+           if (nlevels(d$subfamily) > 1) "s(subfamily, bs = 're')", "s(genus, bs = 're')")
+  rhs <- rhs[rhs != "_s"]
+  m <- gam(as.formula(paste("y ~", paste(rhs, collapse = " + "))), data = d, family = binomial,
+           method = "REML")
+  cf <- summary(m)$p.table[term, ]
+  data.table(contrast = ct, analysis = label, species = nrow(d), events = sum(d$y),
+             genera = uniqueN(d$genus), estimate = cf[1], se = cf[2], p = cf[4])
+}
+
+# Binomial deviance and cross-validated deviance explained (as in s06 and s08)
+binary_deviance <- function(y, q) {
+  q <- pmin(pmax(q, 1e-9), 1 - 1e-9)
+  -2 * sum(y * log(q) + (1 - y) * log(1 - q))
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# The seasonality effect under strong controls
+
+Each row is one model of one contrast; all include random intercepts of subfamily and genus, and all but the within-region rows include region as a fixed effect. Precipitation seasonality is standardised over the species of each analysis, so estimates are log odds ratios per standard deviation in that analysis.
+
+*Inputs:* s08/species_drivers.csv; raw/butterfly_ant_interactions/species_table.csv
+*Outputs:* seasonality_effects.csv
+
+```{r seasonality_effects}
+sp <- read_species()
+cat("associated species:", nrow(sp), "; with species-specific evidence:", sum(sp$direct), "\n")
+print(dcast(sp[, .N, by = .(interaction_type, direct)], interaction_type ~ direct,
+            value.var = "N"))
+
+effects <- rbindlist(lapply(names(contrasts), function(ct) {
+  rows <- list(
+    fit_seasonality(sp, ct, "Reference: region and lineage"),
+    fit_seasonality(sp, ct, "With temperature and aridity", extra = c("bio01", "log_aridity")),
+    fit_seasonality(specific(sp, ct), ct, "Species-specific evidence only"),
+    fit_seasonality(specific(sp, ct), ct, "Species-specific evidence, with temperature and aridity",
+                    extra = c("bio01", "log_aridity")),
+    fit_seasonality(sp, ct, "Within genera (deviation from genus mean)", within = TRUE))
+  for (g in large_genera)
+    rows[[length(rows) + 1]] <- fit_seasonality(sp[genus != g], ct, paste("Without", g))
+  rows[[length(rows) + 1]] <- fit_seasonality(sp[!genus %in% large_genera], ct,
+                                              "Without all three")
+  for (rg in region_levels)
+    rows[[length(rows) + 1]] <- fit_seasonality(sp[region == rg], ct, paste("Within", rg),
+                                                region = FALSE)
+  rbindlist(rows)
+}))
+write_table(effects, file.path(dir_data_intermediate, "seasonality_effects.csv"))
+print(effects, digits = 3)
+```
+
+```{r clear_seasonality_effects, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Phylogenetic logistic regression
+
+The same contrasts are fitted with `phyloglm` on both grafted trees of `s04`, with precipitation seasonality and region as predictors.
+
+*Inputs:* s08/species_drivers.csv; s04/grafted_trees.rds
+*Outputs:* seasonality_phylo.csv
+
+```{r seasonality_phylo}
+sp <- read_species()
+trees <- readRDS(file.path(dir_s04, "grafted_trees.rds"))
+phylo <- rbindlist(lapply(names(trees), function(study) rbindlist(lapply(names(contrasts),
+                                                                         function(ct) {
+  d <- as.data.frame(sp[interaction_type %in% contrasts[[ct]]$rows &
+                          species %in% trees[[study]]$tip.label])
+  d$y <- as.integer(d$interaction_type %in% contrasts[[ct]]$success)
+  d$bio15_s <- as.numeric(scale(d$bio15))
+  d$region <- factor(d$region)
+  rownames(d) <- d$species
+  tr <- keep.tip(trees[[study]], d$species)
+  m <- tryCatch(phyloglm(y ~ bio15_s + region, data = d, phy = tr, method = "logistic_MPLE",
+                         btol = phyloglm_btol), error = function(e) NULL)
+  if (is.null(m)) return(NULL)
+  cf <- summary(m)$coefficients["bio15_s", ]
+  data.table(tree = study, contrast = ct, species = nrow(d), events = sum(d$y),
+             estimate = cf[1], se = cf[2], p = cf[4], alpha = m$alpha)
+}))))
+write_table(phylo, file.path(dir_data_intermediate, "seasonality_phylo.csv"))
+print(phylo, digits = 3)
+```
+
+```{r clear_seasonality_phylo, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Transfer to each held-out subfamily
+
+For obligacy (obligate against facultative), each subfamily with obligate and facultative species is held out in turn and predicted by logistic regressions fitted to the others, with the predictor sets: region; latitude and hemisphere; latitude and hemisphere plus precipitation seasonality; precipitation seasonality alone. Deviance explained is computed within each held-out subfamily against the obligate share of the training species (the prevalence baseline); the predicted and observed obligate shares show calibration.
+
+*Inputs:* s08/species_drivers.csv
+*Outputs:* subfamily_transfer.csv
+
+```{r subfamily_transfer}
+sp <- read_species()
+d <- sp[interaction_type %in% c("f", "m", "p")]
+d[, `:=`(y = as.integer(interaction_type %in% c("m", "p")), region = factor(region),
+         hemisphere = factor(hemisphere))]
+for (v in c("bio15", "abs_latitude")) set(d, j = paste0(v, "_s"), value = as.numeric(scale(d[[v]])))
+sets <- c(region = "region", `latitude x hemisphere` = "abs_latitude_s * hemisphere",
+          `latitude x hemisphere + seasonality` = "abs_latitude_s * hemisphere + bio15_s",
+          `seasonality alone` = "bio15_s")
+held <- d[, .(obligate = sum(y), facultative = sum(1 - y)), by = subfamily][
+  obligate > 0 & facultative > 0]$subfamily
+
+transfer <- rbindlist(lapply(held, function(sf) rbindlist(lapply(names(sets), function(s) {
+  X <- model.matrix(as.formula(paste("~", sets[[s]])), data = d)
+  test <- d$subfamily == sf
+  fit <- suppressWarnings(glm.fit(X[!test, , drop = FALSE], d$y[!test], family = binomial()))
+  b <- fit$coefficients
+  b[is.na(b)] <- 0
+  q <- as.numeric(plogis(X[test, , drop = FALSE] %*% b))
+  q0 <- rep(mean(d$y[!test]), sum(test))
+  data.table(subfamily = sf, set = s, species = sum(test), obligate = sum(d$y[test]),
+             observed_share = mean(d$y[test]), predicted_share = mean(q),
+             baseline_share = q0[1],
+             d2 = 1 - binary_deviance(d$y[test], q) / binary_deviance(d$y[test], q0))
+}))))
+write_table(transfer, file.path(dir_data_intermediate, "subfamily_transfer.csv"))
+print(dcast(transfer, subfamily + species + obligate + observed_share ~ set, value.var = "d2"),
+      digits = 2)
+```
+
+```{r clear_subfamily_transfer, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Genera with both obligate and facultative species
+
+The genera with at least one obligate and one facultative species are the only places where the evolution of obligacy can be compared with climate among close relatives. For each: the species of each strategy, the regions, the share with species-specific evidence, the share on the published tree, and the median precipitation seasonality of its obligate and facultative species.
+
+*Inputs:* s08/species_drivers.csv; raw/butterfly_ant_interactions/crosswalk_yumnam_2025.csv
+*Outputs:* mixed_genera.csv
+
+```{r mixed_genera}
+sp <- read_species()
+cw <- fread(file.path(dir_data_raw, "butterfly_ant_interactions", "crosswalk_yumnam_2025.csv"))
+sp[, on_tree := species %in% cw[matched == TRUE]$analysis_species]
+mixed <- sp[, .(f = sum(interaction_type == "f"), m = sum(interaction_type == "m"),
+                p = sum(interaction_type == "p")), by = genus][f > 0 & (m + p) > 0]$genus
+tab <- sp[genus %in% mixed, .(
+  subfamily = subfamily[1], facultative = sum(interaction_type == "f"),
+  mutualist = sum(interaction_type == "m"), parasite = sum(interaction_type == "p"),
+  regions = paste(names(sort(table(region), decreasing = TRUE)), collapse = ", "),
+  direct_share = mean(direct), on_tree_share = mean(on_tree),
+  seasonality_obligate = median(bio15[interaction_type %in% c("m", "p")]),
+  seasonality_facultative = median(bio15[interaction_type == "f"])), by = genus]
+tab[, obligate_more_seasonal := seasonality_obligate > seasonality_facultative]
+write_table(tab[order(-(mutualist + parasite))],
+            file.path(dir_data_intermediate, "mixed_genera.csv"))
+print(tab[order(-(mutualist + parasite))], digits = 2)
+cat("genera in which obligate species live in more seasonal climates than facultative ones:",
+    sum(tab$obligate_more_seasonal), "of", nrow(tab), "; sign test p =",
+    signif(binom.test(sum(tab$obligate_more_seasonal), nrow(tab))$p.value, 2), "\n")
+```
+
+```{r clear_mixed_genera, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(A) The effect of precipitation seasonality on the three contrasts across the controls and subsets (filled: p < 0.05; intervals truncated at ±2.8; labels give events and species). (B) Deviance explained in each held-out subfamily by the predictor sets, against the prevalence baseline (zero). (C) In each genus with both obligate and facultative species, the median precipitation seasonality of its obligate against its facultative species (point size: obligate species).
+
+*Inputs:* s11/ seasonality_effects.csv, subfamily_transfer.csv, mixed_genera.csv
+*Outputs:* plot_seasonality.png
+
+```{r plot_seasonality}
+effects <- fread(file.path(dir_data_intermediate, "seasonality_effects.csv"))
+transfer <- fread(file.path(dir_data_intermediate, "subfamily_transfer.csv"))
+mixed <- fread(file.path(dir_data_intermediate, "mixed_genera.csv"))
+contrast_labels <- sapply(contrasts, `[[`, "label")
+ci_limit <- 2.8
+
+# --- A: effects across controls and subsets ---
+order <- unique(effects$analysis)
+effects[, `:=`(analysis = factor(analysis, rev(order)),
+               contrast = factor(contrast_labels[contrast], contrast_labels),
+               fill_key = ifelse(p < 0.05, "p < 0.05", "p >= 0.05"),
+               label = paste0(events, "/", species),
+               lower = pmax(estimate - 1.96 * se, -ci_limit),
+               upper = pmin(estimate + 1.96 * se, ci_limit))]
+panel_a <- ggplot(effects, aes(estimate, analysis)) +
+  geom_vline(xintercept = 0, colour = "grey55", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = lower, xmax = upper), width = 0, linewidth = 0.45,
+                orientation = "y") +
+  geom_point(aes(fill = fill_key), shape = 21, size = 1.8, stroke = 0.5) +
+  geom_text(aes(x = ci_limit + 0.25, label = label), hjust = 0, size = 2.1, colour = "grey40") +
+  facet_wrap(~ contrast, nrow = 1) +
+  scale_x_continuous(breaks = -2:2) +
+  coord_cartesian(xlim = c(-ci_limit, ci_limit + 1.6)) +
+  scale_fill_manual(values = c(`p < 0.05` = "black", `p >= 0.05` = "white"), name = NULL) +
+  labs(x = "Effect of precipitation seasonality (log odds per SD, 95% CI)", y = NULL,
+       title = "Seasonality under strong controls") +
+  theme_minimal(base_size = 8.5) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        strip.text = element_text(face = "bold"), legend.position = "bottom",
+        plot.title = element_text(face = "bold", size = 9.5))
+
+# --- B: transfer to each held-out subfamily ---
+transfer[, `:=`(set = factor(set, c("region", "latitude x hemisphere",
+                                    "latitude x hemisphere + seasonality", "seasonality alone")),
+                subfamily = factor(paste0(subfamily, " (", obligate, "/", species, ")")))]
+panel_b <- ggplot(transfer, aes(100 * pmax(d2, -1), subfamily, shape = set)) +
+  geom_vline(xintercept = 0, colour = "grey55", linewidth = 0.4) +
+  geom_point(size = 1.9, position = position_dodge(width = 0.6)) +
+  scale_shape_manual(values = c(15, 16, 17, 4), name = NULL) +
+  labs(x = "Deviance explained in the held-out subfamily (%)", y = NULL,
+       title = "Prediction of each held-out subfamily") +
+  guides(shape = guide_legend(ncol = 2)) +
+  theme_minimal(base_size = 8.5) +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom",
+        plot.title = element_text(face = "bold", size = 9.5))
+
+# --- C: mixed genera ---
+panel_c <- ggplot(mixed, aes(seasonality_facultative, seasonality_obligate)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_point(aes(size = mutualist + parasite), shape = 21, fill = "#E69F00", colour = "grey20",
+             stroke = 0.4, alpha = 0.85) +
+  geom_text(aes(label = genus), size = 2.2, vjust = -1.1, fontface = "italic",
+            check_overlap = TRUE) +
+  scale_size_area(max_size = 5, name = "Obligate species") +
+  scale_x_continuous(limits = c(20, 100)) +
+  scale_y_continuous(limits = c(20, 100)) +
+  labs(x = "Precipitation seasonality (CV, %),\nfacultative species",
+       y = "Precipitation seasonality (CV, %),\nobligate species",
+       title = "Within mixed genera") +
+  coord_equal(clip = "off") +
+  theme_minimal(base_size = 8.5) +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom",
+        plot.title = element_text(face = "bold", size = 9.5))
+
+fig <- panel_a / (panel_b | panel_c) + plot_layout(heights = c(1.2, 1)) +
+  plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(face = "bold", size = 12))
+save_figure(fig, "plot_seasonality", 11, 10)
+fig
+```
+
+```{r clear_plot_seasonality, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

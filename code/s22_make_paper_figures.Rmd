@@ -1,0 +1,468 @@
+---
+title: "Lycaenidae ant-interaction climate 22 - main figures of the paper"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+After an external review (29 October 2026), the paper has four main figures, each built around one finding; the European case study, the origins of obligacy and the detailed audits move to the Supporting Information. The first main figure is the world map of `s16` (`plot_world_strategies.png`); this notebook combines the outputs of `s05`–`s21` into the other three:
+
+2. **Overlapping climates, different interactions.** Where the climates of the Cape and southern Australia occur, and how obligate-rich they are in each region; the four strategies of pairs of Mediterranean-climate regions standardised over the climate strata they share; and the robustness of the contrast to the definition of the strata.
+3. **Lineage predicts, climate does not transfer.** The regions' strategies and the genera behind them; deviance explained by lineage and climate for held-out species and genera; and predictions for held-out realms.
+4. **What remains: a southern geography of obligacy.** Geography against climate, soils and fire for held-out subfamilies; effects given region and lineage, with Holm-adjusted p-values; seasonality of the obligate and facultative species of every mixed genus; and the partner genera of obligate species in the Mediterranean-climate regions.
+
+Style: the strategy colours of `butterfly_ant_interactions`; larger type than the notebook figures (base 9.5 pt at a printed width of 7.5 in); recessive grids; no lines joining categories; every interval drawn in full. Nothing is recomputed.
+
+A full run takes under a minute.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+region_short <- c(Nearctic = "Nearctic", Neotropic = "Neotropics", Palearctic = "Palaearctic",
+                  `Tropical Africa` = "Tropical Africa", `Southern Africa` = "Southern Africa",
+                  Indomalayan = "Indomalaya", Australia = "Australia",
+                  `New Guinea and islands` = "New Guinea")
+types <- c("n", "f", "m", "p")
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+type_labels <- c(n = "Non-associated", f = "Facultative", m = "Obligate mutualist",
+                 p = "Obligate parasite")
+contrast_labels <- c(associated = "Ant-associated vs\nnon-associated",
+                     obligate = "Obligate vs\nfacultative", parasite = "Parasite vs\nmutualist")
+med_levels <- c("Cape", "Southern Australia", "Mediterranean Basin", "California",
+                "Central Chile")
+model_labels <- c(baseline = "Baseline", climate = "Climate",
+                  `latitude x hemisphere` = "Latitude × hemisphere", lineage = "Lineage",
+                  `lineage + climate` = "Lineage + climate")
+model_colours <- c(baseline = "#9A9A9A", climate = "#B73779", `latitude x hemisphere` = "#009E73",
+                   lineage = "#3B3B3B", `lineage + climate` = "#56B4E9")
+property_labels <- c(lgm_anomaly_temperature = "LGM temperature anomaly",
+                     log_aridity = "Aridity", bio15 = "Precipitation seasonality",
+                     dry_months = "Dry months", dry_run = "Longest dry spell",
+                     bio14 = "Driest-month precipitation", phh2o = "Soil pH",
+                     cec = "Soil cation exchange capacity", nitrogen = "Soil nitrogen",
+                     soc = "Soil organic carbon", soil_p = "Soil phosphorus",
+                     fire = "Burned fraction (fire)",
+                     pgem_log_precipitation = "5-Myr mean precipitation",
+                     pgem_dry_share = "5-Myr share of dry time")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_int <- function(x) path_resrepo(file.path("data/intermediate", x))
+dir_s05 <- dir_int("s05_compare_regions")
+dir_s06 <- dir_int("s06_test_stability")
+dir_s08 <- dir_int("s08_test_southern_drivers")
+dir_s12 <- dir_int("s12_audit_evidence")
+dir_s13 <- dir_int("s13_compare_matched_climates")
+dir_s16 <- dir_int("s16_make_maps")
+dir_s18 <- dir_int("s18_audit_shared_climates")
+dir_s19 <- dir_int("s19_test_mixed_genera")
+dir_s20 <- dir_int("s20_predict_held_out")
+dir_s21 <- dir_int("s21_test_ant_partners")
+dir_data_intermediate <- dir_int("s22_make_paper_figures")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r define_helpers}
+# Shared theme: larger type for print, recessive grid, left-aligned bold titles
+theme_figure <- function(base_size = 9.5) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          panel.grid.major.y = element_blank(),
+          plot.title = element_text(face = "bold", size = base_size + 0.5),
+          plot.title.position = "plot",
+          plot.subtitle = element_text(colour = "grey35", size = base_size - 1),
+          axis.title = element_text(colour = "grey20"),
+          axis.text = element_text(colour = "grey25"),
+          strip.text = element_text(face = "bold", hjust = 0, size = base_size - 0.5),
+          legend.position = "bottom", legend.title = element_text(size = base_size - 1),
+          legend.text = element_text(size = base_size - 1),
+          plot.tag = element_text(face = "bold", size = 12))
+}
+tags <- plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")")
+
+# A PNG of another notebook as a panel
+png_panel <- function(file) {
+  wrap_elements(full = grid::rasterGrob(png::readPNG(file), interpolate = TRUE))
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Figure 2: overlapping climates, different interactions
+
+(a) Where the climate strata of the Mediterranean-climate Cape and southern Australia occur (`s16`). (b) Standardised share of each strategy among the classified species of two regions within the climate strata they share (area weights; each species counted in every shared stratum it was recorded in); points with 95% intervals from resampling genera. (c) Difference in the obligate share between the regions of each pair, for strata half as wide to twice as wide as the main strata and minimum occupancies of one to ten pixels; the main analysis is outlined. (d) Obligate share of the species recorded in the climates of the Cape and southern Australia in each biogeographic region outside the five Mediterranean-climate regions; coloured: 95% interval from resampling genera; grey bars: bounds if all unclassified species were non-obligate or all obligate.
+
+*Inputs:* s16/plot_shared_climates_panel.png; s18/ standardised_shares.csv, sensitivity.csv; s13/beyond_mediterranean.csv
+*Outputs:* figure_2_shared_climates.png
+
+```{r figure_2}
+shares <- fread(file.path(dir_s18, "standardised_shares.csv"))
+sens <- fread(file.path(dir_s18, "sensitivity.csv"))[strata > 0]
+beyond <- fread(file.path(dir_s13, "beyond_mediterranean.csv"))
+pairs_shown <- c("Cape vs Mediterranean Basin", "Southern Australia vs Mediterranean Basin",
+                 "Mediterranean Basin vs California")
+pair_labels <- c(`Cape vs Mediterranean Basin` = "Cape vs Basin",
+                 `Southern Australia vs Mediterranean Basin` = "S. Australia vs Basin",
+                 `Mediterranean Basin vs California` = "Basin vs California",
+                 `Cape vs Southern Australia` = "Cape vs S. Australia")
+short_region <- c(Cape = "Cape", `Southern Australia` = "S. Australia",
+                  `Mediterranean Basin` = "Basin", California = "California")
+
+# --- b: four strategies in shared strata (filled: first region of the pair; open: second) ---
+sb <- shares[version == "all strata of each species" & weights == "area weights" &
+               type %in% types & pair %in% pairs_shown]
+sb[, first := region == sub(" vs .*$", "", pair)]
+strata_n <- unique(sb[, .(pair, strata)])
+facet_lab <- sapply(pairs_shown, function(p) {
+  r <- strsplit(p, " vs ")[[1]]
+  sprintf("● %s  ○ %s, %d strata", short_region[[r[1]]],
+          short_region[[r[2]]], strata_n[pair == p]$strata)
+})
+sb[, `:=`(pair = factor(facet_lab[pair], facet_lab), type = factor(type, rev(types)),
+          first = factor(first, c(TRUE, FALSE)))]
+panel_b <- ggplot(sb, aes(100 * share, type, colour = type, shape = first)) +
+  geom_errorbar(aes(xmin = 100 * low, xmax = 100 * high), width = 0, linewidth = 0.6,
+                orientation = "y", position = position_dodge(width = 0.6)) +
+  geom_point(size = 2.4, fill = "white", stroke = 0.9, position = position_dodge(width = 0.6)) +
+  facet_wrap(~ pair, ncol = 1) +
+  scale_colour_manual(values = type_colours, guide = "none") +
+  scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 21), guide = "none") +
+  scale_y_discrete(labels = type_labels) +
+  scale_x_continuous(limits = c(0, 100)) +
+  labs(x = "Standardised share (%)", y = NULL,
+       title = "Within shared climate strata",
+       subtitle = "95% intervals from resampling genera") +
+  theme_figure()
+
+# --- c: sensitivity of the obligate contrast ---
+sc <- sens[pair %in% pairs_shown]
+sc[, `:=`(pair = factor(pair_labels[pair], pair_labels[pairs_shown]),
+          grain = factor(paste0("×", width_factor), paste0("×", sort(unique(width_factor)))),
+          main = width_factor == 1 & min_pixels == 5,
+          min_pixels = factor(min_pixels))]
+panel_c <- ggplot(sc, aes(100 * difference, grain, colour = min_pixels)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = 100 * difference_low, xmax = 100 * difference_high), width = 0,
+                linewidth = 0.45, orientation = "y", position = position_dodge(width = 0.75)) +
+  geom_point(aes(size = main), position = position_dodge(width = 0.75)) +
+  facet_wrap(~ pair, ncol = 1) +
+  scale_colour_manual(values = c(`1` = "#A6A6A6", `5` = "#3B3B3B", `10` = "#56B4E9"),
+                      name = "Minimum pixels") +
+  scale_size_manual(values = c(`FALSE` = 1.3, `TRUE` = 2.8), guide = "none") +
+  labs(x = "Difference in obligate share (points)",
+       y = "Width of the strata", title = "Robust to the strata",
+       subtitle = "Large point: main analysis") +
+  theme_figure() + theme(legend.margin = margin(0, 0, 0, 0))
+
+# --- d: the same climates elsewhere ---
+pd <- beyond[target == "Cape and S. Australia" & classified >= 5]
+pd[, `:=`(region = factor(region_short[region], rev(region_short[region_levels])),
+          south = region %in% c("Southern Africa", "Australia"))]
+panel_d <- ggplot(pd, aes(y = region)) +
+  geom_linerange(aes(xmin = 100 * lower_bound, xmax = 100 * upper_bound), colour = "grey85",
+                 linewidth = 3.2) +
+  geom_errorbar(aes(xmin = 100 * boot_low, xmax = 100 * boot_high, colour = south), width = 0,
+                linewidth = 0.7, orientation = "y") +
+  geom_point(aes(x = 100 * obligate_share, colour = south), size = 2.4) +
+  geom_text(aes(x = 102, label = classified), hjust = 0, size = 2.7, colour = "grey35") +
+  scale_colour_manual(values = c(`TRUE` = "#E69F00", `FALSE` = "#3B3B3B"), guide = "none") +
+  scale_x_continuous(limits = c(0, 110), breaks = c(0, 25, 50, 75, 100)) +
+  labs(x = "Obligate share (%; labels: classified species)", y = NULL,
+       title = "The same climates elsewhere",
+       subtitle = "Climates of the Cape and southern Australia,\noutside the five Mediterranean-climate regions") +
+  theme_figure()
+
+fig <- png_panel(file.path(dir_s16, "plot_shared_climates_panel.png")) /
+  (panel_b | (panel_c / panel_d + plot_layout(heights = c(1.7, 1)))) +
+  plot_layout(heights = c(0.75, 1.5)) + tags
+save_figure(fig, "figure_2_shared_climates", 7.5, 10)
+fig
+```
+
+```{r clear_figure_2, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure 3: lineage predicts, climate does not transfer
+
+(a) The classified species of each region by strategy; numbers: genera behind each strategy; n: classified species. (b) Obligate share among the associated species of each realm (black bar) and as predicted by models fitted to the other seven realms (points, with 95% intervals from resampling genera within the realm). (c) Deviance explained by lineage (random intercepts of subfamily and genus) and climate (six predictors), in sample, for species held out (their congeners stay in the training data) and for whole genera held out (only the subfamily is known); medians of three repeats of ten folds; filled: all classified species; open: species-specific evidence only. (d) Deviance explained for all species of held-out realms and held-out subfamilies, relative to the share in the training data, with 95% intervals from resampling genera; lineage models are omitted for held-out subfamilies, whose lineages are unknown to the model by design.
+
+*Inputs:* s05/region_lineages.csv; s12/ coverage_regions.csv, lineage_out_of_sample.csv; s20/ held_out_metrics.csv, held_out_pooled.csv
+*Outputs:* figure_3_lineage_climate.png
+
+```{r figure_3}
+lin <- fread(file.path(dir_s05, "region_lineages.csv"))
+cov <- unique(fread(file.path(dir_s12, "coverage_regions.csv"))[, .(region, recorded, classified)])
+oos <- fread(file.path(dir_s12, "lineage_out_of_sample.csv"))
+met <- fread(file.path(dir_s20, "held_out_metrics.csv"))
+pooled <- fread(file.path(dir_s20, "held_out_pooled.csv"))
+
+# --- a: composition of the regions ---
+lin[, `:=`(region = factor(region_short[region], rev(region_short[region_levels])),
+           interaction_type = factor(interaction_type, rev(types)))]
+setorder(lin, region, -interaction_type)
+lin[, `:=`(xmax = cumsum(share), xmin = cumsum(share) - share), by = region]
+cov[, region := factor(region_short[region], levels(lin$region))]
+panel_a <- ggplot(lin) +
+  geom_rect(aes(xmin = xmin, xmax = xmax, ymin = as.numeric(region) - 0.38,
+                ymax = as.numeric(region) + 0.38, fill = interaction_type),
+            colour = "white", linewidth = 0.5) +
+  geom_text(data = lin[share >= 0.07], aes(x = (xmin + xmax) / 2, y = as.numeric(region),
+                                           label = genera), colour = "white", size = 2.8) +
+  geom_text(data = cov, aes(x = 1.03, y = as.numeric(region), label = classified),
+            hjust = 0, size = 2.7, colour = "grey30") +
+  annotate("text", x = 1.03, y = length(levels(lin$region)) + 0.8, hjust = 0, size = 2.6,
+           colour = "grey30", label = "n") +
+  scale_fill_manual(values = type_colours, labels = type_labels, breaks = types, name = NULL) +
+  scale_x_continuous(labels = scales::label_percent(), breaks = c(0, 0.5, 1),
+                     expand = expansion(mult = c(0, 0.13))) +
+  scale_y_continuous(breaks = seq_along(levels(lin$region)), labels = levels(lin$region),
+                     expand = expansion(add = c(0.5, 1))) +
+  labs(x = "Share of classified species", y = NULL,
+       title = "Strategies of each region",
+       subtitle = "Numbers: genera; n: classified species") +
+  guides(fill = guide_legend(nrow = 2)) +
+  theme_figure() + theme(panel.grid.major = element_blank())
+
+# --- b: lineage and climate out of sample (no lines joining the schemes) ---
+o <- oos[model %in% c("lineage", "climate"), .(d2 = median(d2)),
+         by = .(contrast, evidence, scheme, model)]
+o[, `:=`(scheme = factor(scheme, c("in sample", "species held out", "genera held out"),
+                         c("In\nsample", "Species\nheld out", "Genera\nheld out")),
+         contrast = factor(contrast_labels[contrast], contrast_labels),
+         model = factor(c(lineage = "Lineage", climate = "Climate")[model],
+                        c("Lineage", "Climate")),
+         evidence = factor(c(all = "All classified species",
+                             specific = "Species-specific evidence")[evidence]))]
+panel_b <- ggplot(o, aes(scheme, 100 * d2, colour = model, shape = evidence)) +
+  geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_point(size = 2.3, fill = "white", stroke = 0.8,
+             position = position_dodge(width = 0.55)) +
+  facet_wrap(~ contrast, nrow = 1) +
+  scale_colour_manual(values = c(Lineage = "#3B3B3B", Climate = "#B73779"), name = NULL) +
+  scale_shape_manual(values = c(16, 21), name = NULL) +
+  labs(x = NULL, y = "Deviance explained (%)",
+       title = "Knowing a species' genus predicts its strategy; its climate barely does") +
+  guides(colour = guide_legend(order = 1), shape = guide_legend(order = 2)) +
+  theme_figure() + theme(panel.grid.major.x = element_blank())
+
+# --- c: held-out realms, obligacy ---
+show <- c("climate", "latitude x hemisphere", "lineage")
+mc <- met[contrast == "obligate" & scheme == "held-out realm" & model %in% show]
+mc[, `:=`(unit = factor(region_short[unit], rev(region_short[region_levels])),
+          model = factor(model, rev(show)))]
+obs <- unique(mc[, .(unit, observed, events, species)])
+panel_c <- ggplot(mc, aes(y = unit)) +
+  geom_errorbar(aes(xmin = 100 * predicted_low, xmax = 100 * predicted_high, colour = model),
+                width = 0, linewidth = 0.55, orientation = "y",
+                position = position_dodge(width = 0.7)) +
+  geom_point(aes(x = 100 * predicted, colour = model), size = 2,
+             position = position_dodge(width = 0.7)) +
+  geom_point(data = obs, aes(x = 100 * observed), shape = 124, size = 6, colour = "black") +
+  scale_colour_manual(values = model_colours, labels = model_labels[show], breaks = show,
+                      name = "Predicted by") +
+  labs(x = "Obligate share of associated species (%)", y = NULL,
+       title = "Each realm predicted from the other seven",
+       subtitle = "Black bar: observed") +
+  guides(colour = guide_legend(nrow = 2, reverse = TRUE)) +
+  theme_figure()
+
+# --- d: pooled held-out deviance explained ---
+show_d <- c("climate", "latitude x hemisphere", "lineage", "lineage + climate")
+# Lineage cannot inform the prediction of a subfamily not used to fit the model
+pd <- pooled[model %in% show_d & !(scheme == "held-out subfamily" & grepl("lineage", model))]
+pd[, `:=`(model = factor(model, rev(show_d)),
+          scheme = factor(scheme, c("held-out realm", "held-out subfamily"),
+                          c("Held-out realms", "Held-out subfamilies")),
+          contrast = factor(contrast_labels[contrast], contrast_labels))]
+panel_d <- ggplot(pd, aes(100 * d2, model, colour = model)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = 100 * d2_low, xmax = 100 * d2_high), width = 0, linewidth = 0.55,
+                orientation = "y") +
+  geom_point(size = 2.1) +
+  facet_grid(scheme ~ contrast, scales = "free", space = "free_y") +
+  scale_colour_manual(values = model_colours, guide = "none") +
+  scale_y_discrete(labels = model_labels) +
+  labs(x = "Held-out deviance explained relative to the training share (%)", y = NULL,
+       title = "Whole realms and subfamilies held out") +
+  theme_figure() + theme(strip.text.y = element_text(angle = 0, hjust = 0))
+
+fig <- (panel_a | panel_c) / panel_b / panel_d +
+  plot_layout(heights = c(1.1, 0.8, 0.85)) + tags
+save_figure(fig, "figure_3_lineage_climate", 7.5, 10)
+fig
+```
+
+```{r clear_figure_3, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure 4: what remains
+
+(a) Deviance explained when the obligacy of each subfamily is predicted by a logistic regression fitted to the other subfamilies: geography (latitude by hemisphere, dashed line; region), geography with one property added, and each property alone. (b) Effect of each property on obligacy given region (fixed effect) and lineage (random intercepts of subfamily and genus), in log odds per SD with 95% intervals; labels: Holm-adjusted p-values over all properties. (c) Median precipitation seasonality of the facultative (blue) and obligate (orange) species of every genus that has both, ordered by the difference; small points: species. (d) The ant genera most often recorded with obligate lycaenids, in the Mediterranean-climate regions: species of each genus recorded in GABI (shading) and lycaenid species of each strategy recorded with it there (symbols).
+
+*Inputs:* s06/stability_cv.csv; s08/drivers_cv.csv; s19/ holm_obligacy.csv, mixed_genera_full.csv, mixed_genera_species.csv; s21/partner_availability.csv
+*Outputs:* figure_4_remaining_signal.png
+
+```{r figure_4}
+scv <- fread(file.path(dir_s06, "stability_cv.csv"))[scheme == "subfamily"]
+dcv <- fread(file.path(dir_s08, "drivers_cv.csv"))[scheme == "subfamily"]
+holm <- fread(file.path(dir_s19, "holm_obligacy.csv"))
+mixed <- fread(file.path(dir_s19, "mixed_genera_full.csv"))
+mixed_sp <- fread(file.path(dir_s19, "mixed_genera_species.csv"))
+avail <- fread(file.path(dir_s21, "partner_availability.csv"))
+label_of <- function(v) ifelse(v %in% names(property_labels), property_labels[v], v)
+
+# --- a: held-out subfamilies ---
+cv <- rbind(
+  scv[set == "region", .(label = "Region", group = "Geography", d2 = median(cv_d2))],
+  scv[set == "latitude x hemisphere", .(label = "Latitude × hemisphere", group = "Geography",
+                                        d2 = median(cv_d2))],
+  scv[set == "latitude x hemisphere + anomaly",
+      .(label = "+ LGM temperature anomaly", group = "Geography +\none property",
+        d2 = median(cv_d2))],
+  dcv[grepl("^reference [+] ", set) & set != "reference + all drivers",
+      .(label = paste("+", label_of(sub("^reference [+] ", "", set))),
+        group = "Geography +\none property", d2 = median(cv_d2)), by = set][, set := NULL],
+  scv[set == "anomaly", .(label = "LGM temperature anomaly", group = "Property\nalone",
+                          d2 = median(cv_d2))],
+  dcv[grepl(" alone$", set) & set != "all drivers alone",
+      .(label = label_of(sub(" alone$", "", set)), group = "Property\nalone",
+        d2 = median(cv_d2)), by = set][, set := NULL])
+cv[, group := factor(group, c("Geography", "Geography +\none property", "Property\nalone"))]
+cv[, key := factor(paste(group, label), paste(group, label)[order(group, d2)])]
+ref <- cv[label == "Latitude × hemisphere"]$d2
+panel_a <- ggplot(cv, aes(100 * d2, key, colour = group)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_vline(xintercept = 100 * ref, colour = "#009E73", linewidth = 0.4, linetype = "22") +
+  geom_point(size = 2.2) +
+  facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+  scale_y_discrete(labels = setNames(as.character(cv$label), as.character(cv$key))) +
+  scale_colour_manual(values = c(Geography = "#009E73", `Geography +\none property` = "#7F7F7F",
+                                 `Property\nalone` = "#B73779"), guide = "none") +
+  labs(x = "Deviance explained in held-out subfamilies (%)", y = NULL,
+       title = "Geography predicts obligacy in unseen lineages") +
+  theme_figure() + theme(strip.text.y = element_text(angle = 0, hjust = 0))
+
+# --- b: effects given region and lineage, Holm-adjusted ---
+holm[, `:=`(label = factor(label_of(property), label_of(property)[order(-estimate)]),
+            clear = p_holm < 0.05)]
+panel_b <- ggplot(holm, aes(estimate, label)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), width = 0,
+                linewidth = 0.5, orientation = "y", colour = "grey30") +
+  geom_point(aes(fill = clear), shape = 21, size = 2.3, stroke = 0.6) +
+  geom_text(aes(x = max(estimate + 1.96 * se) + 0.08,
+                label = ifelse(p_holm < 0.001, "<0.001", sprintf("%.3f", p_holm))),
+            hjust = 0, size = 2.6, colour = "grey35") +
+  scale_fill_manual(values = c(`TRUE` = "#3B3B3B", `FALSE` = "white"), guide = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.25))) +
+  labs(x = "Effect on obligacy\n(log odds per SD, 95% CI)", y = NULL,
+       title = "Given region and lineage",
+       subtitle = "Labels: Holm-adjusted p; filled: < 0.05") +
+  theme_figure()
+
+# --- c: every mixed genus ---
+mixed[, label := sprintf("%s (%d/%d)", genus, obligate, facultative)]
+mixed[, label := factor(label, mixed[order(seasonality_difference)]$label)]
+mixed_sp <- merge(mixed_sp, mixed[, .(genus, label)], by = "genus")
+panel_c <- ggplot(mixed, aes(y = label)) +
+  geom_point(data = mixed_sp, aes(x = bio15, colour = group), size = 0.9, alpha = 0.35,
+             position = position_jitter(height = 0.15, width = 0, seed = 1)) +
+  geom_segment(aes(x = seasonality_facultative, xend = seasonality_obligate, yend = label),
+               colour = "grey45", linewidth = 0.6) +
+  geom_point(aes(x = seasonality_facultative), colour = type_colours[["f"]], size = 2.4) +
+  geom_point(aes(x = seasonality_obligate), colour = type_colours[["m"]], size = 2.4) +
+  scale_colour_manual(values = c(facultative = type_colours[["f"]],
+                                 obligate = type_colours[["m"]]), guide = "none") +
+  labs(x = "Precipitation seasonality (CV, %)", y = NULL,
+       title = "Every genus with obligate and facultative species",
+       subtitle = "Medians of facultative (blue) and obligate (orange) species;\nin brackets: obligate/facultative species") +
+  theme_figure() + theme(axis.text.y = element_text(face = "italic"))
+
+# --- d: partner genera in the Mediterranean-climate regions ---
+top <- unique(avail[order(-obligate)]$ant_genus)[1:8]
+d <- avail[level == "Mediterranean-climate region" & ant_genus %in% top]
+d[, `:=`(unit = factor(unit, med_levels), ant_genus = factor(ant_genus, rev(top)))]
+uses <- melt(d, id.vars = c("unit", "ant_genus"), measure.vars = c("f", "m", "p"),
+             variable.name = "type", value.name = "lycaenids")[lycaenids > 0]
+shifts <- c(f = -0.25, m = 0, p = 0.25)
+panel_d <- ggplot(d, aes(unit, ant_genus)) +
+  geom_tile(aes(fill = ant_species), colour = "white", linewidth = 0.7) +
+  lapply(names(shifts), function(t)
+    geom_point(data = uses[type == t], aes(colour = type, size = lycaenids),
+               position = position_nudge(x = shifts[[t]]))) +
+  scale_fill_gradient(low = "#F4F4F4", high = "#6A6A6A", trans = "sqrt",
+                      name = "Ant species of the genus") +
+  scale_colour_manual(values = type_colours[c("f", "m", "p")],
+                      labels = type_labels[c("f", "m", "p")], name = NULL) +
+  scale_size_area(max_size = 4, breaks = c(1, 5, 20), name = "Lycaenid species") +
+  scale_x_discrete(labels = c(Cape = "Cape", `Southern Australia` = "S. Australia",
+                              `Mediterranean Basin` = "Basin", California = "California",
+                              `Central Chile` = "Chile")) +
+  labs(x = NULL, y = NULL, title = "Partner genera of obligate species",
+       subtitle = "In the Mediterranean-climate regions") +
+  guides(colour = guide_legend(nrow = 2, override.aes = list(size = 2.5), order = 1),
+         size = guide_legend(nrow = 1, order = 2),
+         fill = guide_colourbar(barwidth = 7, barheight = 0.5, order = 3)) +
+  theme_figure() + theme(axis.text.y = element_text(face = "italic"),
+                         axis.text.x = element_text(angle = 30, hjust = 1),
+                         panel.grid.major = element_blank(), legend.box = "vertical",
+                         legend.position = "bottom", legend.title.position = "top",
+                         legend.spacing.y = unit(0.1, "cm"))
+
+fig <- (panel_a | panel_b) / (panel_c | panel_d) + plot_layout(heights = c(1, 1.15)) + tags
+save_figure(fig, "figure_4_remaining_signal", 7.5, 10)
+fig
+```
+
+```{r clear_figure_4, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

@@ -1,0 +1,554 @@
+---
+title: "Lycaenidae ant-interaction climate 15 - ant association along latitude and temperature"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+In the maps of Europe, the share of species not associated with ants appears to increase towards the north. This notebook asks how the contrast between ant-associated (mostly facultative) and non-associated species changes with latitude and temperature, and why:
+
+1. **A finer grid.** Hexagons of resolution 7 (about 23,000 km²) in Europe, the eastern Palaearctic and the Nearctic, where sampling allows it, with the share of each strategy, the share expected from the genera present (as in `s05`), mean annual temperature and latitude.
+2. **Richness or share?** A rising share of non-associated species can mean that they become more numerous northwards, or that associated species drop out faster. The species richness of each strategy is modelled along latitude.
+3. **Latitude or temperature?** In Europe, mountains make some southern cells cold, which separates latitude from temperature.
+4. **Lineages or change within them?** The observed gradient in the non-associated share is compared with the gradient expected from the genera present, against a null in which strategies are permuted within genera (`s14`). The genera that persist or drop out northwards are listed.
+5. **Elsewhere.** The species-level association between ant association and temperature, given lineage, in each of the eight regions, and the same gradients in the eastern Palaearctic and the Nearctic.
+
+A full run takes about 10 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(sf)
+library(dggridR)
+library(mgcv)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+# Hexagon resolution, and the minimum classified species of a hexagon
+hex_res <- 7
+min_classified <- 10
+
+# Areas (longitude and latitude bounds of hexagon centres)
+areas <- list(Europe = c(-12, 40, 35, 72), `Eastern Palaearctic` = c(60, 180, 30, 75),
+              Nearctic = c(-170, -50, 25, 75))
+area_levels <- names(areas)
+
+# Latitude bands of the profiles, and the southern and northern parts of Europe compared for
+# the genera
+band_width <- 3
+south_max <- 46
+north_min <- 56
+min_genus_richness <- 0.3
+
+# Permutations of the within-genus null
+n_perm <- 199
+
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+type_labels <- c(n = "Non-associated", f = "Facultative", m = "Obligate mutualist",
+                 p = "Obligate parasite")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_data_intermediate <- path_resrepo("data/intermediate/s15_test_association")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Area of points from the bounds of the areas (NA outside all of them)
+area_of <- function(lon, lat) {
+  a <- rep(NA_character_, length(lon))
+  for (k in area_levels) {
+    b <- areas[[k]]
+    a[is.na(a) & lon >= b[1] & lon <= b[2] & lat >= b[3] & lat <= b[4]] <- k
+  }
+  factor(a, area_levels)
+}
+
+# Leave-one-out strategy composition of each species' congeners (or subfamily when it has no
+# classified congener), as in s05
+lineage_expectation <- function(sp, type) {
+  types <- names(type_colours)
+  ind <- data.table(pool_key = sp$pool_key, genus = sp$genus, subfamily = sp$subfamily)
+  for (k in types) set(ind, j = k, value = as.numeric(type == k))
+  loo <- function(group) ind[, c(list(pool_key = pool_key, n_group = .N - 1),
+                                 lapply(.SD, function(z) (sum(z) - z) / pmax(.N - 1, 1))),
+                             by = group, .SDcols = types]
+  e <- loo("genus")[, c("pool_key", "n_group", types), with = FALSE]
+  lonely <- e$n_group == 0
+  s <- loo("subfamily")
+  e[lonely, (types) := s[match(e$pool_key[lonely], pool_key), types, with = FALSE]]
+  setnames(e, types, paste0("e_", types))
+  e[, n_group := NULL]
+  e
+}
+
+# Cell counts of each strategy and the lineage-expected non-associated share, from species
+# strategies `type` and the presence table
+cell_counts <- function(sp, type, pres) {
+  e <- lineage_expectation(sp, type)
+  p <- merge(pres, data.table(pool_key = sp$pool_key, type = type), by = "pool_key")
+  p <- merge(p, e, by = "pool_key")
+  p[, .(n_classified = .N, n_n = sum(type == "n"), n_f = sum(type == "f"),
+        n_m = sum(type == "m"), n_p = sum(type == "p"), e_n = mean(e_n)), by = cell_id]
+}
+
+# Slope (log odds per SD) of the observed and expected non-associated share along x
+share_slopes <- function(d, x) {
+  w <- d$n_classified
+  c(observed = coef(suppressWarnings(glm(d$n_n / w ~ d[[x]], weights = w,
+                                         family = quasibinomial)))[[2]],
+    expected = coef(suppressWarnings(glm(d$e_n ~ d[[x]], weights = w,
+                                         family = quasibinomial)))[[2]])
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+
+# Shared theme: recessive grid, no minor grid, bold left-aligned titles
+theme_figure <- function(base_size = 8.5) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot",
+          plot.subtitle = element_text(colour = "grey35", size = base_size - 0.5),
+          axis.title = element_text(colour = "grey25"),
+          axis.text = element_text(colour = "grey35"),
+          strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom")
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Hexagons of the Holarctic
+
+Every cleaned record in the three areas is placed in its hexagon of resolution `r hex_res`; the classified species of each hexagon are counted by strategy, with the lineage-expected non-associated share. The mean annual temperature and elevation of a hexagon are the means of its 10-arc-minute land pixels.
+
+*Inputs:* s02/species_records.rds; s05/species_regions.csv; s01/climate_present_10m.tif
+*Outputs:* holarctic_presence_hex7.csv, holarctic_cells_hex7.csv, holarctic_hex7.rds
+
+```{r holarctic_cells}
+dg <- dgconstruct(res = hex_res)
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+sp <- sp[interaction_type %in% names(type_colours)]
+x <- readRDS(file.path(dir_s02, "species_records.rds"))[pool_key %in% sp$pool_key]
+x <- x[!is.na(area_of(decimalLongitude, decimalLatitude))]
+x[, cell_id := dgGEO_to_SEQNUM(dg, decimalLongitude, decimalLatitude)$seqnum]
+pres <- unique(x[, .(pool_key, cell_id)])
+write_table(pres, file.path(dir_data_intermediate, "holarctic_presence_hex7.csv"))
+
+# --- Counts, centres and area of each hexagon ---
+cells <- cell_counts(sp, sp$interaction_type, pres)
+centre <- dgSEQNUM_to_GEO(dg, cells$cell_id)
+cells[, `:=`(longitude = centre$lon_deg, latitude = centre$lat_deg)]
+cells[, area := area_of(longitude, latitude)]
+cells <- cells[!is.na(area)]
+
+# --- Climate of each hexagon from its land pixels ---
+present <- rast(file.path(dir_s01, "climate_present_10m.tif"))[[c("bio01", "elevation")]]
+pix <- as.data.table(as.data.frame(present, xy = TRUE, na.rm = TRUE))
+pix <- pix[!is.na(area_of(x, y))]
+pix[, cell_id := dgGEO_to_SEQNUM(dg, x, y)$seqnum]
+clim <- pix[, .(bio01 = mean(bio01), elevation = mean(elevation), land_pixels = .N),
+            by = cell_id]
+cells <- merge(cells, clim, by = "cell_id")
+write_table(cells, file.path(dir_data_intermediate, "holarctic_cells_hex7.csv"))
+saveRDS(dgcellstogrid(dg, cells$cell_id), file.path(dir_data_intermediate, "holarctic_hex7.rds"))
+print(cells[, .(hexagons = .N, with_min_classified = sum(n_classified >= min_classified),
+                median_classified = as.numeric(median(n_classified))), by = area])
+```
+
+```{r clear_holarctic_cells, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Richness and share of each strategy along latitude
+
+In each area, the hexagons with at least `r min_classified` classified species are grouped in `r band_width`° latitude bands, and the mean species richness of each strategy and the mean shares are computed. The change in richness with latitude is estimated for each strategy with a quasi-Poisson regression of the hexagon counts on latitude (per 10° of latitude); a positive difference between the non-associated and facultative slopes means that facultative species drop out faster northwards.
+
+*Inputs:* s15/holarctic_cells_hex7.csv
+*Outputs:* latitude_profiles.csv, richness_slopes.csv
+
+```{r latitude_profiles}
+cells <- fread(file.path(dir_data_intermediate, "holarctic_cells_hex7.csv"))
+cells <- cells[n_classified >= min_classified]
+cells[, band := band_width * floor(latitude / band_width) + band_width / 2]
+long <- melt(cells, id.vars = c("cell_id", "area", "latitude", "band", "n_classified"),
+             measure.vars = c("n_n", "n_f", "n_m", "n_p"), variable.name = "type",
+             value.name = "species")
+long[, type := sub("n_", "", type)]
+profiles <- long[, .(hexagons = .N, richness = mean(species),
+                     share = sum(species) / sum(n_classified)), by = .(area, band, type)]
+write_table(profiles[order(area, type, band)],
+            file.path(dir_data_intermediate, "latitude_profiles.csv"))
+
+# --- Richness slopes per strategy, and the difference between non-associated and facultative ---
+slopes <- rbindlist(lapply(unique(long$area), function(a) {
+  d <- long[area == a & type %in% c("n", "f")]
+  d[, `:=`(type = factor(type, c("f", "n")), lat10 = latitude / 10)]
+  m <- glm(species ~ type * lat10, data = d, family = quasipoisson)
+  cf <- summary(m)$coefficients
+  data.table(area = a,
+             facultative_change_per_10deg = exp(cf["lat10", 1]) - 1,
+             non_associated_change_per_10deg = exp(cf["lat10", 1] + cf["typen:lat10", 1]) - 1,
+             difference_log = cf["typen:lat10", 1], difference_se = cf["typen:lat10", 2],
+             p = cf["typen:lat10", 4], hexagons = nrow(d) / 2)
+}))
+write_table(slopes, file.path(dir_data_intermediate, "richness_slopes.csv"))
+print(slopes, digits = 3)
+print(dcast(profiles[area == "Europe"], band ~ type, value.var = "richness"), digits = 2)
+```
+
+```{r clear_latitude_profiles, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Latitude, temperature and lineages in the non-associated share
+
+For each area, quasi-binomial GAMs of the non-associated share of the hexagons (weighted by classified species) on latitude, on temperature and on both give the deviance explained by each. The linear slopes of the observed and lineage-expected shares along latitude and temperature (log odds per SD) are compared with `r n_perm` data sets in which the strategies are permuted among the classified species of each genus: under this null, the part of the gradient not reproduced by the genera present arises by chance.
+
+*Inputs:* s15/ holarctic_cells_hex7.csv, holarctic_presence_hex7.csv; s05/species_regions.csv
+*Outputs:* share_models.csv, share_null.csv
+
+```{r share_models}
+cells <- fread(file.path(dir_data_intermediate, "holarctic_cells_hex7.csv"))
+cells <- cells[n_classified >= min_classified]
+pres <- fread(file.path(dir_data_intermediate, "holarctic_presence_hex7.csv"),
+              colClasses = c(pool_key = "character"))
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+sp <- sp[interaction_type %in% names(type_colours)]
+
+# --- Deviance explained by latitude, temperature and both ---
+models <- rbindlist(lapply(area_levels, function(a) {
+  d <- cells[area == a]
+  d[, share := n_n / n_classified]
+  fits <- list(latitude = share ~ s(latitude, k = 5), temperature = share ~ s(bio01, k = 5),
+               both = share ~ s(latitude, k = 5) + s(bio01, k = 5))
+  data.table(area = a, model = names(fits), hexagons = nrow(d),
+             dev_expl = sapply(fits, function(f) summary(gam(f, data = d, weights = n_classified,
+                                                             family = quasibinomial,
+                                                             method = "REML"))$dev.expl),
+             correlation_latitude_temperature = cor(d$latitude, d$bio01))
+}))
+write_table(models, file.path(dir_data_intermediate, "share_models.csv"))
+print(dcast(models, area + hexagons + correlation_latitude_temperature ~ model,
+            value.var = "dev_expl"), digits = 2)
+
+# --- Observed and expected slopes, with the within-genus null ---
+cells[, `:=`(latitude_z = (latitude - mean(latitude)) / sd(latitude),
+             bio01_z = (bio01 - mean(bio01)) / sd(bio01)), by = area]
+geo <- cells[, .(cell_id, area, latitude_z, bio01_z)]
+set.seed(20261029)
+null <- rbindlist(lapply(0:n_perm, function(r) {
+  type <- if (r == 0) sp$interaction_type else
+    sp$interaction_type[ave(seq_len(nrow(sp)), sp$genus, FUN = function(i) i[sample.int(length(i))])]
+  d <- merge(geo, cell_counts(sp, type, pres[cell_id %in% geo$cell_id]), by = "cell_id")
+  d <- d[n_classified >= min_classified]
+  rbindlist(lapply(area_levels, function(a) rbindlist(lapply(c("latitude_z", "bio01_z"),
+                                                             function(v) {
+    s <- share_slopes(d[area == a], v)
+    data.table(permutation = r, area = a, variable = v, observed_slope = s[["observed"]],
+               expected_slope = s[["expected"]])
+  }))))
+}))
+null[, within_lineage := observed_slope - expected_slope]
+write_table(null, file.path(dir_data_intermediate, "share_null.csv"))
+print(null[, .(observed_slope = observed_slope[permutation == 0],
+               expected_slope = expected_slope[permutation == 0],
+               within_observed = within_lineage[permutation == 0],
+               null_low = quantile(within_lineage[permutation > 0], 0.025),
+               null_high = quantile(within_lineage[permutation > 0], 0.975)),
+           by = .(area, variable)], digits = 2)
+```
+
+```{r clear_share_models, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Genera that persist or drop out northwards in Europe
+
+For each genus with classified species in Europe, the mean number of its species per hexagon is compared between the south (centres below `r south_max`°N) and the north (above `r north_min`°N), for genera with at least `r min_genus_richness` species per hexagon in one of the two parts.
+
+*Inputs:* s15/ holarctic_cells_hex7.csv, holarctic_presence_hex7.csv; s05/species_regions.csv
+*Outputs:* europe_genera.csv
+
+```{r europe_genera}
+cells <- fread(file.path(dir_data_intermediate, "holarctic_cells_hex7.csv"))
+cells <- cells[area == "Europe" & n_classified >= min_classified]
+cells[, part := fifelse(latitude < south_max, "south", fifelse(latitude > north_min, "north",
+                                                                NA_character_))]
+cells <- cells[!is.na(part)]
+pres <- fread(file.path(dir_data_intermediate, "holarctic_presence_hex7.csv"),
+              colClasses = c(pool_key = "character"))[cell_id %in% cells$cell_id]
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+p <- merge(pres, sp[interaction_type %in% names(type_colours),
+                    .(pool_key, genus, interaction_type)], by = "pool_key")
+p <- merge(p, cells[, .(cell_id, part)], by = "cell_id")
+n_cells <- cells[, .N, by = part]
+g <- p[, .(species = .N, strategies = paste(sort(unique(interaction_type)), collapse = "")),
+       by = .(genus, part)]
+g <- merge(g, n_cells, by = "part")
+g[, richness := species / N]
+gw <- dcast(g, genus ~ part, value.var = "richness", fill = 0)
+gw <- merge(gw, p[, .(strategy = names(which.max(table(interaction_type))),
+                      european_species = uniqueN(pool_key)), by = genus], by = "genus")
+gw <- gw[pmax(north, south) >= min_genus_richness]
+gw[, log2_ratio := log2((north + 0.05) / (south + 0.05))]
+write_table(gw[order(log2_ratio)], file.path(dir_data_intermediate, "europe_genera.csv"))
+print(gw[order(log2_ratio)], digits = 2)
+```
+
+```{r clear_europe_genera, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Ant association and temperature among species, by region
+
+For the classified species of each region (`s05`), ant association (facultative or obligate against non-associated) is related to the species' median annual temperature (standardised over all classified species) with random intercepts of subfamily and genus; a second model replaces temperature by its deviation from the genus mean and the genus mean, and reports the within-genus slope.
+
+*Inputs:* s05/species_regions.csv
+*Outputs:* association_effects.csv
+
+```{r association_effects}
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+sp <- sp[interaction_type %in% names(type_colours) & is.finite(bio01)]
+sp[, `:=`(y = as.integer(interaction_type != "n"), bio01_z = as.numeric(scale(bio01)))]
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+effects <- rbindlist(lapply(region_levels, function(rg) {
+  d <- copy(sp[region == rg])
+  if (sum(d$y) < 5 || sum(1 - d$y) < 5) return(NULL)
+  d[, `:=`(genus = factor(genus), subfamily = factor(subfamily),
+           within = bio01_z - ave(bio01_z, genus), between = ave(bio01_z, genus))]
+  fit <- function(rhs, term) {
+    m <- gam(as.formula(paste("y ~", rhs, "+", lineage)), data = d, family = binomial,
+             method = "REML")
+    cf <- summary(m)$p.table[term, ]
+    c(estimate = cf[[1]], se = cf[[2]], p = cf[[4]])
+  }
+  rbind(data.table(region = rg, model = "Given lineage", t(fit("bio01_z", "bio01_z"))),
+        data.table(region = rg, model = "Within genera",
+                   t(fit("within + between", "within"))))[
+    , `:=`(species = nrow(d), non_associated = sum(1 - d$y))]
+}))
+write_table(effects, file.path(dir_data_intermediate, "association_effects.csv"))
+print(effects, digits = 3)
+```
+
+```{r clear_association_effects, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figures
+
+**Europe.** (A) Share of non-associated species among the classified species of each hexagon (about 23,000 km²; hexagons with fewer than `r min_classified` classified species are not shown). (B) Mean species richness per hexagon of non-associated, facultative and obligate species along latitude (log scale). (C) Non-associated share of each hexagon along latitude (points), with the observed trend and the trend expected from the genera present. (D) Change in each genus's species per hexagon from the south to the north of Europe.
+
+**Elsewhere.** (E) Non-associated share along latitude in the three areas, observed and expected from genera. (F) Effect of temperature on ant association given lineage, and within genera, in each region (log odds per SD, 95% intervals).
+
+*Inputs:* s15/ holarctic_cells_hex7.csv, holarctic_hex7.rds, latitude_profiles.csv, europe_genera.csv, association_effects.csv
+*Outputs:* plot_europe_association.png, plot_association_regions.png
+
+```{r plot_association}
+cells <- fread(file.path(dir_data_intermediate, "holarctic_cells_hex7.csv"))
+cells <- cells[n_classified >= min_classified]
+cells[, share := n_n / n_classified]
+hex <- readRDS(file.path(dir_data_intermediate, "holarctic_hex7.rds"))
+profiles <- fread(file.path(dir_data_intermediate, "latitude_profiles.csv"))
+genera <- fread(file.path(dir_data_intermediate, "europe_genera.csv"))
+effects <- fread(file.path(dir_data_intermediate, "association_effects.csv"))
+grey_ramp <- c("#EFEFEF", "#C7C7C7", "#8F8F8F", "#5A5A5A", "#262626")
+
+# --- A: map of Europe (Lambert azimuthal equal area, EPSG:3035) ---
+eu <- merge(hex, cells[area == "Europe", .(cell_id, share)], by.x = "seqnum", by.y = "cell_id")
+eu <- st_transform(eu, 3035)
+# Natural Earth land (bundled small scale), cropped before projecting
+sf_use_s2(FALSE)
+land <- rnaturalearth::ne_countries(scale = "small", returnclass = "sf")[, "geometry"]
+land <- st_transform(st_union(suppressWarnings(st_crop(st_make_valid(land),
+                                              c(xmin = -30, xmax = 75, ymin = 25, ymax = 78)))),
+                     3035)
+sf_use_s2(TRUE)
+box <- c(xmin = 2.5e6, xmax = 7.25e6, ymin = 1.3e6, ymax = 5.5e6)
+panel_a <- ggplot() +
+  geom_sf(data = land, fill = "#F2F2F0", colour = NA) +
+  geom_sf(data = eu, aes(fill = share), colour = "white", linewidth = 0.1) +
+  geom_sf(data = land, fill = NA, colour = "grey45", linewidth = 0.2) +
+  scale_fill_gradientn(colours = grey_ramp, limits = c(0, 0.6), oob = scales::squish,
+                       labels = scales::percent, name = "Non-associated",
+                       guide = guide_colourbar(barwidth = unit(4, "cm"),
+                                               barheight = unit(0.25, "cm"),
+                                               title.position = "top")) +
+  coord_sf(crs = 3035, xlim = box[c("xmin", "xmax")], ylim = box[c("ymin", "ymax")],
+           expand = FALSE) +
+  labs(title = "Share of non-associated species",
+       subtitle = "Classified species per hexagon of about 23,000 km²") +
+  theme_void(base_size = 8.5) +
+  theme(plot.title = element_text(face = "bold", size = 9.5),
+        plot.subtitle = element_text(colour = "grey35", size = 8),
+        legend.position = "bottom", legend.title = element_text(size = 7.5),
+        panel.background = element_rect(fill = "white", colour = NA))
+
+# --- B: richness of each strategy along latitude (Europe) ---
+pr <- profiles[area == "Europe" & hexagons >= 5]
+pr[, group := fifelse(type %in% c("m", "p"), "o", type)]
+pr <- pr[, .(richness = sum(richness)), by = .(band, group)]
+group_colours <- c(n = type_colours[["n"]], f = type_colours[["f"]], o = type_colours[["m"]])
+group_labels <- c(n = "Non-associated", f = "Facultative", o = "Obligate")
+# End labels, with the two upper lines (close at high latitude) pulled apart on the log scale
+ends <- pr[, .SD[which.max(band)], by = group]
+ends[, label_y := richness * c(f = 1.35, n = 0.74, o = 1)[group]]
+panel_b <- ggplot(pr[richness > 0], aes(band, richness, colour = group)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.4) +
+  geom_text(data = ends, aes(y = label_y, label = group_labels[group]), hjust = -0.12,
+            size = 2.6, show.legend = FALSE) +
+  scale_colour_manual(values = group_colours, guide = "none") +
+  scale_y_log10() +
+  scale_x_continuous(expand = expansion(mult = c(0.03, 0.3))) +
+  labs(x = "Latitude (°N)", y = "Species per hexagon",
+       title = "Facultative species drop out northwards",
+       subtitle = "Mean richness per hexagon in 3° bands (log scale)") +
+  theme_figure()
+
+# --- C: non-associated share along latitude, observed and expected ---
+ce <- cells[area == "Europe"]
+grid <- data.table(latitude = seq(min(ce$latitude), max(ce$latitude), length.out = 100))
+curve <- function(y) {
+  m <- gam(y ~ s(latitude, k = 5), data = ce, weights = n_classified, family = quasibinomial,
+           method = "REML")
+  as.numeric(predict(m, newdata = grid, type = "response"))
+}
+curves <- rbind(grid[, .(latitude, share = curve(ce$share), source = "Observed")],
+                grid[, .(latitude, share = curve(ce$e_n), source = "Expected from genera")])
+curve_ends <- curves[, .SD[which.max(latitude)], by = source]
+panel_c <- ggplot() +
+  geom_point(data = ce, aes(latitude, share), colour = "grey55", alpha = 0.35, size = 0.8,
+             stroke = 0) +
+  geom_line(data = curves, aes(latitude, share, colour = source), linewidth = 0.8) +
+  geom_text(data = curve_ends, aes(latitude, share, label = source, colour = source),
+            hjust = -0.08, size = 2.6) +
+  scale_colour_manual(values = c(Observed = "#262626", `Expected from genera` = "#9A9A9A"),
+                      guide = "none") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(expand = expansion(mult = c(0.03, 0.45))) +
+  labs(x = "Latitude (°N)", y = "Non-associated share",
+       title = "The genera present reproduce the trend",
+       subtitle = "Hexagons with at least 10 classified species") +
+  theme_figure()
+
+# --- D: genera persisting or dropping out northwards ---
+genera[, genus := factor(genus, genus[order(log2_ratio)])]
+panel_d <- ggplot(genera, aes(log2_ratio, genus, colour = strategy)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_segment(aes(x = 0, xend = log2_ratio, yend = genus), linewidth = 0.5) +
+  geom_point(size = 1.8) +
+  scale_colour_manual(values = type_colours, labels = type_labels, name = NULL) +
+  scale_x_continuous(breaks = -4:2, labels = function(b) paste0("×", signif(2^b, 2))) +
+  labs(x = "Species per hexagon, north (>56°N) relative to south (<46°N)", y = NULL,
+       title = "Genera that persist, and genera that drop out, northwards") +
+  theme_figure() + theme(axis.text.y = element_text(face = "italic", size = 6.8))
+
+fig1 <- (panel_a | (panel_b / panel_c)) / panel_d +
+  plot_layout(heights = c(1.25, 1)) +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")") & theme(plot.tag = element_text(face = "bold", size = 12))
+save_figure(fig1, "plot_europe_association", 9, 9.6)
+fig1
+
+# --- E: the three areas ---
+three <- rbindlist(lapply(area_levels, function(a) {
+  d <- cells[area == a]
+  g <- data.table(latitude = seq(quantile(d$latitude, 0.02), quantile(d$latitude, 0.98),
+                                 length.out = 80))
+  f <- function(y) as.numeric(predict(gam(y ~ s(latitude, k = 5), data = d,
+                                          weights = n_classified, family = quasibinomial,
+                                          method = "REML"), newdata = g, type = "response"))
+  rbind(g[, .(latitude, share = f(d$share), source = "Observed")],
+        g[, .(latitude, share = f(d$e_n), source = "Expected from genera")])[, area := a]
+}))
+three[, area := factor(area, area_levels)]
+panel_e <- ggplot(three, aes(latitude, share, colour = source)) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~ area, nrow = 1) +
+  scale_colour_manual(values = c(Observed = "#262626", `Expected from genera` = "#9A9A9A"),
+                      name = NULL) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Latitude (°N)", y = "Non-associated share",
+       title = "The northward rise of non-associated species is European") +
+  theme_figure()
+
+# --- F: species-level effects of temperature on association ---
+effects[, `:=`(region = factor(region, rev(region_levels)),
+               model = factor(model, c("Given lineage", "Within genera")))]
+panel_f <- ggplot(effects, aes(estimate, region, shape = model)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = pmax(estimate - 1.96 * se, -6), xmax = pmin(estimate + 1.96 * se, 6)),
+                width = 0, linewidth = 0.45, orientation = "y",
+                position = position_dodge(width = 0.6)) +
+  geom_point(size = 1.9, fill = "white", position = position_dodge(width = 0.6)) +
+  scale_shape_manual(values = c(16, 21), name = NULL) +
+  coord_cartesian(xlim = c(-6, 6)) +
+  labs(x = "Effect of temperature on ant association (log odds per SD, 95% CI)", y = NULL,
+       title = "Among species, temperature does not predict ant association within regions") +
+  theme_figure()
+
+fig2 <- panel_e / panel_f + plot_layout(heights = c(1, 1.2)) +
+  plot_annotation(tag_levels = list(c("E", "F"))) &
+  theme(plot.tag = element_text(face = "bold", size = 12))
+save_figure(fig2, "plot_association_regions", 8.5, 7)
+fig2
+```
+
+```{r clear_plot_association, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

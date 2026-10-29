@@ -1,0 +1,243 @@
+---
+title: "Lycaenidae ant-interaction climate 02 - assemblages and species climates"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+This is the second notebook of the climate study. It builds the lycaenid assemblages of the grid cells and the climate of each species, from the outputs of `butterfly_ant_interactions` (species table and cleaned occurrence records) and the climate layers of `s01_prepare_climate`.
+
+First, each species is placed in the cells of the 250-, 500- and 1,000-km Equal Earth grids that contain its stringently cleaned records, exactly as in Fig. 1 of `butterfly_ant_interactions`, and the species of each interaction strategy are counted per cell. The 500-km counts are checked against the published cell table of that study. Second, the climate of each species is summarised as the median over the 10-arc-minute pixels holding its records, so that strategies can also be related to climate among species (with taxonomy), which avoids counting the same species in many cells. Last, the cell counts are joined to the cell climate. A full run takes about 5 min.
+
+# Setup
+
+## Packages
+
+`data.table` handles the tables and `terra` the climate layers; `sf` is used by the projection helpers.
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(sf)
+```
+
+## Variables
+
+The cell sizes and the interaction types are fixed here.
+
+```{r setup_variables}
+# Cell sides of the Equal Earth grids (km), as in s01_prepare_climate
+cell_sizes_km <- c(250, 500, 1000)
+
+# Interaction types: non-associated, facultative, obligate mutualist, obligate parasite
+types <- c("n", "f", "m", "p")
+```
+
+## Folders
+
+The `butterfly_ant_interactions` outputs are read from their frozen copies in the raw data and the climate layers from `s01_prepare_climate`; outputs are written to this notebook's folder.
+
+```{r setup_folders}
+# Raw data and the outputs of s01
+dir_butterfly <- path_resrepo("data/raw/butterfly_ant_interactions")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+
+# Outputs of this notebook
+dir_data_intermediate <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+`write_table()` writes the output tables, `projections.R` and `geography.R` place records in Equal Earth cells as in `butterfly_ant_interactions`.
+
+```{r load_functions}
+# Output tables
+source(here::here("code", "R", "write_table.R"))
+
+# Equal Earth projection and presence cells
+source(here::here("code", "R", "projections.R"))
+source(here::here("code", "R", "geography.R"))
+```
+
+Each section below reads its inputs from disk and ends by removing its objects (in a hidden chunk), so only the objects defined in this setup carry over from one section to the next.
+
+```{r keep_setup_objects}
+# Objects of the setup, kept when each section clears its own objects
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Species records
+
+The analysis units of `butterfly_ant_interactions` (one row per species unit, with its interaction type where classified) and the unique coordinates of their stringently cleaned records are prepared once for the following sections.
+
+*Inputs:* raw/butterfly_ant_interactions/ species_table.csv, records_final.rds
+*Outputs:* species_records.rds (unique strict coordinates of each unit)
+
+```{r species_records}
+# --- Species units and their types ---
+tab <- fread(file.path(dir_butterfly, "species_table.csv"), colClasses = c(pool_key = "character"))
+stopifnot(!anyDuplicated(tab$pool_key))
+print(table(tab$interaction_type, useNA = "ifany"))
+
+# --- Unique strict-cleaning coordinates of the units ---
+x <- readRDS(file.path(dir_butterfly, "records_final.rds"))
+x <- unique(x[in_strict_plus == TRUE & !is.na(pool_key) & pool_key %in% tab$pool_key,
+              .(pool_key, decimalLongitude, decimalLatitude)])
+saveRDS(x, file.path(dir_data_intermediate, "species_records.rds"))
+cat("units with records:", uniqueN(x$pool_key), "; unique coordinates:", nrow(x), "\n")
+```
+
+```{r clear_species_records, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Cell assemblages
+
+Each unit is counted once in every cell holding at least one of its records. For each cell, the table gives the number of recorded units, the number with an interaction type (`n_classified`), the counts of each type and the classification coverage. Proportions are computed in the analysis notebooks, where minimum numbers of classified species are applied.
+
+*Inputs:* raw/butterfly_ant_interactions/ species_table.csv, interaction_cells_500km.csv; s02/species_records.rds
+*Outputs:* presence_250km.csv, presence_500km.csv, presence_1000km.csv (unit by cell); cell_assemblages_250km.csv, cell_assemblages_500km.csv, cell_assemblages_1000km.csv
+
+```{r cell_assemblages}
+tab <- fread(file.path(dir_butterfly, "species_table.csv"), colClasses = c(pool_key = "character"))
+x <- readRDS(file.path(dir_data_intermediate, "species_records.rds"))
+occ <- split(as.data.frame(x[, .(decimalLongitude, decimalLatitude)]), x$pool_key)
+rm(x)
+invisible(gc())
+
+for (cell_km in cell_sizes_km) {
+  # --- Presence of each unit in the cells ---
+  pres <- as.data.table(equal_area_species_cells(occ, cell_km = cell_km))
+  pres <- unique(pres[, .(pool_key = species, cell_id, cell_x, cell_y)])
+  pres[, interaction_type := tab$interaction_type[match(pool_key, tab$pool_key)]]
+  write_table(pres[, .(pool_key, cell_id)],
+              file.path(dir_data_intermediate, paste0("presence_", cell_km, "km.csv")))
+
+  # --- Counts per cell ---
+  cells <- pres[, .(cell_x = cell_x[1], cell_y = cell_y[1], n_total = .N,
+                    n_classified = sum(interaction_type %in% types),
+                    n_n = sum(interaction_type %in% "n"), n_f = sum(interaction_type %in% "f"),
+                    n_m = sum(interaction_type %in% "m"), n_p = sum(interaction_type %in% "p")),
+                by = cell_id]
+  cells[, coverage := n_classified / n_total]
+  write_table(cells, file.path(dir_data_intermediate,
+                               paste0("cell_assemblages_", cell_km, "km.csv")))
+  cat(cell_km, "km:", nrow(cells), "occupied cells,", sum(cells$n_classified >= 10),
+      "with >= 10 classified species\n")
+}
+
+# --- Check against the published 500-km cell table of butterfly_ant_interactions ---
+cells <- fread(file.path(dir_data_intermediate, "cell_assemblages_500km.csv"))
+pub <- fread(file.path(dir_butterfly, "interaction_cells_500km.csv"))
+chk <- merge(cells, pub, by = "cell_id")
+stopifnot(nrow(chk) == nrow(pub), nrow(cells) == nrow(pub),
+          all(chk$n_total.x == chk$n_total.y), all(chk$n_classified.x == chk$n_classified.y))
+k <- chk$n_classified.x >= 10
+stopifnot(isTRUE(all.equal(chk$n_p[k] / chk$n_classified.x[k], chk$prop_parasitic[k])),
+          isTRUE(all.equal(chk$n_m[k] / chk$n_classified.x[k], chk$prop_mutualist[k])))
+cat("500-km cells identical to the published cell table:", nrow(chk), "\n")
+```
+
+```{r clear_cell_assemblages, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Species climates
+
+Each unit's records are reduced to the unique 10-arc-minute pixels they fall in, so that densely recorded places do not dominate, and the climate of the unit is the median over these pixels of each present and past variable of `s01_prepare_climate`. Records in pixels without climate values (mostly on small islands and coasts) are dropped. The number of pixels is kept as a measure of the information behind each value.
+
+*Inputs:* raw/butterfly_ant_interactions/species_table.csv; s02/species_records.rds; s01/ climate_present_10m.tif, climate_past_10m.tif, climate_variability_30m.tif
+*Outputs:* species_climate.csv
+
+```{r species_climates}
+tab <- fread(file.path(dir_butterfly, "species_table.csv"), colClasses = c(pool_key = "character"))
+x <- readRDS(file.path(dir_data_intermediate, "species_records.rds"))
+present <- rast(file.path(dir_s01, "climate_present_10m.tif"))
+past <- rast(file.path(dir_s01, "climate_past_10m.tif"))
+variability <- rast(file.path(dir_s01, "climate_variability_30m.tif"))
+layers <- c(present, past, resample(variability, present, method = "near"))
+
+# --- Unique pixels of each unit ---
+x[, pixel := cellFromXY(present, cbind(decimalLongitude, decimalLatitude))]
+px <- unique(x[!is.na(pixel), .(pool_key, pixel)])
+
+# --- Climate of the pixels, and the median of each unit ---
+vals <- as.data.table(layers[px$pixel])
+vals[, pool_key := px$pool_key]
+vals <- vals[!is.na(bio01)]
+sp <- vals[, c(list(n_pixels = .N), lapply(.SD, median, na.rm = TRUE)), by = pool_key,
+           .SDcols = names(layers)]
+
+# LGM ice cover as the share of the unit's pixels under ice at the LGM (not the median)
+sp[, lgm_ice := NULL]
+sp <- merge(sp, vals[, .(lgm_ice_share = mean(lgm_ice, na.rm = TRUE)), by = pool_key],
+            by = "pool_key")
+
+# Latitude of the unit: median of its pixels' latitudes (for comparisons with latitude)
+px[, latitude := yFromCell(present, pixel)]
+sp <- merge(sp, px[, .(abs_latitude = median(abs(latitude))), by = pool_key], by = "pool_key")
+
+# --- Add the taxonomy and interaction traits ---
+sp <- merge(tab[, .(pool_key, species, genus, subfamily, interaction_type, host_breadth,
+                    range_area)], sp, by = "pool_key")
+write_table(sp, file.path(dir_data_intermediate, "species_climate.csv"))
+cat("units with a climate:", nrow(sp), "; classified:", sum(sp$interaction_type %in% types),
+    "\n")
+print(sp[interaction_type %in% types, .N, by = interaction_type])
+```
+
+```{r clear_species_climates, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Cell table for analysis
+
+The assemblage counts are joined to the cell climate. Only cells with climate values (land) are kept; cells with records but no land pixel in WorldClim are reported.
+
+*Inputs:* s02/cell_assemblages_*km.csv; s01/cell_climate_*km.csv
+*Outputs:* cell_data_250km.csv, cell_data_500km.csv, cell_data_1000km.csv
+
+```{r cell_data}
+for (cell_km in cell_sizes_km) {
+  a <- fread(file.path(dir_data_intermediate, paste0("cell_assemblages_", cell_km, "km.csv")))
+  cl <- fread(file.path(dir_s01, paste0("cell_climate_", cell_km, "km.csv")))
+  d <- merge(a, cl[, !c("cell_x", "cell_y")], by = "cell_id")
+  cat(cell_km, "km: occupied cells without climate:", nrow(a) - nrow(d),
+      "(classified species in them:", sum(a[!cell_id %in% d$cell_id]$n_classified), ")\n")
+  write_table(d, file.path(dir_data_intermediate, paste0("cell_data_", cell_km, "km.csv")))
+}
+```
+
+```{r clear_cell_data, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+The R version and packages used to render this notebook are printed below, with the versions of the geospatial libraries (GDAL, PROJ, GEOS) used by `sf` and `terra`.
+
+```{r save_r_environment}
+print(sessionInfo())
+
+# Geospatial libraries bundled with (Windows) or linked by (Linux, macOS) sf and terra
+if ("sf" %in% loadedNamespaces()) print(sf::sf_extSoftVersion())
+if ("terra" %in% loadedNamespaces()) print(terra::gdal(lib = "all"))
+```

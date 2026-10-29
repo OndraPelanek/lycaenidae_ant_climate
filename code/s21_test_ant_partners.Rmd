@@ -1,0 +1,374 @@
+---
+title: "Lycaenidae ant-interaction climate 21 - ant richness and partner genera"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+The strategies of lycaenids depend on ants, yet so far the analyses used climate and lineage only. An external review (29 October 2026) asked for ant data, with two cautions: the richness of ants is only a baseline, and the presence of an ant genus is not the same as its compatibility with lycaenids. This notebook uses the global ant data of Kass et al. (2022; Global Ant Biodiversity Informatics records and the richness estimated from them) and the ant partners recorded for each lycaenid species in the parent study:
+
+1. **Ant richness as a baseline.** Each lycaenid species gets the median estimated ant species and genus richness over its record pixels; their effects on association, obligacy and parasitism are estimated given lineage and given region and lineage.
+2. **Partner genera.** The ant genera recorded as partners of lycaenid species of each strategy and region.
+3. **Availability and use of the partner genera.** For the genera most often recorded as partners of obligate species: the number of their species recorded in each biogeographic region and Mediterranean-climate region, and whether they are recorded as partners of the lycaenids of that region, and of which strategies. If obligate associations were absent from the Mediterranean Basin or California because the partner genera of southern obligate species are missing there, those genera should be absent or poor in species there; if they are present and used by facultative species, absence of partners is not the explanation, although differences in colony ecology within these genera still could be.
+
+The partner records are uneven (many species have none, others have a single genus) and GABI is unevenly sampled, so the numbers are descriptions of the recorded partners, not estimates of partner ranges.
+
+A full run takes about 5 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(mgcv)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+# Kass et al. (2022) files inside the Dryad archive
+kass_zip <- "ants_kass2022/main_analysis_data.zip"
+kass_files <- c(
+  species_richness = "main_analysis_data/results_species/richness_predictions_irs60K/raw/ant_sp_richness.tif",
+  genus_richness = "main_analysis_data/results_genus/richness_predictions_irs60K/raw/ant_gen_richness.tif",
+  species_records = "main_analysis_data/processing_data/3A_forAnalysis_processed_database_SPECIES.csv",
+  genus_records = "main_analysis_data/processing_data/3B_forAnalysis_processed_database_GENUS.csv")
+
+# Contrasts
+contrasts <- list(associated = list(rows = c("n", "f", "m", "p"), success = c("f", "m", "p"),
+                                    label = "Ant-associated vs non-associated"),
+                  obligate = list(rows = c("f", "m", "p"), success = c("m", "p"),
+                                  label = "Obligate vs facultative"),
+                  parasite = list(rows = c("m", "p"), success = "p",
+                                  label = "Parasite vs mutualist"))
+
+# Number of partner genera of obligate species shown
+n_partner_genera <- 14
+
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+med_levels <- c("Cape", "Southern Australia", "Mediterranean Basin", "California",
+                "Central Chile")
+types <- c("n", "f", "m", "p")
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+type_labels <- c(n = "Non-associated", f = "Facultative", m = "Obligate mutualist",
+                 p = "Obligate parasite")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_s07 <- path_resrepo("data/intermediate/s07_compare_mediterranean")
+dir_s13 <- path_resrepo("data/intermediate/s13_compare_matched_climates")
+dir_data_intermediate <- path_resrepo("data/intermediate/s21_test_ant_partners")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# A raster inside the Kass archive, read without extracting it
+read_kass_raster <- function(name) {
+  zip <- normalizePath(file.path(dir_data_raw, kass_zip), winslash = "/")
+  rast(file.path("/vsizip", zip, kass_files[[name]]))
+}
+
+# A table inside the Kass archive, extracted to a temporary folder
+read_kass_table <- function(name) {
+  out <- unzip(file.path(dir_data_raw, kass_zip), files = kass_files[[name]],
+               exdir = tempdir(), junkpaths = TRUE)
+  on.exit(unlink(out))
+  fread(out)
+}
+
+# Species of a contrast, coded 0/1
+contrast_data <- function(sp, ct) {
+  d <- copy(sp[interaction_type %in% contrasts[[ct]]$rows])
+  d[, `:=`(y = as.integer(interaction_type %in% contrasts[[ct]]$success),
+           region = factor(region), genus = factor(genus), subfamily = factor(subfamily))]
+  d
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom", plot.tag = element_text(face = "bold", size = 11))
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Ant richness of each lycaenid species
+
+*Inputs:* raw/ants_kass2022/main_analysis_data.zip (richness rasters); s01/climate_present_10m.tif; s02/species_records.rds; s05/species_regions.csv
+*Outputs:* species_ants.csv, ant_richness_effects.csv
+
+```{r ant_richness}
+ants <- c(read_kass_raster("species_richness"), read_kass_raster("genus_richness"))
+names(ants) <- c("ant_species", "ant_genera")
+stopifnot(compareGeom(ants, rast(file.path(dir_s01, "climate_present_10m.tif")), stopOnError = FALSE))
+
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+sp <- sp[interaction_type %in% types & !is.na(region)]
+x <- readRDS(file.path(dir_s02, "species_records.rds"))
+x[, pool_key := as.character(pool_key)]
+x <- x[pool_key %in% sp$pool_key]
+x[, cell := cellFromXY(ants, cbind(decimalLongitude, decimalLatitude))]
+px <- unique(x[!is.na(cell), .(pool_key, cell)])
+px <- cbind(px, as.data.table(ants[px$cell]))
+med <- px[, lapply(.SD, median, na.rm = TRUE), by = pool_key, .SDcols = names(ants)]
+sp <- merge(sp[, .(pool_key, species, genus, subfamily, interaction_type, region, bio01,
+                   log_aridity)], med, by = "pool_key")
+sp[, `:=`(log_ant_species = log10(ant_species + 1), log_ant_genera = log10(ant_genera + 1))]
+write_table(sp, file.path(dir_data_intermediate, "species_ants.csv"))
+print(sp[, .(species = .N, ant_species = median(ant_species, na.rm = TRUE),
+             ant_genera = median(ant_genera, na.rm = TRUE)), by = interaction_type])
+
+# --- Effects of ant richness given lineage, and given region and lineage ---
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+effects <- rbindlist(lapply(names(contrasts), function(ct) {
+  d <- contrast_data(sp[is.finite(log_ant_species) & is.finite(log_ant_genera)], ct)
+  rbindlist(lapply(c("log_ant_species", "log_ant_genera"), function(v) {
+    d[, z := as.numeric(scale(get(v)))]
+    rbindlist(lapply(c("lineage", "region and lineage"), function(given) {
+      rhs <- paste(if (given == "region and lineage") "region +", "z +", lineage)
+      m <- gam(as.formula(paste("y ~", rhs)), data = d, family = binomial, method = "REML")
+      cf <- summary(m)$p.table["z", ]
+      data.table(contrast = ct, property = v, given = given, species = nrow(d),
+                 events = sum(d$y), estimate = cf[[1]], se = cf[[2]], p = cf[[4]])
+    }))
+  }))
+}))
+write_table(effects, file.path(dir_data_intermediate, "ant_richness_effects.csv"))
+print(effects, digits = 3)
+```
+
+```{r clear_ant_richness, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Partner genera of each strategy and region
+
+*Inputs:* raw/butterfly_ant_interactions/ species_partners.csv, species_table.csv; s05/species_regions.csv; s07/mediterranean_pool_species.csv
+*Outputs:* partner_records.csv, partner_genera.csv
+
+```{r partner_genera}
+partners <- fread(file.path(dir_data_raw, "butterfly_ant_interactions", "species_partners.csv"),
+                  colClasses = c(gbif_key = "character"))
+tab <- fread(file.path(dir_data_raw, "butterfly_ant_interactions", "species_table.csv"),
+             colClasses = c(pool_key = "character", gbif_key = "character"))
+reg <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+med <- fread(file.path(dir_s07, "mediterranean_pool_species.csv"),
+             colClasses = c(pool_key = "character"))
+
+# --- One row per lycaenid species unit and recorded ant taxon ---
+rec <- partners[associated_ants != "", .(ant_taxon = trimws(unlist(strsplit(associated_ants, ";")))),
+                by = gbif_key]
+rec[, ant_genus := sub("^([A-Za-z]+).*", "\\1", ant_taxon)]
+rec <- rec[grepl("^[A-Z][a-z]+$", ant_genus)]
+rec <- unique(merge(rec, tab[, .(gbif_key, pool_key)], by = "gbif_key")[, .(pool_key, ant_taxon,
+                                                                             ant_genus)])
+rec <- merge(rec, reg[interaction_type %in% types, .(pool_key, species, genus, subfamily,
+                                                      interaction_type, region)], by = "pool_key")
+write_table(rec, file.path(dir_data_intermediate, "partner_records.csv"))
+cat("Lycaenid species with recorded partner genera, by strategy:\n")
+print(merge(rec[, .(with_partners = uniqueN(pool_key)), by = interaction_type],
+            reg[interaction_type %in% types, .(classified = .N), by = interaction_type],
+            by = "interaction_type"))
+
+# --- Lycaenid species per ant genus, strategy and region (and Mediterranean-climate region) ---
+by_region <- rec[, .(lycaenid_species = uniqueN(pool_key)),
+                 by = .(ant_genus, interaction_type, unit = region)][, level := "Biogeographic region"]
+rec_med <- merge(rec, med[, .(pool_key, med_region)], by = "pool_key", allow.cartesian = TRUE)
+by_med <- rec_med[, .(lycaenid_species = uniqueN(pool_key)),
+                  by = .(ant_genus, interaction_type, unit = med_region)][
+                    , level := "Mediterranean-climate region"]
+by_all <- rec[, .(lycaenid_species = uniqueN(pool_key)), by = .(ant_genus, interaction_type)][
+  , `:=`(unit = "All regions", level = "All")]
+pg <- rbind(by_all, by_region, by_med, use.names = TRUE)
+write_table(pg, file.path(dir_data_intermediate, "partner_genera.csv"))
+print(dcast(by_all, ant_genus ~ interaction_type, value.var = "lycaenid_species", fill = 0)[
+  order(-(m + p))][1:25])
+```
+
+```{r clear_partner_genera, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Availability and use of the partner genera of obligate species
+
+The genera recorded as partners of the most obligate lycaenid species (mutualists and parasites) are compared across regions: the number of their species and of their records in GABI (Kass et al. 2022, filtered records), and the number of lycaenid species of each strategy recorded with them.
+
+*Inputs:* raw/ants_kass2022/main_analysis_data.zip (filtered species and genus records); s13/pixel_strata.rds; s21/partner_genera.csv
+*Outputs:* ant_genus_regions.csv, partner_availability.csv
+
+```{r partner_availability}
+template <- rast(file.path(dir_s01, "climate_present_10m.tif"))[[1]]
+pix <- readRDS(file.path(dir_s13, "pixel_strata.rds"))[, .(cell, region = as.character(region),
+                                                           med_region = as.character(med_region))]
+
+# --- Species and genus records, placed in regions by their pixel ---
+ant_sp <- read_kass_table("species_records")
+ant_sp[, `:=`(ant_genus = sub("\\..*$", "", valid_species_name),
+              cell = cellFromXY(template, cbind(lon_opt, lat_opt)))]
+ant_g <- read_kass_table("genus_records")
+ant_g[, `:=`(ant_genus = valid_species_name, cell = cellFromXY(template, cbind(lon_opt, lat_opt)))]
+ant_sp <- merge(ant_sp, pix, by = "cell")
+ant_g <- merge(ant_g, pix, by = "cell")
+
+count_units <- function(unit_col) {
+  s <- ant_sp[!is.na(get(unit_col)), .(ant_species = uniqueN(valid_species_name),
+                                       species_records = .N), by = .(unit = get(unit_col), ant_genus)]
+  g <- ant_g[!is.na(get(unit_col)), .(genus_records = .N), by = .(unit = get(unit_col), ant_genus)]
+  merge(s, g, by = c("unit", "ant_genus"), all = TRUE)
+}
+genus_regions <- rbind(count_units("region")[, level := "Biogeographic region"],
+                       count_units("med_region")[, level := "Mediterranean-climate region"])
+for (v in c("ant_species", "species_records", "genus_records")) {
+  set(genus_regions, which(is.na(genus_regions[[v]])), v, 0L)
+}
+write_table(genus_regions, file.path(dir_data_intermediate, "ant_genus_regions.csv"))
+
+# --- Partner genera of obligate species: availability and use in every region ---
+pg <- fread(file.path(dir_data_intermediate, "partner_genera.csv"))
+top <- pg[level == "All" & interaction_type %in% c("m", "p"),
+          .(obligate = sum(lycaenid_species)), by = ant_genus][order(-obligate)][
+            seq_len(n_partner_genera)]
+units <- rbind(data.table(level = "Biogeographic region", unit = region_levels),
+               data.table(level = "Mediterranean-climate region", unit = med_levels))
+grid <- CJ(ant_genus = top$ant_genus, unit = units$unit, sorted = FALSE)
+grid <- merge(grid, units, by = "unit")
+avail <- merge(grid, genus_regions, by = c("level", "unit", "ant_genus"), all.x = TRUE)
+use <- dcast(pg[level != "All"], level + unit + ant_genus ~ interaction_type,
+             value.var = "lycaenid_species", fill = 0)
+for (t in setdiff(types, names(use))) set(use, j = t, value = 0L)
+avail <- merge(avail, use[, c("level", "unit", "ant_genus", types), with = FALSE],
+               by = c("level", "unit", "ant_genus"), all.x = TRUE)
+for (v in c("ant_species", "species_records", "genus_records", types)) {
+  set(avail, which(is.na(avail[[v]])), v, 0L)
+}
+avail <- merge(avail, top, by = "ant_genus")
+write_table(avail[order(-obligate, level, unit)],
+            file.path(dir_data_intermediate, "partner_availability.csv"))
+print(dcast(avail[level == "Mediterranean-climate region"], ant_genus + obligate ~ unit,
+            value.var = "ant_species")[order(-obligate)])
+print(avail[level == "Mediterranean-climate region" & (m + p + f) > 0,
+            .(ant_genus, unit, ant_species, n, f, m, p)][order(ant_genus, unit)])
+```
+
+```{r clear_partner_availability, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) Effects of the estimated ant species richness of each lycaenid species' records on each contrast, given lineage and given region and lineage (log odds per SD, 95% intervals). (b) The ant genera recorded as partners of the most obligate lycaenid species, in each biogeographic region: the number of their species recorded in GABI (shading) and the lycaenid species of each strategy recorded with them there (symbols). (c) The same for the Mediterranean-climate regions.
+
+*Inputs:* s21/ ant_richness_effects.csv, partner_availability.csv
+*Outputs:* plot_ants.png
+
+```{r plot_ants}
+effects <- fread(file.path(dir_data_intermediate, "ant_richness_effects.csv"))
+avail <- fread(file.path(dir_data_intermediate, "partner_availability.csv"))
+
+# --- a: ant richness ---
+e <- effects[property == "log_ant_species"]
+e[, `:=`(contrast = factor(sapply(contrasts, `[[`, "label")[contrast],
+                           rev(sapply(contrasts, `[[`, "label"))),
+         given = factor(paste("Given", given), c("Given lineage", "Given region and lineage")))]
+panel_a <- ggplot(e, aes(estimate, contrast, shape = given)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), width = 0,
+                linewidth = 0.5, orientation = "y", position = position_dodge(width = 0.5)) +
+  geom_point(size = 2.2, fill = "white", position = position_dodge(width = 0.5)) +
+  scale_shape_manual(values = c(21, 16), name = NULL) +
+  labs(x = "Effect of ant species richness (log odds per SD, 95% CI)", y = NULL,
+       title = "Ant richness") +
+  theme_figure()
+
+# --- b, c: partner genera ---
+partner_panel <- function(lv, lev, title) {
+  d <- avail[level == lv]
+  d[, `:=`(unit = factor(unit, lev), ant_genus = factor(ant_genus, rev(unique(
+    avail[order(-obligate)]$ant_genus))))]
+  uses <- melt(d, id.vars = c("unit", "ant_genus"), measure.vars = c("f", "m", "p"),
+               variable.name = "type", value.name = "lycaenids")[lycaenids > 0]
+  shifts <- c(f = -0.25, m = 0, p = 0.25)
+  ggplot(d, aes(unit, ant_genus)) +
+    geom_tile(aes(fill = ant_species), colour = "white", linewidth = 0.6) +
+    lapply(names(shifts), function(t)
+      geom_point(data = uses[type == t], aes(colour = type, size = lycaenids),
+                 position = position_nudge(x = shifts[[t]]))) +
+    scale_fill_gradient(low = "#F2F2F2", high = "#5A5A5A", trans = "sqrt",
+                        limits = c(0, max(avail$ant_species)),
+                        name = "Ant species\nrecorded (GABI)") +
+    scale_colour_manual(values = type_colours[c("f", "m", "p")],
+                        labels = type_labels[c("f", "m", "p")], drop = FALSE,
+                        name = "Lycaenids recorded\nwith the genus") +
+    scale_size_area(max_size = 3.5, breaks = c(1, 5, 20),
+                    limits = c(0, max(avail[, c("f", "m", "p")])), name = "Lycaenid species") +
+    labs(x = NULL, y = NULL, title = title) +
+    theme_figure() +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1), axis.text.y = element_text(face = "italic"),
+          panel.grid.major = element_blank(), legend.box = "vertical")
+}
+panel_b <- partner_panel("Biogeographic region", region_levels,
+                         "Partner genera of obligate species across regions")
+panel_c <- partner_panel("Mediterranean-climate region", med_levels,
+                         "... and across Mediterranean-climate regions")
+
+fig <- panel_a / (panel_b | panel_c) + plot_layout(heights = c(0.35, 1), guides = "collect") +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")") &
+  theme(legend.position = "bottom", legend.box = "vertical")
+save_figure(fig, "plot_ants", 11, 9.5)
+fig
+```
+
+```{r clear_plot_ants, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

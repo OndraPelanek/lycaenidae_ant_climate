@@ -1,0 +1,366 @@
+---
+title: "Lycaenidae ant-interaction climate 10 - diversification of obligate lineages and robustness of the origins"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+`s09_test_history` found that the obligate-rich faunas of southern Africa and Australia arose differently: southern Africa's obligate species descend from a few origins followed by large radiations, Australia's from many origins. This notebook checks this result and tests its implication.
+
+1. **Robustness of the origins.** The species grafted onto their genus form polytomies, which `s09` resolved once at random. Here the origins are counted again over 20 random resolutions (20 stochastic maps each), and on a tree of genera (one tip per genus, from the species matched to the published tree only), which does not depend on placements within genera at all.
+2. **Diversification.** If southern Africa's obligate richness reflects radiation, its obligate genera should have diversified faster than other genera. The net diversification rate of each genus is estimated from its number of species and its stem age (Magallón & Sanderson 2001), for extinction fractions of 0 and 0.9, using all species units of the genus (classified or not) and the stem age on the dated Yumnam tree. Rates are compared between obligate and other genera and between regions, with and without phylogenetic correction (phylogenetic regression on the tree of genera).
+
+Genus richness counts the species units of `butterfly_ant_interactions`, which slightly outnumber described species, and stem ages are taken from the parent node of the most recent common ancestor of a genus's tips (older than the true stem age when a genus is not monophyletic on the tree). Rates are therefore approximate, and comparisons among groups are more reliable than single values. A full run takes about 10 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(ape)
+library(phytools)
+library(phylolm)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+obligate_types <- c("m", "p")
+classified_types <- c("n", "f", "m", "p")
+
+# Robustness of the origins: random resolutions of the polytomies, and maps per resolution
+n_resolutions <- 20
+n_maps_per_resolution <- 20
+n_maps_genus_tree <- 100
+min_branch_share <- 1e-4
+
+# Extinction fractions of the Magallón & Sanderson estimator
+epsilons <- c(0, 0.9)
+
+# A genus is obligate when at least half of its classified species are obligate
+obligate_genus_share <- 0.5
+
+# Genera with a stem age below this (Myr; zero-length branches of the published tree) are excluded
+# from the rate comparisons
+min_stem_age <- 0.5
+
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+southern_regions <- c("Southern Africa", "Australia")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s04 <- path_resrepo("data/intermediate/s04_fit_phylogenetic_models")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_s09 <- path_resrepo("data/intermediate/s09_test_history")
+dir_data_intermediate <- path_resrepo("data/intermediate/s10_test_diversification")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+tree_file <- file.path(dir_data_raw, "phylogenies", "yumnam_2025",
+                       "21Jan2025_30June23_SubfamAdded_RelTime_DivergenceTime_928sp.nwk")
+crosswalk_file <- file.path(dir_data_raw, "butterfly_ant_interactions", "crosswalk_yumnam_2025.csv")
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+source(here::here("code", "R", "phylogeny.R"))
+```
+
+```{r define_helpers}
+# Resolve polytomies at random and lengthen zero-length branches (as in s09)
+prepare_tree <- function(tr, seed) {
+  set.seed(seed)
+  tr <- multi2di(tr, random = TRUE)
+  floor <- min_branch_share * max(node.depth.edgelength(tr))
+  tr$edge.length[tr$edge.length < floor] <- floor
+  tr
+}
+
+# Origins of state "1" in a list of stochastic maps: for each change from 0 to 1 on a branch, the
+# region holding most of the descendant tips in state 1 and the number of those tips
+count_origins <- function(maps, state1, region_of) {
+  n_tip <- Ntip(maps[[1]])
+  rbindlist(lapply(seq_along(maps), function(s) {
+    m <- maps[[s]]
+    rbindlist(lapply(seq_len(nrow(m$edge)), function(i) {
+      states <- names(m$maps[[i]])
+      if (!any(head(states, -1) == "0" & tail(states, -1) == "1")) return(NULL)
+      child <- m$edge[i, 2]
+      desc <- if (child <= n_tip) child else getDescendants(m, child)
+      tips <- m$tip.label[desc[desc <= n_tip]]
+      tips <- tips[state1[tips]]
+      if (!length(tips)) return(NULL)
+      data.table(map = s, region = names(sort(table(region_of[tips]), decreasing = TRUE))[1],
+                 descendants = length(tips))
+    }))
+  }))
+}
+
+# Origins per region and map, with zero for regions without an origin
+origins_per_region <- function(origins, maps) {
+  x <- origins[, .N, by = .(map, region)]
+  x <- merge(CJ(map = maps, region = region_levels), x, by = c("map", "region"), all.x = TRUE)
+  x[is.na(N), N := 0L]
+  x
+}
+
+# Net diversification rate from stem age (Magallón & Sanderson 2001)
+ms_rate <- function(n, age, eps) log(n * (1 - eps) + eps) / age
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Origins over random resolutions of the polytomies
+
+The `s09` analysis is repeated on `r n_resolutions` random resolutions of the grafted Yumnam tree, with `r n_maps_per_resolution` stochastic maps each.
+
+*Inputs:* s04/grafted_trees.rds; s09/history_species.csv
+*Outputs:* origins_resolutions.csv
+
+```{r origins_resolutions}
+trees <- readRDS(file.path(dir_s04, "grafted_trees.rds"))
+sp <- fread(file.path(dir_s09, "history_species.csv"))
+d <- sp[species %in% trees$yumnam_2025$tip.label]
+base <- keep.tip(trees$yumnam_2025, d$species)
+ob <- setNames(ifelse(d$obligate == 1, "1", "0"), d$species)
+state1 <- setNames(d$obligate == 1, d$species)
+region_of <- setNames(d$region, d$species)
+
+res <- rbindlist(lapply(seq_len(n_resolutions), function(r) {
+  tr <- prepare_tree(base, seed = r)
+  set.seed(1000 + r)
+  maps <- make.simmap(tr, ob, model = "ARD", nsim = n_maps_per_resolution, message = FALSE)
+  o <- count_origins(maps, state1, region_of)
+  origins_per_region(o, seq_len(n_maps_per_resolution))[, resolution := r]
+}))
+write_table(res, file.path(dir_data_intermediate, "origins_resolutions.csv"))
+print(res[, .(median = median(N), low = quantile(N, 0.025), high = quantile(N, 0.975)),
+          by = region][order(-median)])
+```
+
+```{r clear_origins_resolutions, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Origins on a tree of genera
+
+Only the species matched to tips of the published Yumnam tree are used (no grafting); each genus keeps one tip, with branch lengths from the published tree. A genus is coded obligate when at least half of its classified species are obligate, and is assigned the region holding most of its species with a region.
+
+*Inputs:* raw/phylogenies/yumnam_2025; raw/butterfly_ant_interactions/ crosswalk_yumnam_2025.csv, species_table.csv; s05/species_regions.csv
+*Outputs:* genus_table.csv, genus_tree.rds, origins_genus_tree.csv
+
+```{r genus_tree}
+tab <- fread(file.path(dir_data_raw, "butterfly_ant_interactions", "species_table.csv"),
+             colClasses = c(pool_key = "character"))
+reg <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+cw <- read.csv(crosswalk_file, na.strings = c("", "NA"))
+
+# --- Genus table: richness (all units), classified species, obligate share and region ---
+genera <- tab[!is.na(genus), .(richness = .N,
+                              classified = sum(interaction_type %in% classified_types),
+                              obligate = sum(interaction_type %in% obligate_types),
+                              facultative = sum(interaction_type %in% "f"),
+                              non_associated = sum(interaction_type %in% "n"),
+                              subfamily = subfamily[1]), by = genus]
+gr <- reg[!is.na(region), .N, by = .(genus, region)][order(genus, -N)][!duplicated(genus)]
+genera <- merge(genera, gr[, .(genus, region)], by = "genus", all.x = TRUE)
+genera[classified > 0, strategy := ifelse(obligate / classified >= obligate_genus_share,
+                                          "Obligate", ifelse(facultative >= non_associated,
+                                                             "Facultative", "Non-associated"))]
+
+# --- Tree of the matched species, then one tip per genus ---
+matched <- intersect(tab$species, cw$analysis_species[cw$matched])
+tr <- prepare_analysis_tree(read_published_tree(tree_file), cw, matched, "published")
+if (!is.ultrametric(tr)) tr <- force.ultrametric(tr, method = "extend")
+tip_genus <- tab$genus[match(tr$tip.label, tab$species)]
+height <- max(node.depth.edgelength(tr))
+depth <- node.depth.edgelength(tr)
+
+# Stem age of each genus: age of the parent of the most recent common ancestor of its tips
+stem <- rbindlist(lapply(unique(tip_genus), function(g) {
+  tips <- which(tip_genus == g)
+  node <- if (length(tips) == 1) tips else getMRCA(tr, tips)
+  parent <- tr$edge[tr$edge[, 2] == node, 1]
+  clade <- if (length(tips) == 1) tips else
+    getDescendants(tr, node)[getDescendants(tr, node) <= Ntip(tr)]
+  data.table(genus = g, tips_on_tree = length(tips), stem_age = height - depth[parent],
+             monophyletic = all(tip_genus[clade] == g))
+}))
+genera <- merge(genera, stem, by = "genus", all.x = TRUE)
+for (e in epsilons) set(genera, j = paste0("rate_eps", e),
+                        value = ms_rate(genera$richness, genera$stem_age, e))
+write_table(genera, file.path(dir_data_intermediate, "genus_table.csv"))
+
+gt <- keep.tip(tr, match(unique(tip_genus), tip_genus))
+gt$tip.label <- tip_genus[match(gt$tip.label, tr$tip.label)]
+saveRDS(gt, file.path(dir_data_intermediate, "genus_tree.rds"))
+cat("genera on the tree:", Ntip(gt), "; with a classified species:",
+    sum(gt$tip.label %in% genera[!is.na(strategy)]$genus), "; monophyletic:",
+    sum(stem$monophyletic), "\n")
+
+# --- Origins of obligacy on the tree of genera ---
+gd <- genera[genus %in% gt$tip.label & !is.na(strategy) & !is.na(region)]
+gt2 <- keep.tip(gt, gd$genus)
+ob <- setNames(ifelse(gd$strategy == "Obligate", "1", "0"), gd$genus)
+set.seed(20261028)
+maps <- make.simmap(gt2, ob, model = "ARD", nsim = n_maps_genus_tree, message = FALSE)
+o <- count_origins(maps, setNames(gd$strategy == "Obligate", gd$genus),
+                   setNames(gd$region, gd$genus))
+og <- origins_per_region(o, seq_len(n_maps_genus_tree))
+write_table(og, file.path(dir_data_intermediate, "origins_genus_tree.csv"))
+print(og[, .(median = median(N), low = quantile(N, 0.025), high = quantile(N, 0.975)),
+         by = region][order(-median)])
+print(gd[strategy == "Obligate", .(genera = .N), by = region])
+```
+
+```{r clear_genus_tree, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Diversification of obligate genera
+
+The net diversification rates of genera with a classified species (and a stem age of at least `r min_stem_age` Myr) are compared among strategies and between the obligate-rich southern regions (southern Africa and Australia) and elsewhere. A phylogenetic regression on the tree of genera (`phylolm`, Pagel's lambda) is fitted with obligacy, southern region and their interaction, beside the same model without phylogeny.
+
+*Inputs:* s10/ genus_table.csv, genus_tree.rds
+*Outputs:* diversification_models.csv, diversification_summary.csv
+
+```{r diversification}
+genera <- fread(file.path(dir_data_intermediate, "genus_table.csv"), na.strings = c("", "NA"))
+gt <- readRDS(file.path(dir_data_intermediate, "genus_tree.rds"))
+gd <- genera[!is.na(strategy) & !is.na(region) & is.finite(stem_age) & stem_age >= min_stem_age]
+gd[, `:=`(obligate = as.integer(strategy == "Obligate"),
+          southern = as.integer(region %in% southern_regions),
+          group = paste0(ifelse(region == "Southern Africa", "Southern Africa",
+                                ifelse(region == "Australia", "Australia", "Elsewhere")),
+                         ", ", tolower(strategy)))]
+
+summary <- gd[, .(genera = .N, species = sum(richness),
+                  median_rate_eps0 = median(rate_eps0), median_rate_eps0.9 = median(rate_eps0.9)),
+              by = .(strategy, region_group = ifelse(region %in% southern_regions, region,
+                                                     "Elsewhere"))]
+write_table(summary[order(region_group, strategy)],
+            file.path(dir_data_intermediate, "diversification_summary.csv"))
+print(summary[order(region_group, strategy)], digits = 3)
+
+# --- Phylogenetic and ordinary regressions of the rates ---
+dd <- as.data.frame(gd[genus %in% gt$tip.label])
+rownames(dd) <- dd$genus
+tr <- keep.tip(gt, dd$genus)
+models <- rbindlist(lapply(c("rate_eps0", "rate_eps0.9"), function(v) {
+  f <- as.formula(paste(v, "~ obligate * southern"))
+  pm <- phylolm(f, data = dd, phy = tr, model = "lambda")
+  om <- lm(f, data = dd)
+  rbind(data.table(response = v, model = "phylogenetic", term = rownames(summary(pm)$coefficients),
+                   estimate = summary(pm)$coefficients[, 1], se = summary(pm)$coefficients[, 2],
+                   p = summary(pm)$coefficients[, 4], lambda = pm$optpar, genera = nrow(dd)),
+        data.table(response = v, model = "ordinary", term = rownames(summary(om)$coefficients),
+                   estimate = summary(om)$coefficients[, 1], se = summary(om)$coefficients[, 2],
+                   p = summary(om)$coefficients[, 4], lambda = NA_real_, genera = nrow(dd)))
+}))
+write_table(models, file.path(dir_data_intermediate, "diversification_models.csv"))
+print(models[term != "(Intercept)"], digits = 3)
+```
+
+```{r clear_diversification, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(A) Origins of obligacy per region over random resolutions of the polytomies (boxes: 400 maps) and on the tree of genera (points and bars: median and 95% range of 100 maps). (B) Net diversification rate of each genus (extinction fraction 0) by strategy, in southern Africa, Australia and elsewhere; point size gives the genus's species.
+
+*Inputs:* s10/ origins_resolutions.csv, origins_genus_tree.csv, genus_table.csv
+*Outputs:* plot_diversification.png
+
+```{r plot_diversification}
+res <- fread(file.path(dir_data_intermediate, "origins_resolutions.csv"))
+og <- fread(file.path(dir_data_intermediate, "origins_genus_tree.csv"))
+genera <- fread(file.path(dir_data_intermediate, "genus_table.csv"), na.strings = c("", "NA"))
+
+# --- A: origins per region, species tree (random resolutions) and genus tree ---
+res[, region := factor(region, rev(region_levels))]
+ogs <- og[, .(median = median(N), low = quantile(N, 0.025), high = quantile(N, 0.975)),
+          by = region][, region := factor(region, rev(region_levels))]
+panel_a <- ggplot(res, aes(N, region)) +
+  geom_boxplot(aes(colour = "Species tree, 20 random resolutions"), width = 0.45,
+               outlier.size = 0.4, linewidth = 0.35, position = position_nudge(y = 0.17)) +
+  geom_errorbar(data = ogs, aes(xmin = low, xmax = high, y = region,
+                                colour = "Tree of genera"), inherit.aes = FALSE, width = 0,
+                linewidth = 0.6, orientation = "y", position = position_nudge(y = -0.2)) +
+  geom_point(data = ogs, aes(median, region, colour = "Tree of genera"), size = 2,
+             position = position_nudge(y = -0.2)) +
+  scale_colour_manual(values = c(`Species tree, 20 random resolutions` = "grey45",
+                                 `Tree of genera` = "black"), name = NULL) +
+  labs(x = "Origins of obligacy per stochastic map", y = NULL, title = "Origins of obligacy") +
+  guides(colour = guide_legend(ncol = 1)) +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        legend.position = "bottom", plot.title = element_text(face = "bold", size = 9.5))
+
+# --- B: diversification rates of genera ---
+g <- genera[!is.na(strategy) & !is.na(region) & is.finite(rate_eps0) & stem_age >= min_stem_age]
+g[, `:=`(area = factor(ifelse(region %in% southern_regions, region, "Elsewhere"),
+                       c("Southern Africa", "Australia", "Elsewhere")),
+         strategy = factor(strategy, c("Non-associated", "Facultative", "Obligate")))]
+strategy_colours <- c(`Non-associated` = "#4D4D4D", Facultative = "#0072B2", Obligate = "#E69F00")
+panel_b <- ggplot(g, aes(strategy, rate_eps0, colour = strategy)) +
+  geom_boxplot(outlier.shape = NA, width = 0.55, linewidth = 0.4, colour = "grey30") +
+  geom_jitter(aes(size = richness), width = 0.18, height = 0, alpha = 0.55, stroke = 0) +
+  facet_wrap(~ area, nrow = 1) +
+  scale_colour_manual(values = strategy_colours, guide = "none") +
+  scale_size_area(max_size = 3.5, breaks = c(5, 20, 80), name = "Species in genus") +
+  labs(x = NULL, y = "Net diversification rate (per Myr, stem age, extinction 0)",
+       title = "Diversification of genera") +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.x = element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "bottom",
+        strip.text = element_text(face = "bold"),
+        plot.title = element_text(face = "bold", size = 9.5))
+
+fig <- (panel_a | panel_b) + plot_layout(widths = c(1, 1.5)) +
+  plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(face = "bold", size = 12))
+save_figure(fig, "plot_diversification", 11, 4.8)
+fig
+```
+
+```{r clear_plot_diversification, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

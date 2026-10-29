@@ -1,0 +1,734 @@
+---
+title: "Similar climates, different interactions: lineage composition shapes the global geography of butterfly–ant associations"
+output:
+  bookdown::word_document2:
+    reference_docx: docx_template.docx
+    fig_caption: true
+    number_sections: false
+    pandoc_args: ["--lua-filter=caption_style.lua", "--columns=10000"]
+    toc: false
+  bookdown::html_document2:
+    fig_caption: true
+    number_sections: false
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, error = FALSE,
+                      out.width = if (knitr::is_html_output()) "100%" else "6.5in")
+library(data.table)
+
+# Results are read from the notebook folders in data/intermediate; nothing is recomputed
+dir_int <- function(x) resrepo::path_resrepo(file.path("data/intermediate", x))
+read <- function(dir, file) fread(file.path(dir, file))
+fig <- function(dir, file) knitr::include_graphics(file.path(dir, file))
+
+# Number formatting
+pct <- function(x, digits = 0) paste0(formatC(100 * x, format = "f", digits = digits), "%")
+pts <- function(x) formatC(100 * x, format = "f", digits = 0)
+num <- function(x, digits = 2) formatC(x, format = "f", digits = digits)
+pval <- function(p) if (p < 0.001) "p < 0.001" else paste("p =", formatC(p, format = "f", digits = 3))
+south <- function(x) sub("^Southern", "southern", x)
+
+# (Helper arguments are named unlike any column, so that data.table filters read them correctly)
+
+# --- Sample (s02) ---
+spc <- read(dir_int("s02_build_assemblages"), "species_climate.csv")
+n_units <- nrow(spc)
+n_class <- spc[interaction_type %in% c("n", "f", "m", "p"), .N]
+n_type <- function(k) spc[interaction_type == k, .N]
+n_records <- nrow(readRDS(file.path(dir_int("s02_build_assemblages"), "species_records.rds")))
+
+# --- Regions and lineages (s05) ---
+d5 <- dir_int("s05_compare_regions")
+lin <- read(d5, "region_lineages.csv")
+lin_n <- function(rg, k, what = "species") {
+  x <- lin[region == rg & interaction_type == k][[what]]
+  if (length(x)) x else 0L
+}
+assoc_share <- lin[, .(share = sum(species[interaction_type != "n"]) / sum(species)), by = region]
+obligate_genera_total <- read(d5, "species_regions.csv")[interaction_type %in% c("m", "p"),
+                                                         uniqueN(genus)]
+grad <- read(d5, "region_gradient_slopes_hex5.csv")
+gb <- grad[abs(observed_slope) > 0.3]
+
+# --- Species level (s04) and evidence (s12) ---
+part_sp <- read(dir_int("s04_fit_phylogenetic_models"), "partition_species.csv")
+ps <- function(ct, col) part_sp[contrast == ct][[col]]
+d12 <- dir_int("s12_audit_evidence")
+ecov <- read(d12, "coverage_regions.csv")
+ecomp <- function(rg) unique(ecov[region == rg, classified / recorded])
+epres <- function(k) ecov[strategy == k, sum(N[evidence == "presumed from relatives"]) / sum(N)]
+oos_t <- read(d12, "lineage_out_of_sample.csv")[, .(d2 = median(d2)),
+                                                by = .(contrast, evidence, scheme, model)]
+oos <- function(ct, ev, sch, mo) oos_t[contrast == ct & evidence == ev & scheme == sch &
+                                         model == mo]$d2
+
+# --- Held-out realms and subfamilies (s20) ---
+d20 <- dir_int("s20_predict_held_out")
+po20 <- read(d20, "held_out_pooled.csv")
+po <- function(ct, sch, mo, col = "d2") po20[contrast == ct & scheme == sch & model == mo][[col]]
+me20 <- read(d20, "held_out_metrics.csv")
+me <- function(ct, sch, u, mo, col = "predicted")
+  me20[contrast == ct & scheme == sch & unit == u & model == mo][[col]]
+novel_max <- me20[model == "climate" & contrast == "obligate" & scheme == "held-out realm",
+                  max(novel_share)]
+
+# --- Stability or southern geography (s06) and southern drivers (s08) ---
+d6 <- dir_int("s06_test_stability")
+scv <- read(d6, "stability_cv.csv")
+sc <- function(st, sch) median(scv[set == st & scheme == sch]$cv_d2)
+seff <- read(d6, "stability_effects.csv")
+se <- function(a, col = "estimate") seff[analysis == a][[col]]
+d8 <- dir_int("s08_test_southern_drivers")
+dcv <- read(d8, "drivers_cv.csv")
+deff <- read(d8, "drivers_effects.csv")
+dgain <- merge(dcv[grepl("^reference [+] ", set) & set != "reference + all drivers"],
+               dcv[set == "reference", .(ref = cv_d2, scheme, repeat_id)],
+               by = c("scheme", "repeat_id"))[, .(gain = median(cv_d2 - ref)), by = .(set, scheme)]
+
+# --- Shared climates (s07, s13) ---
+d7 <- dir_int("s07_compare_mediterranean")
+mpool <- read(d7, "mediterranean_pools.csv")
+mob <- function(rg) mpool[med_region == rg, sum(species[interaction_type %in% c("m", "p")]) /
+                            sum(species)]
+mn <- function(rg) mpool[med_region == rg, sum(species)]
+d13 <- dir_int("s13_compare_matched_climates")
+pcomp <- read(d13, "pair_comparisons.csv")
+pcv <- function(pr_, rg, col, grain = "standard")
+  pcomp[pair == pr_ & region == rg & strata == grain][[col]]
+bmed <- read(d13, "beyond_mediterranean.csv")
+bmv <- function(tg, rg, col = "obligate_share") bmed[target == tg & region == rg][[col]]
+sgen <- read(d13, "shared_genera.csv")
+
+# --- Standardised shared-climate audit (s18) ---
+d18 <- dir_int("s18_audit_shared_climates")
+sc18 <- read(d18, "standardised_contrasts.csv")
+std <- function(pr_, col, ver = "all strata of each species", wt = "area weights")
+  sc18[pair == pr_ & version == ver & weights == wt][[col]]
+sh18_t <- read(d18, "standardised_shares.csv")
+sh18 <- function(pr_, rg, ty, col = "share")
+  sh18_t[pair == pr_ & region == rg & type == ty & version == "all strata of each species" &
+           weights == "area weights"][[col]]
+bal18 <- read(d18, "balance.csv")
+bl <- function(pr_, v, col) bal18[pair == pr_ & variable == v][[col]]
+ret18 <- read(d18, "retained.csv")
+rt <- function(pr_, rg, col) ret18[pair == pr_ & region == rg][[col]]
+sens18 <- read(d18, "sensitivity.csv")[strata > 0]
+dec18 <- read(d18, "decomposition.csv")
+dc <- function(r1, r2, col) dec18[region_1 == r1 & region_2 == r2][[col]]
+gw18 <- read(d18, "genus_weighted.csv")
+gwv <- function(u, col) gw18[unit == u][[col]]
+cb <- "Cape vs Mediterranean Basin"
+ab <- "Southern Australia vs Mediterranean Basin"
+bc <- "Mediterranean Basin vs California"
+
+# --- Ant association along latitude (s15) ---
+d15 <- dir_int("s15_test_association")
+rsl <- read(d15, "richness_slopes.csv")
+rs <- function(a, col) rsl[area == a][[col]]
+smd <- read(d15, "share_models.csv")
+sm <- function(a, mo) smd[area == a & model == mo]$dev_expl
+shn <- read(d15, "share_null.csv")
+shv <- function(a, v, col) shn[permutation == 0 & area == a & variable == v][[col]]
+eug <- read(d15, "europe_genera.csv")
+aef <- read(d15, "association_effects.csv")
+
+# --- Null models and matched-only trees (s14) ---
+d14 <- dir_int("s14_test_null_models")
+gnt <- read(d14, "gradient_null_total.csv")
+omt <- read(d14, "origins_matched.csv")
+omv <- function(tr, rg, col = "origins_median") omt[tree == tr & region == rg][[col]]
+
+# --- Seasonality (s11) and drought within mixed genera (s19) ---
+d11 <- dir_int("s11_test_seasonality")
+sea <- read(d11, "seasonality_effects.csv")
+se11 <- function(ct, an, col = "estimate") sea[contrast == ct & analysis == an][[col]]
+d19 <- dir_int("s19_test_mixed_genera")
+dr19 <- read(d19, "drought_effects.csv")
+dr <- function(ct, pp, col = "estimate") dr19[contrast == ct & property == pp][[col]]
+wg19 <- read(d19, "within_genus_tests.csv")
+wg <- function(ct, pp, col) wg19[contrast == ct & property == pp][[col]]
+holm19 <- read(d19, "holm_obligacy.csv")
+hb <- function(pp, col) holm19[property == pp][[col]]
+mix19 <- read(d19, "mixed_genera_full.csv")
+carn19 <- read(d19, "carnivory.csv")
+spd19 <- read(d19, "species_drought.csv")
+
+# --- Ants (s21) ---
+d21 <- dir_int("s21_test_ant_partners")
+ar21 <- read(d21, "ant_richness_effects.csv")
+ar <- function(ct, gv, col = "estimate", pp = "log_ant_species")
+  ar21[contrast == ct & given == gv & property == pp][[col]]
+av21 <- read(d21, "partner_availability.csv")
+av <- function(g, u, col = "ant_species") av21[ant_genus == g & unit == u][[col]]
+prec21 <- read(d21, "partner_records.csv")
+pg21 <- read(d21, "partner_genera.csv")[level == "All"]
+pgn <- function(g, k) { x <- pg21[ant_genus == g & interaction_type == k]$lycaenid_species
+                        if (length(x)) x else 0L }
+obl_partner <- prec21[interaction_type %in% c("m", "p"), uniqueN(pool_key)]
+obl_cc <- prec21[interaction_type %in% c("m", "p") & ant_genus %in% c("Crematogaster", "Camponotus"),
+                 uniqueN(pool_key)]
+
+# --- History of obligacy (s09, s10) ---
+d9 <- dir_int("s09_test_history")
+ptest <- read(d9, "pagel_tests.csv")
+osum <- read(d9, "origins_summary.csv")
+os <- function(rg, col) osum[region == rg][[col]]
+d10 <- dir_int("s10_test_diversification")
+ogt <- read(d10, "origins_genus_tree.csv")
+og_med <- function(rg) median(ogt[region == rg]$N)
+gtab <- fread(file.path(d10, "genus_table.csv"), na.strings = c("", "NA"))
+og_gen <- function(rg) gtab[strategy == "Obligate" & region == rg & is.finite(stem_age), .N]
+
+d16 <- dir_int("s16_make_maps")
+d22 <- dir_int("s22_make_paper_figures")
+```
+
+**Title:** Similar climates, different interactions: lineage composition shapes the global geography of butterfly–ant associations
+
+**Running title:** Lineages, climate and butterfly–ant interactions
+
+**Draft for co-authors, `r format(Sys.Date(), "%d %B %Y")`.** Every number is computed from the analysis outputs (`code/s01`–`s22`). Main text about 5,000 words; four figures; Supporting Information follows the references.
+
+# Abstract {-}
+
+**Aim:** Lycaenid butterfly larvae interact with ants in four ways, from no association to obligate mutualism and parasitism, and these strategies are strongly structured in space. We asked whether this geography follows climate, or the lineages that each region holds.
+
+**Location:** Global.
+
+**Time period:** Present; climate change since the Last Glacial Maximum.
+
+**Major taxa studied:** Lycaenidae (Lepidoptera).
+
+**Methods:** For `r format(n_class, big.mark = ",")` classified species, we compared how well climate and lineage predicted the strategies of species, genera, subfamilies and realms left out of the fit, compared Mediterranean-climate regions within shared climate strata, and asked which associations with climate, drought, soils, fire and ants remain once region and lineage are known.
+
+**Results:** In overlapping measured climatic conditions, `r pct(std(cb, "obligate_1"))` of the classified species of the Cape and `r pct(std(cb, "obligate_2"))` of the Mediterranean Basin were obligate associates (difference `r pts(std(cb, "difference"))` percentage points, 95% interval `r pts(std(cb, "difference_low"))`–`r pts(std(cb, "difference_high"))`), for every definition of the strata, and both mutualists and parasites contributed. Lineage predicted the obligacy of held-out realms (deviance explained `r pct(po("obligate", "held-out realm", "lineage"))`); climate predicted it poorly (`r pct(po("obligate", "held-out realm", "climate"))`) and forecast obligate associates in the Neotropics, where none are recorded, within the climates of the training data. The ant genera recorded with southern obligate species were rich in species in the Mediterranean Basin and tended its facultative lycaenids. Obligacy alone had a geography crossing lineages: latitude and hemisphere predicted it in held-out subfamilies, while glacial climate change, soils, fire and ant richness added little. Given region and lineage, obligate mutualists lived in climates with longer dry seasons, and within genera, obligate species lived in drier, more seasonal climates than their facultative relatives.
+
+**Main conclusions:** The global geography of butterfly–ant interactions follows the lineages that each region holds more closely than its climate. Similar climates on different continents hold different interactions because they hold different genera, and the southern concentration of obligate associations is not accounted for by present or glacial climate, soils, fire or the availability of partner ants.
+
+**Keywords:** ant–butterfly interactions, biogeography, climate, lineage composition, Lycaenidae, Mediterranean-climate regions, mutualism, myrmecophily, parasitism, phylogenetic niche conservatism
+
+# Introduction
+
+Most lycaenid butterflies interact with ants as larvae, and these interactions range from no association, through facultative tending, to obligate mutualism and obligate parasitism of ant colonies (Pierce et al., 2002; Pierce & Dankowicz, 2022). The strategies are distributed very unevenly across the globe. Obligate associates are concentrated in southern Africa and Australia, whereas the recorded lycaenid fauna of the Americas is facultative or non-associated (Pierce et al., 2002; Fiedler, 2021).
+
+Pierce et al. (2002) noted that obligate associations are more common in the Southern Hemisphere and suggested that this is partly because highly ant-associated lineages make up more of the southern fauna. This suggestion has not been tested against its alternatives, which act at very different timescales. The first concerns present environments. Ants are less active and less abundant in cold climates, and in the Swiss Alps lycaenid species with weaker ant interactions occur in colder places (Pellissier et al., 2012). In seasonally dry, fire-prone biomes, larvae that shelter in ant nests may escape fire, desiccation and food shortage (Cottrell, 1984; Espeland et al., 2023). Old, nutrient-poor landscapes, where plants produce carbohydrates in excess and ants are abundant and dominant, have also been invoked for the Cape and Australia (Orians & Milewski, 2007; Hopper, 2009; Pierce & Dankowicz, 2022). The second concerns the Late Quaternary: regions with little climate change since the Last Glacial Maximum (LGM) may have allowed specialists that depend on partners to persist (Dynesius & Jansson, 2000; Sandel et al., 2011). The third concerns which lineages reached and persisted in each region; only a few, climatically filtered lineages of blues reached the New World, for example (Vila et al., 2011).
+
+Separating these explanations is difficult because the strategies are concentrated in few lineages, which also occupy particular climates. An association between climate and the strategies across space can therefore reflect where lineages live rather than what climates favour. We combined a global compilation of lycaenid–ant interactions with occurrence records to map the four strategies, and asked three questions. First, does climate predict the strategy of a species beyond its lineage, and does it predict the strategies of lineages and whole realms that were not used to fit the model? Second, do regions with overlapping measured climatic conditions hold the same strategies? Third, which environmental associations remain once region and lineage are known? These are tests of pattern. They show where the strategies follow climate and where they follow the lineages present, not the processes that produced either.
+
+# Methods
+
+## Strategies, occurrences and regions
+
+We used the interaction types, taxonomy and cleaned occurrence records of a companion compilation of lycaenid–ant interactions (in preparation). Each species unit was classified as non-associated, facultative, obligate mutualist or obligate parasite, and the evidence for each type was recorded: either for the species itself, or presumed by the sources from relatives or from the genus. Riodinidae were not included. Of the `r format(n_units, big.mark = ",")` species units with occurrence records (`r format(n_records, big.mark = ",")` unique cleaned coordinates), `r format(n_class, big.mark = ",")` were classified: `r n_type("n")` non-associated, `r n_type("f")` facultative, `r n_type("m")` obligate mutualist and `r n_type("p")` obligate parasite. We assigned each species to the biogeographic region holding most of its records, using the realms of RESOLVE Ecoregions 2017 (Dinerstein et al., 2017) with Africa south of 15° S and Australia south of 10° S separated, giving eight regions. Assemblages were built in ISEA hexagons of about 23,000, 70,000 and 210,000 km² (Sahr et al., 2003) and mapped in the Equal Earth projection chosen with `crstools` (Pozzi et al., 2026). Classification is uneven: `r pct(ecomp("Australia"))` of the recorded species of Australia and `r pct(ecomp("Southern Africa"))` of southern Africa are classified, against `r pct(ecomp("Neotropic"))` of the Neotropics (Fig. 1f).
+
+## Environment and ants
+
+Each species was described by the median over the 10-arc-minute pixels holding its records. Present climate came from WorldClim 2.1 (Fick & Hijmans, 2017): annual mean temperature, minimum temperature of the coldest month, precipitation seasonality (the coefficient of variation of monthly precipitation), the precipitation of the driest month and an aridity index, the ratio of precipitation to potential evapotranspiration estimated with the Hargreaves equation (Hargreaves & Samani, 1985). Because seasonality measures how uneven rainfall is, not how long the dry season lasts, we also counted the dry months of each pixel (precipitation in mm below twice the mean temperature in °C) and the longest run of consecutive dry months. Past climate came from the 800-kyr reconstruction of Krapp et al. (2021), accessed with `pastclim` (Leonardi et al., 2023): the change in temperature and precipitation since the LGM (21 ka) and the velocity of the temperature change (Sandel et al., 2011); pixels under the LGM ice took the anomaly of the nearest ice-free land. Soil pH, cation exchange capacity, nitrogen and organic carbon at 0–30 cm came from SoilGrids 2.0 (Poggio et al., 2021), soil total phosphorus at 0–10 cm from He et al. (2021), and the mean annual burned fraction of 2001–2020 from GFED5 (Chen et al., 2023). For aridity over deeper time, we took the mean log annual precipitation and the share of time with less than 500 mm per year over the last 5 Myr from PALEO-PGEM (Barreto et al., 2023), at 10-kyr steps. For ants, each species was given the median ant species richness estimated by Kass et al. (2022) over its record pixels. From the ant partners recorded for each lycaenid species in the companion compilation, we listed the ant genera recorded with obligate species and counted, in each region, the species of these genera in the filtered Global Ant Biodiversity Informatics records compiled by Kass et al. (2022) and the lycaenid species of each strategy recorded with them.
+
+## Climate and lineage out of sample
+
+We analysed three nested contrasts: ant-associated against non-associated species, obligate (mutualist or parasite) against facultative species, and parasites against mutualists. For each, binomial models related the strategy to six predictors of present and past climate (annual mean temperature, aridity, precipitation seasonality, the LGM temperature and precipitation anomalies, and the temperature velocity), to lineage (random intercepts of subfamily and genus; `mgcv`, Wood, 2011), or to both. Because in-sample deviance explained measures description rather than generality, we judged the models by their predictions for species left out of the fit. We held out species (ten folds; their congeners remained in the training data), whole genera, whole subfamilies, and whole realms: each of the eight regions was predicted from the other seven. Against a baseline that predicts the share of the outcome in the training data, we compared climate, latitude interacting with hemisphere, lineage, and lineage with climate. For each held-out unit we report the predicted and observed share of the outcome, the area under the ROC curve (AUC, discrimination within the unit) and the deviance explained relative to the baseline, with 95% intervals from resampling genera within the unit. A held-out species was climatically novel when its Mahalanobis distance from the training species in the six climate predictors exceeded the 99th percentile of the training species' own distances. We repeated the species and genus folds with species-specific evidence only.
+
+## Comparisons within overlapping climates
+
+We compared the five Mediterranean-climate regions, defined as Köppen–Geiger class Cs (Beck et al., 2023): the Cape, southern Australia, the Mediterranean Basin, California and central Chile. Because their climates are similar but not identical, we compared two regions only within the climate strata that both occupy, a coarsened exact matching (Iacus et al., 2012): strata of 2 °C annual mean temperature, 3 °C minimum temperature, 0.15 log10 aridity index and 15% precipitation seasonality, each occupied by at least five pixels of each region. Restricting two regions to common climatic support does not give them the same distribution over it. We therefore estimated the share of each strategy within each shared stratum and averaged it over common stratum weights, the mean of the two regions' area shares (or equal weights), using the strata in which both regions had at least three classified species. A species recorded in several strata counted in each; in a second version it counted only in the shared stratum holding most of its records. Intervals came from resampling genera (1,000 replicates), which keeps congeners and species of several strata together, and are shown separately from the bounds set by unclassified species (all non-obligate or all obligate). We report the climatic balance of the regions before and after weighting as standardised mean differences, the share of each region's area and species retained, and the contrast for strata half as wide to twice as wide and for minimum occupancies of one to ten pixels. The species-weighted obligate share S of a region equals the genus-weighted share G (each genus weighted equally) plus a richness term S − G, which is positive when obligate genera are richer in species than other genera; we split regional contrasts into these two parts. Finally, we took the strata of the Cape and southern Australia and compared the species recorded in them in each biogeographic region outside the five Mediterranean-climate regions.
+
+## Composition within regions
+
+Within each region, we described the share of each strategy along temperature, aridity and the LGM anomaly in hexagons of about 210,000 km². To separate the turnover of lineages from change within lineages, each species was given the strategy composition of its congeners, itself excluded, and the mean over a hexagon's species gave the composition expected from the lineages present. We compared the part of each gradient that this expectation did not reproduce with 199 permutations of strategies among the species of each genus.
+
+## What remains once region and lineage are known
+
+For obligacy, we predicted each held-out subfamily with logistic regressions on geography (region, or latitude interacting with hemisphere), on geography with one environmental property added, and on each property alone. We estimated the effect of each property given region (a fixed effect) and lineage (random intercepts of subfamily and genus), for obligacy, for obligate mutualism against facultative species and for parasitism against mutualism, and adjusted the p-values for obligacy by the Holm method across all `r nrow(holm19)` properties. Within the genera containing both outcomes of a contrast, we estimated the within-genus effect of each seasonality and drought property with a logistic regression with genus as a fixed effect, and compared it with 9,999 permutations of the property among the species of each genus.
+
+## Origins of obligacy
+
+To describe how the obligate faunas arose, we counted the origins of obligacy in 100 stochastic character maps (Huelsenbeck et al., 2003; Bollback, 2006; `phytools`, Revell, 2012) on the dated tree of Yumnam & Kodandaramaiah (2025) and the tree of Schär et al. (2018), pruned to the species matched to their tips, on the Yumnam tree with missing species grafted to their genus, and on a tree of genera, which counts only origins between genera. Each origin was assigned to the region holding most of the obligate species descended from it, and we tested whether gains and losses of obligacy depend on hemisphere (Pagel, 1994). Because the counts depend on the tree and on how unsampled species are placed, we treat them as exploratory.
+
+# Results
+
+## The strategies are structured in space and rest on few genera
+
+```{r fig1, fig.cap = "Global distribution of the ant-interaction strategies of lycaenid butterflies, in ISEA hexagons of about 210,000 km² (Equal Earth projection). (a–d) Proportions of classified species that were non-associated, facultative, obligate mutualists and obligate parasites, in hexagons with at least ten classified species. Each panel has its own square-root colour scale, spanning the 1st to 99th percentiles of its hexagons, so colours are not comparable between panels; hexagons beyond this range take the end colour (≤ or ≥ in the legend). (e) Classified species per hexagon (logarithmic scale). (f) Share of the recorded species of each hexagon that is classified, in hexagons with at least ten recorded species. Grey land has no estimate."}
+fig(d16, "plot_world_strategies.png")
+```
+
+Obligate mutualists were concentrated in southern Africa and Australia, obligate parasites in southern Africa, and non-associated species in the Holarctic (Fig. 1). The regions differed less in how many of their species were associated with ants, from `r pct(min(assoc_share$share))` in the `r assoc_share$region[which.min(assoc_share$share)]` to `r pct(max(assoc_share$share))` in `r south(assoc_share$region[which.max(assoc_share$share)])`, than in how they were associated (Fig. 3a). Southern Africa held `r lin_n("Southern Africa", "p")` obligate parasites in `r lin_n("Southern Africa", "p", "genera")` genera and `r lin_n("Southern Africa", "m")` obligate mutualists in `r lin_n("Southern Africa", "m", "genera")` genera, and Australia `r lin_n("Australia", "m")` obligate mutualists in `r lin_n("Australia", "m", "genera")` genera. Obligate associates belonged to `r obligate_genera_total` genera worldwide, and none was recorded among the `r lin_n("Nearctic", "n") + lin_n("Nearctic", "f") + lin_n("Neotropic", "n") + lin_n("Neotropic", "f")` classified species of the Americas.
+
+## Similar climates hold different interactions
+
+The climates of the Cape and southern Australia recur on every continent, but they are rich in obligate associates only in southern Africa and Australia (Fig. 2a, d). Among the classified species recorded in these climates outside the five Mediterranean-climate regions, obligate associates made up `r pct(bmv("Cape and S. Australia", "Southern Africa"))` in southern Africa and `r pct(bmv("Cape and S. Australia", "Australia"))` in Australia, against `r pct(bmv("Cape and S. Australia", "Tropical Africa"))` in tropical Africa, `r pct(bmv("Cape and S. Australia", "Palearctic"))` in the Palaearctic and none in the Americas.
+
+```{r fig2, out.width = if (knitr::is_html_output()) "100%" else "5.2in", fig.cap = "Similar climates, different interactions. (a) Hexagons of about 70,000 km² with land in the climate strata occupied by the Mediterranean-climate parts of the Cape or southern Australia, coloured by the share of obligate associates among the classified species recorded in these climates in each region; labels give the share and the classified species. (b) Share of each strategy among the classified species of two Mediterranean-climate regions within the climate strata they share, standardised to a common distribution over the strata (area weights; filled: first region of the pair; open: second), with 95% intervals from resampling genera. (c) Difference in the standardised obligate share between the regions of each pair, for strata half as wide to twice as wide as the main strata and for regions occupying a stratum with at least one, five or ten pixels; large points: main analysis; 95% intervals from resampling genera. (d) Obligate share of the classified species recorded in the climates of the Cape and southern Australia in each biogeographic region, outside the five Mediterranean-climate regions; coloured: 95% intervals from resampling genera; grey bars: bounds if all unclassified species were non-obligate or all obligate; labels: classified species."}
+fig(d22, "figure_2_shared_climates.png")
+```
+
+The Mediterranean-climate regions showed the same split within shared climates (Fig. 2b). In the `r std(cb, "strata")` climate strata shared by the Cape and the Mediterranean Basin, standardised to the same distribution over the strata, `r pct(std(cb, "obligate_1"))` of the Cape's classified species and `r pct(std(cb, "obligate_2"))` of the Basin's were obligate associates, a difference of `r pts(std(cb, "difference"))` percentage points (95% interval `r pts(std(cb, "difference_low"))`–`r pts(std(cb, "difference_high"))`). Both obligate strategies contributed: obligate mutualists made up `r pct(sh18(cb, "Cape", "m"))` of the Cape's species and `r pct(sh18(cb, "Mediterranean Basin", "m"))` of the Basin's, and obligate parasites `r pct(sh18(cb, "Cape", "p"))` and `r pct(sh18(cb, "Mediterranean Basin", "p"))`. The difference was `r pts(std(cb, "difference", wt = "equal weights"))` points with equal stratum weights and `r pts(std(cb, "difference", ver = "main stratum of each species"))` points when each species counted only in its main stratum, and lay between `r pts(min(sens18[pair == cb]$difference))` and `r pts(max(sens18[pair == cb]$difference))` points for every width of the strata and minimum occupancy, with lower 95% bounds of at least `r pts(min(sens18[pair == cb]$difference_low))` points (Fig. 2c). Southern Australia differed from the Basin by `r pts(std(ab, "difference"))` points (`r pts(std(ab, "difference_low"))`–`r pts(std(ab, "difference_high"))`), a smaller and less certain difference, carried by obligate mutualists (`r pct(sh18(ab, "Southern Australia", "m"))` against `r pct(sh18(ab, "Mediterranean Basin", "m"))`). California shared no climate stratum with the Cape or southern Australia; in the `r std(bc, "strata")` strata it shared with the Basin, neither region held more than a few obligate species (`r pct(std(bc, "obligate_1"))` of the Basin's, none of California's).
+
+Matching balanced the climates of the regions compared, but it restricted the comparison to a small part of the Basin. Between the Cape and the Basin, the standardised mean differences of annual mean temperature, aridity and seasonality fell from up to `r num(max(abs(bal18[pair == cb & variable != "bio06"]$smd_before)))` to at most `r num(max(abs(bal18[pair == cb & variable != "bio06"]$smd_after)))`, while minimum temperature remained higher in the Cape (`r num(bl(cb, "bio06", "smd_after"))`, from `r num(bl(cb, "bio06", "smd_before"))`). The shared strata held `r pct(rt(cb, "Cape", "share_pixels"))` of the Cape's Mediterranean-climate pixels and `r pct(rt(cb, "Cape", "share_species"))` of its classified species, but `r pct(rt(cb, "Mediterranean Basin", "share_pixels"))` of the Basin's pixels and `r pct(rt(cb, "Mediterranean Basin", "share_species"))` of its species (Appendix S4).
+
+The genera behind the contrasts differed between the two southern regions. Weighting each genus equally, the Cape's excess of obligate species over the Basin fell from `r pts(dc("Cape", "Mediterranean Basin", "S_difference"))` to `r pts(dc("Cape", "Mediterranean Basin", "G_difference"))` points: it came mostly from obligate genera that are rich in species, and the three largest obligate genera held `r pct(gwv("Cape", "top3_obligate_share"))` of the Cape's obligate species. Southern Australia's excess came from many obligate genera, `r pct(dc("Southern Australia", "Mediterranean Basin", "G_share_of_S"))` of it remaining with genus weights. None of the obligate species of the Cape or southern Australia belonged to a genus that also occurred in the Basin or California; the genera they shared, such as *Leptotes*, *Lampides*, *Zizeeria* and *Lycaena*, were represented only by facultative or non-associated species.
+
+## Lineage predicts strategies out of sample; climate does not transfer
+
+In sample, lineage described `r pct(ps("associated", "lineage"))` of the deviance in ant association, `r pct(ps("obligate", "lineage"))` in obligacy and `r pct(ps("parasite", "lineage"))` in parasitism against mutualism, and climate `r pct(ps("associated", "climate"))`, `r pct(ps("obligate", "climate"))` and `r pct(ps("parasite", "climate"))`, almost all of it shared with lineage; only `r ps("obligate", "mixed_genera")` genera contained both obligate and facultative species. Out of sample, knowing a species' genus still predicted its strategy (Fig. 3c): for held-out species, lineage explained `r pct(oos("associated", "all", "species held out", "lineage"))`, `r pct(oos("obligate", "all", "species held out", "lineage"))` and `r pct(oos("parasite", "all", "species held out", "lineage"))` of the deviance in the three contrasts, and climate at most `r pct(max(oos_t[scheme == "species held out" & model == "climate" & evidence == "all"]$d2))`. With species-specific evidence only, lineage explained `r pct(oos("associated", "specific", "species held out", "lineage"))`, `r pct(oos("obligate", "specific", "species held out", "lineage"))` and `r pct(oos("parasite", "specific", "species held out", "lineage"))`, so the types presumed from relatives (`r pct(epres("p"))` of the parasites and `r pct(epres("f"))` of the facultative species) inflated the lineage signal only slightly. For held-out genera, the subfamily predicted ant association (`r pct(oos("associated", "all", "genera held out", "lineage"))`) but not obligacy (`r pct(oos("obligate", "all", "genera held out", "lineage"))`), because obligate and facultative genera are mixed within subfamilies.
+
+```{r fig3, out.width = if (knitr::is_html_output()) "100%" else "5.6in", fig.cap = "Lineage and climate as predictors of the strategies. (a) The classified species of each region by strategy; numbers: genera behind each strategy; n: classified species. (b) Obligate share among the associated species of each realm (black bar) and as predicted by models fitted to the other seven realms (points, with 95% intervals from resampling genera within the realm). (c) Deviance explained by lineage (random intercepts of subfamily and genus) and climate (six predictors), in sample, for species held out (their congeners stay in the training data) and for whole genera held out (only the subfamily is known); medians of three repeats of ten folds; filled: all classified species; open: species-specific evidence only. (d) Deviance explained for all species of held-out realms and held-out subfamilies, relative to the share in the training data, with 95% intervals from resampling genera; lineage models are omitted for held-out subfamilies, whose lineages are unknown to the model by design."}
+fig(d22, "figure_3_lineage_climate.png")
+```
+
+The same held for whole realms (Fig. 3b, d). When each realm was predicted from the other seven, lineage explained `r pct(po("obligate", "held-out realm", "lineage"))` of the deviance in obligacy (95% interval `r pct(po("obligate", "held-out realm", "lineage", "d2_low"))`–`r pct(po("obligate", "held-out realm", "lineage", "d2_high"))`; AUC within realms `r num(po("obligate", "held-out realm", "lineage", "auc"))`), latitude and hemisphere `r pct(po("obligate", "held-out realm", "latitude x hemisphere"))` (AUC `r num(po("obligate", "held-out realm", "latitude x hemisphere", "auc"))`), and climate `r pct(po("obligate", "held-out realm", "climate"))` (AUC `r num(po("obligate", "held-out realm", "climate", "auc"))`). Climate forecast that `r pct(me("obligate", "held-out realm", "Neotropic", "climate"))` of the associated species of the Neotropics and `r pct(me("obligate", "held-out realm", "Palearctic", "climate"))` of the Palaearctic would be obligate, against `r pct(me("obligate", "held-out realm", "Neotropic", "climate", "observed"))` and `r pct(me("obligate", "held-out realm", "Palearctic", "climate", "observed"), 0)` observed, and `r pct(me("obligate", "held-out realm", "Southern Africa", "climate"))` of those of southern Africa, against `r pct(me("obligate", "held-out realm", "Southern Africa", "climate", "observed"))`. These failures were not extrapolations: at most `r pct(novel_max)` of the species of any held-out realm lay outside the climates of the training species. Lineage failed where obligate genera are endemic, in Australia (`r pct(me("obligate", "held-out realm", "Australia", "lineage"))` predicted, `r pct(me("obligate", "held-out realm", "Australia", "lineage", "observed"))` observed), where latitude and hemisphere did better (`r pct(me("obligate", "held-out realm", "Australia", "latitude x hemisphere"))`). For ant association and parasitism, climate and geography explained nothing in held-out realms (at most `r pct(max(po20[contrast != "obligate" & scheme == "held-out realm" & model %in% c("climate", "latitude x hemisphere")]$d2))`), whereas lineage explained `r pct(po("associated", "held-out realm", "lineage"))` and `r pct(po("parasite", "held-out realm", "lineage"))`. For held-out subfamilies, whose lineages the models cannot know, obligacy was the only contrast that climate (`r pct(po("obligate", "held-out subfamily", "climate"))`) or latitude and hemisphere (`r pct(po("obligate", "held-out subfamily", "latitude x hemisphere"))`) predicted.
+
+## Within regions, gradients in composition are mostly lineage turnover
+
+Within regions, composition changed along climate gradients (Appendix S3): non-associated species became more frequent towards cold and wet climates in the Palaearctic and Nearctic, and obligate mutualists towards dry climates in southern Africa. Of the `r nrow(gb)` gradients steeper than 0.3 log odds per SD, the composition expected from the genera present had the same sign in `r pct(mean(sign(gb$expected_slope) == sign(gb$observed_slope)))` and reproduced a median `r pct(median(gb$expected_slope / gb$observed_slope))` of the observed slope. Against permutations of strategies within genera, the part not reproduced by the genera was larger than chance on average (mean z = `r num(gnt$mean_z_observed)`, `r pval(gnt$p_one_sided)`), but exceeded the permutation range in only `r gnt$slopes_beyond_null` gradients. In Europe, the share of non-associated species rose northwards because facultative species became fewer, not because non-associated species became more numerous: per 10° of latitude, facultative richness per hexagon fell by `r pct(-rs("Europe", "facultative_change_per_10deg"))`, while non-associated richness did not change. Facultative genera centred in southern Europe, such as *Polyommatus*, *Lysandra* and *Leptotes*, thinned northwards, and the share expected from the genera present rose almost as steeply as the observed share (`r num(shv("Europe", "latitude_z", "expected_slope"))` against `r num(shv("Europe", "latitude_z", "observed_slope"))` log odds per SD of latitude). The pattern was European: the non-associated share hardly changed with latitude in the Nearctic (`r pct(sm("Nearctic", "latitude"), 1)` of the deviance; Appendix S3).
+
+## What remains: a southern geography of obligacy
+
+Obligacy was the one contrast with a geography that crossed lineages. Latitude and hemisphere predicted the obligacy of held-out subfamilies (deviance explained `r num(sc("latitude x hemisphere", "subfamily"))`; Fig. 4a), better than the LGM temperature anomaly, which described the same concentration of obligate associates at southern mid-latitudes because the climate changed little there (alone, `r num(sc("anomaly", "subfamily"))`). Added to latitude and hemisphere, the anomaly did not improve the prediction (`r num(sc("latitude x hemisphere + anomaly", "subfamily"))`), and no soil property (including phosphorus), burned fraction, aridity or 5-Myr precipitation raised it by more than `r num(100 * max(dgain[scheme == "subfamily"]$gain), 1)` percentage points. Given region and lineage, the anomaly had no detectable effect (`r num(se("All associated species"))` log odds per SD, `r pval(se("All associated species", "p"))`), also in each hemisphere, without southern Africa, within genera and with species-specific evidence only (Appendix S5).
+
+```{r fig4, out.width = if (knitr::is_html_output()) "100%" else "5.6in", fig.cap = "What remains once region and lineage are known. (a) Deviance explained when the obligacy of the species of each subfamily is predicted by a logistic regression fitted to the other subfamilies: geography (latitude by hemisphere, dashed line; region), geography with one property added, and each property alone. (b) Effect of each property on obligacy given region (fixed effect) and lineage (random intercepts of subfamily and genus), in log odds per SD with 95% intervals; labels: p-values adjusted by the Holm method over all properties; filled: adjusted p < 0.05. (c) Median precipitation seasonality of the facultative (blue) and obligate (orange) species of every genus that has both, joined by a line; small points: species; genera ordered by the difference; in brackets: obligate and facultative species. (d) The ant genera recorded with the most obligate lycaenid species, in the five Mediterranean-climate regions: the species of each genus recorded there in the Global Ant Biodiversity Informatics database (shading), and the lycaenid species of each strategy recorded with the genus there (symbols)."}
+fig(d22, "figure_4_remaining_signal.png")
+```
+
+Given region and lineage, obligate associates lived in drier climates than facultative species, an association carried by obligate mutualists (Fig. 4b; Appendix S5). The number of dry months had the largest effect (`r num(dr("obligate", "dry_months"))` log odds per SD, `r pval(dr("obligate", "dry_months", "p"))`; for obligate mutualists against facultative species `r num(dr("mutualist", "dry_months"))`), followed by the precipitation of the driest month (`r num(dr("obligate", "bio14"))`) and precipitation seasonality (`r num(dr("obligate", "bio15"))`). The number of dry months and the longest dry spell were almost the same measure (r = `r num(cor(spd19$dry_months, spd19$dry_run, use = "complete.obs"))`), and both were correlated with seasonality (r = `r num(cor(spd19$bio15, spd19$dry_months, use = "complete.obs"))`). After Holm adjustment over the `r nrow(holm19)` properties tested, only the number of dry months remained below 0.05 (adjusted `r pval(hb("dry_months", "p_holm"))`); seasonality did not (adjusted `r pval(hb("bio15", "p_holm"))`). Parasites did not differ from mutualists in any of these properties (all p ≥ `r num(min(dr19[contrast == "parasite"]$p))`).
+
+Within the `r nrow(mix19)` genera with both obligate and facultative species, the obligate species lived in climates with longer dry seasons and more seasonal rainfall than their facultative congeners (Fig. 4c). The within-genus slope was `r num(wg("obligate", "dry_months", "slope"))` log odds per SD for dry months and `r num(wg("obligate", "bio15", "slope"))` for seasonality, beyond the range of 9,999 permutations among the species of each genus (two-sided `r pval(wg("obligate", "dry_months", "p_two_sided"))` and `r pval(wg("obligate", "bio15", "p_two_sided"))`), and the same held for obligate mutualists alone but not for parasites against mutualists (`r pval(wg("parasite", "dry_months", "p_two_sided"))`). The pattern came from the genera with several obligate species: in `r mix19[obligate >= 2 & seasonality_difference > 0, .N]` of these `r mix19[obligate >= 2, .N]` genera, mostly Australian and Indomalayan Theclinae such as *Hypochrysops*, *Arhopala* and *Ogyris*, the obligate species had the more seasonal climates, whereas the `r mix19[obligate == 1, .N]` genera with a single obligate species were split (`r mix19[obligate == 1 & seasonality_difference > 0, .N]` higher, `r mix19[obligate == 1 & seasonality_difference < 0, .N]` lower). Larval carnivory separated the two obligate strategies: `r carn19[strategy == "p"]$carnivorous` of the `r carn19[strategy == "p"]$carnivory_recorded` parasites with a recorded diet feed on ant brood or other insects in ant nests, against `r carn19[strategy == "m"]$carnivorous` of `r carn19[strategy == "m"]$carnivory_recorded` mutualists, so the association with dry seasons concerns larvae that are tended by ants rather than those that prey on them.
+
+Ant richness did not account for the geography of obligacy. Given region and lineage, the estimated ant species richness of a species' records had no detectable effect on obligacy (`r num(ar("obligate", "region and lineage"))` log odds per SD, `r pval(ar("obligate", "region and lineage", "p"))`) or parasitism (`r pval(ar("parasite", "region and lineage", "p"))`), and a weak positive association with ant association (`r num(ar("associated", "lineage"))`, `r pval(ar("associated", "lineage", "p"))` given lineage). Of the `r obl_partner` obligate species with recorded partners, `r obl_cc` were recorded with *Crematogaster* or *Camponotus*. Both genera were rich in species in every Mediterranean-climate region (Fig. 4d): GABI recorded `r av("Crematogaster", "Mediterranean Basin")` *Crematogaster* and `r av("Camponotus", "Mediterranean Basin")` *Camponotus* species in the Mediterranean-climate Basin, against `r av("Crematogaster", "Cape")` and `r av("Camponotus", "Cape")` in the Cape, and `r av("Crematogaster", "Mediterranean Basin", "f")` and `r av("Camponotus", "Mediterranean Basin", "f")` facultative lycaenid species of the Basin were recorded with them. The genera specific to southern obligate partners were mostly regional, such as *Iridomyrmex* and *Anonychomyrma* in Australia and *Anoplolepis* in southern Africa.
+
+## Origins of obligacy
+
+Obligacy arose repeatedly, but the number of origins in each region depended on the tree (Appendix S6). On the tree of genera, which counts only origins between genera, obligacy arose `r og_med("Southern Africa")` times in southern Africa, leading to `r og_gen("Southern Africa")` obligate genera on the tree, and `r og_med("Australia")` times in Australia (`r og_gen("Australia")` genera). The species trees added origins within genera, mainly in Australia (`r omv("yumnam_2025", "Australia")` on the Yumnam tree pruned to its matched species) and the Indomalayan region. Whether gains and losses of obligacy depended on hemisphere differed between trees (`r pval(ptest[tree == "yumnam_2025"]$p)` on the dated Yumnam tree, `r pval(ptest[tree == "schar_2018"]$p)` on the Schär tree).
+
+# Discussion
+
+Across the globe, the strategies of lycaenid butterflies followed their lineages much more closely than their climates. Knowing a species' genus predicted its strategy for held-out species and for whole held-out realms, whereas climate forecast obligate associates where none are recorded; regions with overlapping measured climatic conditions held very different strategies; and climate gradients within regions arose mostly from the turnover of genera. These are observations about pattern: they show that the geography of the strategies is better described by the composition of regional lineages than by climate, not why each region holds the lineages it does.
+
+**What is new.** Pierce et al. (2002) attributed part of the southern excess of obligate associations to the composition of southern faunas. Our results test this suggestion against climate directly, with occurrence-based geography across `r format(n_class, big.mark = ",")` species. Within the climate strata that the Cape shares with the Mediterranean Basin, standardised to a common distribution over them, `r pct(std(cb, "obligate_1"))` of the Cape's species but `r pct(std(cb, "obligate_2"))` of the Basin's are obligate associates, both mutualists and parasites, and none of the southern obligate species belongs to a genus present in the Basin or California. The difference therefore lies in which lineages each region holds, not in how the same lineages behave under the same climate. The same split appears in these climates far outside the Mediterranean-climate regions, and models of climate fitted elsewhere forecast obligate associates in the Neotropics within the climates of the training data. The two southern regions reach their obligate richness differently: the Cape through a few obligate genera rich in species, among them *Chrysoritis*, *Thestor* and *Lepidochrysops*, and southern Australia through many obligate genera with few species each. The African obligate fauna is dominated by *Lepidochrysops* with *Camponotus* ants and the Aphnaeinae with *Crematogaster* (Fiedler, 2021), and *Lepidochrysops* radiated during the Miocene aridification of Africa (Espeland et al., 2023).
+
+**The Americas.** No obligate lycaenid is recorded in the Americas, although the climates of the obligate-rich south recur there. Only a few blue lineages reached the New World, through a Beringian gateway that filtered them by climate (Vila et al., 2011), and none of them is obligate. In the Neotropics, much of the myrmecophily of caterpillars belongs to the sister family Riodinidae, of which more than 90% of the species are Neotropical (Espeland et al., 2015) and about a fifth are known or inferred to associate with ants (Pierce & Dankowicz, 2022). Fiedler (2021) also points out that Neotropical lycaenid life histories are poorly documented, and that Neotropical ant assemblages are dominated by leafcutter and army ants, which do not tend trophobionts. The absence of obligate lycaenids from the Americas thus concerns the lineages of one family; with only `r pct(ecomp("Neotropic"))` of its recorded lycaenids classified, the Neotropical fauna is also the least known.
+
+**Ants.** The ant genera most often recorded with obligate species, *Crematogaster* and *Camponotus*, are rich in species in the Mediterranean Basin and California and are recorded there with facultative lycaenids. The absence of suitable partner genera therefore does not account for the scarcity of obligate associates in the northern Mediterranean-climate regions, and neither did the richness of ants. Presence of a genus is not compatibility, however. Obligate associations involve dominant ants with large, long-lived colonies more often than facultative ones (Fiedler, 2021), and species within *Crematogaster* and *Camponotus* differ widely in colony size, nesting and dominance. Whether the partner species of the north offer such colonies is the natural next test, and requires data on the colony ecology of the ants recorded with lycaenids.
+
+**The southern geography of obligacy.** Obligacy was the one strategy predicted in lineages the model had not seen, and the signal was geographic: obligate associates, in several subfamilies, are concentrated at southern mid-latitudes. The small glacial climate change of the southern continents described this concentration only because it is small there; once region and lineage were known, it added nothing. Glacial stability (Dynesius & Jansson, 2000; Sandel et al., 2011) therefore cannot be separated from whatever else distinguishes the southern continents, and soils, fire and ant richness did not describe the concentration better than geography either. Old, infertile, climatically buffered landscapes, where carbohydrate-rich vegetation supports abundant, dominant ants (Orians & Milewski, 2007; Hopper, 2009), remain a plausible setting for southern obligate lineages, and the convergence of the Cape and Australia in seed dispersal by ants (Lengyel et al., 2010) suggests that such settings affect other ant interactions too. Our data describe where obligate lineages are, not how long they have been there: the origins of obligacy we counted depend on the tree, and rates of diversification estimated from extant species alone cannot distinguish speciation from extinction (Rabosky & Benson, 2021).
+
+**Dry seasons among close relatives.** Once region and lineage were known, obligate mutualism went with longer dry seasons, and within the genera where obligate species have facultative relatives, the obligate species lived in drier, more seasonal climates. This association rests on a few genera, mainly Australian and Indomalayan Theclinae, and only the number of dry months remained clear after correction for the properties tested, so we treat it as provisional. It agrees with the idea that larvae protected by ants, or sheltering in their nests, survive dry seasons better (Cottrell, 1984; Espeland et al., 2023). That idea was proposed mainly for parasites, which develop inside ant nests, yet parasites showed no such association here. The data do not record which mutualist larvae shelter in nests and which are tended on their host plants; that distinction, and the timing of larval development relative to the dry season, would test the association directly.
+
+**Conclusions.** The global geography of butterfly–ant interactions is, above all, a geography of lineages. Where similar climates recur on different continents, the strategies follow the genera each region holds rather than the climate, and climate gradients within regions arise mostly from the turnover of genera. The southern concentration of obligate associations is not accounted for by present or glacial climate, soils, fire or the presence of partner ant genera, and longer dry seasons go with obligate mutualism mainly among close relatives. The colony ecology of partner ants and the history of the southern lineages now offer the most direct tests of why some regions hold obligate associations and others with similar climates do not.
+
+# Data availability statement {-}
+
+The interaction data, cleaned occurrence records, environmental layers and the R code of all analyses will be archived in a public repository (Zenodo) on acceptance; an anonymous link will be provided for review.
+
+# References {-}
+
+Barreto, E., Holden, P. B., Edwards, N. R., & Rangel, T. F. (2023). PALEO-PGEM-Series: a spatial time series of the global climate over the last 5 million years (Plio-Pleistocene). *Global Ecology and Biogeography*, 32, 1034–1045. https://doi.org/10.1111/geb.13683
+
+Beck, H. E., McVicar, T. R., Vergopolan, N., Berg, A., Lutsko, N. J., Dufour, A., Zeng, Z., Jiang, X., van Dijk, A. I. J. M., & Miralles, D. G. (2023). High-resolution (1 km) Köppen–Geiger maps for 1901–2099 based on constrained CMIP6 projections. *Scientific Data*, 10, 724. https://doi.org/10.1038/s41597-023-02549-6
+
+Beyer, R. M., Krapp, M., & Manica, A. (2020). High-resolution terrestrial climate, bioclimate and vegetation for the last 120,000 years. *Scientific Data*, 7, 236. https://doi.org/10.1038/s41597-020-0552-1
+
+Bollback, J. P. (2006). SIMMAP: Stochastic character mapping of discrete traits on phylogenies. *BMC Bioinformatics*, 7, 88. https://doi.org/10.1186/1471-2105-7-88
+
+Chen, Y., Hall, J., van Wees, D., Andela, N., Hantson, S., Giglio, L., van der Werf, G. R., Morton, D. C., & Randerson, J. T. (2023). Multi-decadal trends and variability in burned area from the fifth version of the Global Fire Emissions Database (GFED5). *Earth System Science Data*, 15, 5227–5259. https://doi.org/10.5194/essd-15-5227-2023
+
+Cottrell, C. B. (1984). Aphytophagy in butterflies: its relationship to myrmecophily. *Zoological Journal of the Linnean Society*, 80, 1–57. https://doi.org/10.1111/j.1096-3642.1984.tb02318.x
+
+Dinerstein, E., Olson, D., Joshi, A., Vynne, C., Burgess, N. D., Wikramanayake, E., Hahn, N., et al. (2017). An ecoregion-based approach to protecting half the terrestrial realm. *BioScience*, 67, 534–545. https://doi.org/10.1093/biosci/bix014
+
+Dynesius, M., & Jansson, R. (2000). Evolutionary consequences of changes in species' geographical distributions driven by Milankovitch climate oscillations. *Proceedings of the National Academy of Sciences of the USA*, 97, 9115–9120. https://doi.org/10.1073/pnas.97.16.9115
+
+Espeland, M., Chazot, N., Condamine, F. L., Lemmon, A. R., Lemmon, E. M., Pringle, E., Heath, A., Collins, S., Tiren, W., Mutiso, M., et al., & Pierce, N. E. (2023). Rapid radiation of ant parasitic butterflies during the Miocene aridification of Africa. *Ecology and Evolution*, 13, e10046. https://doi.org/10.1002/ece3.10046
+
+Espeland, M., Hall, J. P. W., DeVries, P. J., Lees, D. C., Cornwall, M., Hsu, Y.-F., Wu, L.-W., Campbell, D. L., Talavera, G., Vila, R., Salzman, S., Ruehr, S., Lohman, D. J., & Pierce, N. E. (2015). Ancient Neotropical origin and recent recolonisation: phylogeny, biogeography and diversification of the Riodinidae (Lepidoptera: Papilionoidea). *Molecular Phylogenetics and Evolution*, 93, 296–306. https://doi.org/10.1016/j.ympev.2015.08.006
+
+Fick, S. E., & Hijmans, R. J. (2017). WorldClim 2: new 1-km spatial resolution climate surfaces for global land areas. *International Journal of Climatology*, 37, 4302–4315. https://doi.org/10.1002/joc.5086
+
+Fiedler, K. (2021). The ant associates of Lycaenidae butterfly caterpillars – revisited. *Nota Lepidopterologica*, 44, 159–174. https://doi.org/10.3897/nl.44.68993
+
+Hargreaves, G. H., & Samani, Z. A. (1985). Reference crop evapotranspiration from temperature. *Applied Engineering in Agriculture*, 1, 96–99. https://doi.org/10.13031/2013.26773
+
+He, X., Augusto, L., Goll, D. S., Ringeval, B., Wang, Y., Helfenstein, J., Huang, Y., Yu, K., Wang, Z., Yang, Y., & Hou, E. (2021). Global patterns and drivers of soil total phosphorus concentration. *Earth System Science Data*, 13, 5831–5846. https://doi.org/10.5194/essd-13-5831-2021
+
+Hopper, S. D. (2009). OCBIL theory: towards an integrated understanding of the evolution, ecology and conservation of biodiversity on old, climatically buffered, infertile landscapes. *Plant and Soil*, 322, 49–86. https://doi.org/10.1007/s11104-009-0068-0
+
+Huelsenbeck, J. P., Nielsen, R., & Bollback, J. P. (2003). Stochastic mapping of morphological characters. *Systematic Biology*, 52, 131–158. https://doi.org/10.1080/10635150390192780
+
+Iacus, S. M., King, G., & Porro, G. (2012). Causal inference without balance checking: coarsened exact matching. *Political Analysis*, 20, 1–24. https://doi.org/10.1093/pan/mpr013
+
+Ives, A. R., & Garland, T., Jr. (2010). Phylogenetic logistic regression for binary dependent variables. *Systematic Biology*, 59, 9–26. https://doi.org/10.1093/sysbio/syp074
+
+Kass, J. M., Guénard, B., Dudley, K. L., Jenkins, C. N., Azuma, F., Fisher, B. L., Parr, C. L., Gibb, H., et al., & Economo, E. P. (2022). The global distribution of known and undiscovered ant biodiversity. *Science Advances*, 8, eabp9908. https://doi.org/10.1126/sciadv.abp9908
+
+Krapp, M., Beyer, R. M., Edmundson, S. L., Valdes, P. J., & Manica, A. (2021). A statistics-based reconstruction of high-resolution global terrestrial climate for the last 800,000 years. *Scientific Data*, 8, 228. https://doi.org/10.1038/s41597-021-01009-3
+
+Lengyel, S., Gove, A. D., Latimer, A. M., Majer, J. D., & Dunn, R. R. (2010). Convergent evolution of seed dispersal by ants, and phylogeny and biogeography in flowering plants: a global survey. *Perspectives in Plant Ecology, Evolution and Systematics*, 12, 43–55. https://doi.org/10.1016/j.ppees.2009.08.001
+
+Leonardi, M., Hallett, E. Y., Beyer, R., Krapp, M., & Manica, A. (2023). pastclim 1.2: an R package to easily access and use paleoclimatic reconstructions. *Ecography*, 2023, e06481. https://doi.org/10.1111/ecog.06481
+
+Orians, G. H., & Milewski, A. V. (2007). Ecology of Australia: the effects of nutrient-poor soils and intense fires. *Biological Reviews*, 82, 393–423. https://doi.org/10.1111/j.1469-185X.2007.00017.x
+
+Pagel, M. (1994). Detecting correlated evolution on phylogenies: a general method for the comparative analysis of discrete characters. *Proceedings of the Royal Society B*, 255, 37–45. https://doi.org/10.1098/rspb.1994.0006
+
+Pellissier, L., Litsios, G., Fiedler, K., Pottier, J., Dubuis, A., Pradervand, J.-N., Salamin, N., & Guisan, A. (2012). Loss of interactions with ants under cold climate in a regional myrmecophilous butterfly fauna. *Journal of Biogeography*, 39, 1782–1790. https://doi.org/10.1111/j.1365-2699.2012.02743.x
+
+Pierce, N. E., Braby, M. F., Heath, A., Lohman, D. J., Mathew, J., Rand, D. B., & Travassos, M. A. (2002). The ecology and evolution of ant association in the Lycaenidae (Lepidoptera). *Annual Review of Entomology*, 47, 733–771. https://doi.org/10.1146/annurev.ento.47.091201.145257
+
+Pierce, N. E., & Dankowicz, E. (2022). The natural history of caterpillar–ant associations. In R. J. Marquis & S. Koptur (Eds.), *Caterpillars in the middle* (pp. 319–391). Springer. https://doi.org/10.1007/978-3-030-86688-4_11
+
+Poggio, L., de Sousa, L. M., Batjes, N. H., Heuvelink, G. B. M., Kempen, B., Ribeiro, E., & Rossiter, D. (2021). SoilGrids 2.0: producing soil information for the globe with quantified spatial uncertainty. *SOIL*, 7, 217–240. https://doi.org/10.5194/soil-7-217-2021
+
+Pozzi, A., Pelanek, O., Padilla-Iglesias, C., Carter, E., Leonardi, M., Fatima, A., Stephenson, N., Colucci, M., Jud, D., Gunasekaram, C., & Manica, A. (2026). crstools 1.0.0: an R package for cartographic analyses. *EarthArXiv* (preprint). https://doi.org/10.31223/X5K17P
+
+Rabosky, D. L., & Benson, R. B. J. (2021). Ecological and biogeographic drivers of biodiversity cannot be resolved using clade age-richness data. *Nature Communications*, 12, 2945. https://doi.org/10.1038/s41467-021-23307-5
+
+Revell, L. J. (2012). phytools: an R package for phylogenetic comparative biology (and other things). *Methods in Ecology and Evolution*, 3, 217–223. https://doi.org/10.1111/j.2041-210X.2011.00169.x
+
+Sahr, K., White, D., & Kimerling, A. J. (2003). Geodesic discrete global grid systems. *Cartography and Geographic Information Science*, 30, 121–134. https://doi.org/10.1559/152304003100011090
+
+Sandel, B., Arge, L., Dalsgaard, B., Davies, R. G., Gaston, K. J., Sutherland, W. J., & Svenning, J.-C. (2011). The influence of Late Quaternary climate-change velocity on species endemism. *Science*, 334, 660–664. https://doi.org/10.1126/science.1210173
+
+Schär, S., Eastwood, R., Arnaldi, K. G., Talavera, G., Kaliszewska, Z. A., Boyle, J. H., Espeland, M., Nash, D. R., Vila, R., & Pierce, N. E. (2018). Ecological specialization is associated with genetic structure in the ant-associated butterfly family Lycaenidae. *Proceedings of the Royal Society B*, 285, 20181158. https://doi.org/10.1098/rspb.2018.1158
+
+Vila, R., Bell, C. D., Macniven, R., Goldman-Huertas, B., Ree, R. H., Marshall, C. R., Bálint, Z., Johnson, K., Benyamini, D., & Pierce, N. E. (2011). Phylogeny and palaeoecology of *Polyommatus* blue butterflies show Beringia was a climate-regulated gateway to the New World. *Proceedings of the Royal Society B*, 278, 2737–2744. https://doi.org/10.1098/rspb.2010.2213
+
+Wood, S. N. (2011). Fast stable restricted maximum likelihood and marginal likelihood estimation of semiparametric generalized linear models. *Journal of the Royal Statistical Society Series B*, 73, 3–36. https://doi.org/10.1111/j.1467-9868.2010.00749.x
+
+Yumnam, T., & Kodandaramaiah, U. (2025). Correlated evolution of multiple traits gives butterflies a false head. *Proceedings of the Royal Society B*, 292, 20250900. https://doi.org/10.1098/rspb.2025.0900
+
+# Supporting Information {-}
+
+```{r si-setup, include=FALSE}
+# Supporting figures are inserted as captioned images (numbered S1.1, S1.2, ... by hand, outside
+# the numbering of the main figures); paths are relative to writing/
+si_fig <- function(dir, file, caption) {
+  cat("![", caption, "](", file.path("../data/intermediate", basename(dir), file),
+      "){width=6.5in}\n\n", sep = "")
+}
+# Supporting tables: a bold caption paragraph, then the table
+si_tab <- function(caption, tab) {
+  cat("**", caption, "**\n\n", sep = "")
+  print(knitr::kable(tab, align = ifelse(vapply(tab, is.numeric, logical(1)), "r", "l")))
+  cat("\n\n")
+}
+f2 <- function(x) formatC(x, format = "f", digits = 2)
+pv <- function(p) vapply(p, function(x) if (is.na(x)) "–" else pval(x), character(1))
+f0 <- function(x) formatC(x, format = "f", digits = 0, big.mark = ",")
+ci <- function(est, lo, hi) paste0(pct(est), " (", pct(lo), "–", pct(hi), ")")
+cin <- function(est, lo, hi) paste0(f2(est), " (", f2(lo), " to ", f2(hi), ")")
+contrast_names <- c(associated = "Associated vs non-associated", obligate = "Obligate vs facultative",
+                    parasite = "Parasite vs mutualist", mutualist = "Mutualist vs facultative")
+type_names <- c(n = "Non-associated", f = "Facultative", m = "Obligate mutualist",
+                p = "Obligate parasite")
+model_names <- c(baseline = "Baseline", climate = "Climate",
+                 `latitude x hemisphere` = "Lat. × hem.", lineage = "Lineage",
+                 `lineage + climate` = "Lineage + climate")
+property_names <- c(lgm_anomaly_temperature = "LGM temperature anomaly", log_aridity = "Aridity",
+                    bio15 = "Precipitation seasonality", dry_months = "Dry months",
+                    dry_run = "Longest dry spell", bio14 = "Driest-month precipitation",
+                    phh2o = "Soil pH", cec = "Soil cation exchange capacity",
+                    nitrogen = "Soil nitrogen", soc = "Soil organic carbon",
+                    soil_p = "Soil phosphorus", fire = "Burned fraction",
+                    pgem_log_precipitation = "5-Myr mean precipitation",
+                    pgem_dry_share = "5-Myr share of dry time")
+pname <- function(v) ifelse(v %in% names(property_names), property_names[v], v)
+```
+
+## Appendix S1. Data: evidence, completeness and environmental layers {-}
+
+The interaction types come from a companion compilation (in preparation). For each type, the sources either gave evidence for the species itself or presumed the type from relatives or from the genus. Table S1.1 gives, for each region, the recorded and classified species and the classified species of each strategy, with the share whose type was presumed from relatives. Figure S1.1 shows the same information with the out-of-sample prediction of Fig. 3c, repeated with species-specific evidence only. Table S1.2 lists the environmental, ant and phylogenetic data.
+
+```{r tab-s1-1, results = "asis"}
+cov <- ecov[, .(N = sum(N)), by = .(region, strategy, evidence, recorded, classified)]
+cell <- function(rg, k) {
+  x <- cov[region == rg & strategy == k]
+  if (!nrow(x)) return("0")
+  n <- sum(x$N)
+  paste0(n, " (", pct(sum(x[evidence == "presumed from relatives"]$N) / n), ")")
+}
+reg_order <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+               "Indomalayan", "Australia", "New Guinea and islands")
+t1 <- rbindlist(lapply(reg_order, function(rg) {
+  x <- unique(cov[region == rg, .(recorded, classified)])
+  data.table(Region = rg, Recorded = x$recorded,
+             Classified = paste0(x$classified, " (", pct(x$classified / x$recorded), ")"),
+             `Non-assoc.` = cell(rg, "n"), Facultative = cell(rg, "f"),
+             Mutualist = cell(rg, "m"), Parasite = cell(rg, "p"))
+}))
+si_tab("Table S1.1. Recorded and classified species of each region (in brackets: share of the recorded species that is classified), and the classified species of each strategy (in brackets: share whose type was presumed from relatives or from the genus by the sources). Species are assigned to the region holding most of their records.", t1)
+```
+
+```{r fig-s1-1, results = "asis"}
+si_fig(d12, "plot_evidence.png", "Figure S1.1. Evidence and out-of-sample prediction. (A) Recorded species of each region by strategy and evidence (light shades: type presumed from relatives or genera), with the unclassified species and the share classified. (B) Deviance explained by lineage, climate and both, in sample, for species held out (ten folds) and for whole genera held out, with all classified species (filled) and species-specific evidence only (open); medians of three repeats. (C) Prediction of the obligacy of held-out subfamilies and genera by region, latitude and hemisphere and the LGM temperature anomaly, with both evidence sets.")
+```
+
+```{r tab-s1-2, results = "asis"}
+t2 <- data.table(
+  Layer = c("Present climate (temperature, precipitation, seasonality, driest month)",
+            "Dry months and longest dry spell", "Aridity index",
+            "Climate since the LGM (800 kyr)", "Second LGM reconstruction (120 kyr)",
+            "Soil pH, cation exchange capacity, nitrogen, organic carbon (0–30 cm)",
+            "Soil total phosphorus (0–10 cm)", "Precipitation over 5 Myr", "Burned fraction (2001–2020)", "Ant species richness; ant occurrence records",
+            "Realms", "Köppen–Geiger classes", "Phylogenies"),
+  Source = c("WorldClim 2.1 (Fick & Hijmans, 2017)",
+             "Monthly WorldClim 2.1: months with precipitation (mm) below twice the mean temperature (°C)",
+             "Hargreaves & Samani (1985), from WorldClim",
+             "Krapp et al. (2021), via pastclim (Leonardi et al., 2023)", "Beyer et al. (2020)",
+             "SoilGrids 2.0 (Poggio et al., 2021)", "He et al. (2021)", "PALEO-PGEM (Barreto et al., 2023), every 10th 1-kyr step", "GFED5 (Chen et al., 2023)",
+             "Kass et al. (2022)", "RESOLVE Ecoregions 2017 (Dinerstein et al., 2017)",
+             "Computed from WorldClim monthly climate as in Beck et al. (2023)",
+             "Yumnam & Kodandaramaiah (2025); Schär et al. (2018)"),
+  Resolution = c("10′", "10′", "10′", "0.5°", "0.5°", "5 km", "0.5°", "1°", "0.25°", "10′; points", "Polygons",
+                 "10′", "Species"))
+si_tab("Table S1.2. Environmental, ant and phylogenetic data.", t2)
+```
+
+## Appendix S2. Climate and lineage among species {-}
+
+Table S2.1 partitions the in-sample deviance of each contrast between climate (six predictors) and lineage (random intercepts of subfamily and genus); Table S2.2 gives the same models for held-out species and genera. Tables S2.3 and S2.4 and Figure S2.1 give the predictions for held-out realms and subfamilies: pooled over all held-out species, and for each held-out unit, with calibration, discrimination and climatic novelty. Figure S2.2 shows the climate coefficients of phylogenetic logistic regressions (Ives & Garland, 2010) on the Yumnam and Schär trees.
+
+```{r tab-s2-1, results = "asis"}
+t3 <- part_sp[, .(Contrast = contrast_names[contrast], Species = species, `Coded 1` = events,
+                  Genera = genera, `Mixed genera` = mixed_genera, Climate = pct(climate),
+                  Lineage = pct(lineage), Both = pct(both), Shared = pct(shared))]
+si_tab("Table S2.1. In-sample deviance explained by climate, lineage and both, and the part shared by climate and lineage, for the three contrasts (binomial models with random intercepts of subfamily and genus). Mixed genera contain both outcomes of the contrast.", t3)
+```
+
+```{r tab-s2-2, results = "asis"}
+t4 <- dcast(oos_t[, .(contrast, evidence, scheme, model, d2)], contrast + evidence + scheme ~ model,
+            value.var = "d2")
+t4 <- t4[order(match(contrast, names(contrast_names)), evidence,
+               match(scheme, c("in sample", "species held out", "genera held out")))]
+t4 <- t4[, .(Contrast = contrast_names[contrast],
+             Evidence = c(all = "All", specific = "Species-specific")[evidence],
+             Scheme = scheme, Lineage = pct(lineage), Climate = pct(climate),
+             `Lineage + climate` = pct(`lineage + climate`))]
+si_tab("Table S2.2. Deviance explained in sample and out of sample (medians of three repeats of ten folds): species held out (congeners remain in the training data) and whole genera held out, with all classified species and with species-specific evidence only. Negative values: worse than predicting the training proportion.", t4)
+```
+
+```{r tab-s2-3, results = "asis"}
+t5 <- po20[, .(Contrast = contrast_names[contrast],
+               `Held out` = c(`held-out realm` = "Realm", `held-out subfamily` = "Subfamily")[scheme],
+               Model = model_names[model],
+               `D² (95% CI)` = paste0(pct(d2), " (", pct(d2_low), " to ", pct(d2_high), ")"),
+               `AUC (95% CI)` = ifelse(model == "baseline", "–", cin(auc, auc_low, auc_high)),
+               `Calibration slope` = ifelse(model == "baseline", "–", f2(calibration_slope)))]
+si_tab("Table S2.3. Prediction of held-out realms (each of eight predicted from the other seven) and held-out subfamilies, pooled over all held-out species: deviance explained relative to the training share (D²), area under the ROC curve (AUC) and calibration slope (1: ideal), with 95% intervals from resampling genera. For held-out subfamilies, the lineage models predict a typical genus, because the subfamily and its genera are unknown to them.", t5)
+```
+
+```{r tab-s2-4, results = "asis"}
+t6 <- me20[contrast == "obligate" & model %in% c("climate", "latitude x hemisphere", "lineage")]
+t6 <- dcast(t6, scheme + unit + species + events + observed + novel_share ~ model,
+            value.var = "predicted")
+t6 <- t6[order(scheme, -species), .(
+  Unit = ifelse(unit == "", "(unassigned)", unit), Species = species, Obligate = events,
+  Observed = pct(observed), Climate = pct(climate), `Lat. × hem.` = pct(`latitude x hemisphere`),
+  Lineage = pct(lineage), Novel = pct(novel_share))]
+si_tab("Table S2.4. Obligacy of each held-out realm (first eight rows) and subfamily: associated species, obligate species, observed obligate share and the share predicted by climate, latitude by hemisphere and lineage, and the share of the unit's species with climates outside those of the training species (Mahalanobis distance beyond the 99th percentile of the training species).", t6)
+```
+
+```{r fig-s2-1, results = "asis"}
+si_fig(d20, "plot_held_out.png", "Figure S2.1. Prediction of held-out realms and subfamilies. (a, c) Observed against predicted obligate share of each held-out realm and subfamily (diagonal: perfect calibration). (b, d) Discrimination within each unit (AUC, 95% intervals from resampling genera). (e) Deviance explained relative to the training share for all held-out species, for each contrast and model.")
+si_fig(dir_int("s04_fit_phylogenetic_models"), "plot_phylo_climate.png", "Figure S2.2. Climate and lineage in the strategies of species. (A) Deviance explained by climate alone, shared and lineage alone (in sample). (B) Deviance explained when a climate-only model predicts the species of genera (median and range over 20 random splits) or subfamilies it was not fitted to. (C) Climate coefficients of phylogenetic logistic regressions on the Yumnam and Schär trees, and of the same model without phylogeny; filled points have p < 0.05.")
+```
+
+## Appendix S3. Composition within regions {-}
+
+Figure S3.1 shows the share of each strategy along temperature, aridity and the LGM temperature anomaly within each region, observed and expected from the genera present. Table S3.1 tests whether the species-level relationships differ among regions. Figure S3.2 analyses ant association along latitude in Europe (hexagons of about 23,000 km²; species richness of each strategy modelled with quasi-Poisson regressions), and Figure S3.3 and Table S3.2 extend the analysis to the eastern Palaearctic and the Nearctic, and to temperature effects on association among species in every region.
+
+```{r fig-s3-1, results = "asis"}
+si_fig(d5, "plot_region_gradients_hex5.png", "Figure S3.1. Share of each strategy along annual mean temperature, aridity and the LGM temperature anomaly within regions (hexagons of about 210,000 km²). Solid: observed; dashed: expected from the lineages present (each species given the strategy composition of its congeners, itself excluded). Points are hexagons.")
+```
+
+```{r tab-s3-1, results = "asis"}
+het <- read(d5, "region_heterogeneity_species.csv")
+vars <- c(bio01 = "Annual mean temperature", log_aridity = "Aridity", abs_latitude = "Latitude",
+          lgm_anomaly_temperature = "LGM temperature anomaly", bio15 = "Precipitation seasonality")
+t7 <- het[, .(Contrast = contrast_names[contrast],
+              Predictor = ifelse(variable %in% names(vars), vars[variable], variable),
+              Regions = regions, `Deviance difference` = f2(deviance_difference), df = num(df, 1),
+              p = pv(p))]
+si_tab("Table S3.1. Differences among regions in the species-level relationship of each contrast with each predictor: deviance difference between models with region-specific and common slopes (both with region intercepts and random intercepts of subfamily and genus; approximate likelihood-ratio test), across the regions with enough species of both outcomes.", t7)
+```
+
+```{r fig-s3-2, results = "asis"}
+si_fig(d15, "plot_europe_association.png", paste0("Figure S3.2. Ant association along latitude in Europe. (a) Share of non-associated species among the classified species of hexagons of about 23,000 km² (at least ten classified species; Lambert equal-area projection). (b) Mean species richness per hexagon of non-associated, facultative and obligate species in 3° latitude bands (log scale). (c) Non-associated share of each hexagon along latitude (points), with the observed trend and the trend expected from the genera present. (d) Species per hexagon of each genus in the north (above 56° N) relative to the south (below 46° N); for example, ", num(eug[genus == "Polyommatus"]$south, 1), " *Polyommatus* species per hexagon in the south and ", num(eug[genus == "Polyommatus"]$north, 1), " in the north."))
+si_fig(d15, "plot_association_regions.png", "Figure S3.3. Ant association beyond Europe. (E) Non-associated share along latitude in Europe, the eastern Palaearctic and the Nearctic (hexagons of about 23,000 km²), observed and expected from the genera present. (F) Effect of a species' mean annual temperature on ant association given lineage, and within genera, in each region (log odds per SD, 95% intervals).")
+```
+
+```{r tab-s3-2, results = "asis"}
+t8 <- merge(rsl, dcast(smd, area ~ model, value.var = "dev_expl"), by = "area")
+t8 <- t8[, .(Area = area, Hexagons = hexagons,
+             `Facultative per 10°` = pct(facultative_change_per_10deg),
+             `Non-associated per 10°` = pct(non_associated_change_per_10deg),
+             p = pv(p), `D²: latitude` = pct(latitude), `D²: temperature` = pct(temperature))]
+si_tab("Table S3.2. Ant association along latitude in three Holarctic areas (hexagons of about 23,000 km² with at least ten classified species): change in the species richness of facultative and non-associated species per 10° of latitude (quasi-Poisson regressions), the p-value of their difference, and the deviance in the non-associated share explained by latitude and by temperature (quasi-binomial GAMs).", t8)
+```
+
+## Appendix S4. Comparisons within overlapping climates {-}
+
+Figure S4.1 shows the five Mediterranean-climate regions and their climates, and Figure S4.2 the comparison within shared strata without standardisation. Figure S4.3 and Tables S4.1–S4.4 give the standardised comparison: the four strategies, the balance of the climates, the area and species retained, the sensitivity to the strata, and the genus-weighted composition. Table S4.5 gives the same climates outside the five regions.
+
+```{r fig-s4-1, results = "asis"}
+si_fig(d7, "plot_mediterranean.png", "Figure S4.1. The five Mediterranean-climate regions. (A) Pixels of Köppen–Geiger class Cs. (B) Strategies of the classified species of each region's Cs pixels (labels: genera). (C) Climates of the Cs pixels. (D) Obligate share of each Mediterranean hexagon of the Cape and southern Australia against that of its three most similar hexagons in climate in California and the Mediterranean Basin (nearest-neighbour matching).")
+si_fig(d13, "plot_matched_climates.png", "Figure S4.2. Strategies in shared climates without standardisation. (A) Obligate share of each Mediterranean-climate region in the climate strata it shares with the other region of the pair, with standard (filled) and twice as wide (open) strata; intervals from resampling genera; grey bars: completeness bounds; crosses: unclassified species given the obligate share of their congeners. (B) The same for each biogeographic region in the climates of the Cape and southern Australia, and of the Mediterranean Basin, outside the five regions. (C) Obligacy of the species of the Cape and southern Australian pools against those of the Mediterranean Basin, without and with each species' own climate (log odds).")
+si_fig(d18, "plot_shared_climate_audit.png", "Figure S4.3. Audit of the comparison within shared climates. (a) Standardised share of each strategy within the strata shared by each pair (area weights; 95% intervals from resampling genera). (b) Standardised mean difference of each climate variable between the regions of each pair, before and after matching (grey band: |SMD| < 0.25). (c) Standardised difference in obligacy for every stratum width and minimum number of pixels. (d) Species-weighted against genus-weighted obligate share of each Mediterranean-climate region and biogeographic region.")
+```
+
+```{r tab-s4-1, results = "asis"}
+t9 <- sc18[, .(Pair = pair, Version = c(`all strata of each species` = "All strata",
+                                        `main stratum of each species` = "Main stratum")[version],
+               Weights = sub(" weights", "", weights), Strata = strata,
+               `Obligate, first` = pct(obligate_1), `Obligate, second` = pct(obligate_2),
+               `Difference (95% CI)` = paste0(pts(difference), " (", pts(difference_low), " to ",
+                                              pts(difference_high), ")"))]
+si_tab("Table S4.1. Standardised obligate share of the first and second region of each pair within their shared climate strata, and their difference in percentage points with a 95% interval from resampling genera: with each species counted in all shared strata it was recorded in, or only in its main shared stratum, and with area or equal stratum weights.", t9)
+```
+
+```{r tab-s4-2, results = "asis"}
+t10 <- merge(bal18[, .(`SMD before` = paste(f2(smd_before), collapse = ", "),
+                       `SMD after` = paste(f2(smd_after), collapse = ", ")), by = pair],
+             ret18[, .(`Pixels retained` = paste0(region, " ", pct(share_pixels), collapse = "; "),
+                       `Species retained` = paste0(region, " ", pct(share_species), collapse = "; ")),
+                   by = pair], by = "pair")
+setnames(t10, "pair", "Pair")
+si_tab("Table S4.2. Climatic balance and retention for each pair of Mediterranean-climate regions: standardised mean differences (first minus second region, divided by the pooled SD before matching) of annual mean temperature, minimum temperature, aridity and precipitation seasonality, in this order, before and after matching and weighting, and the share of each region's Mediterranean-climate pixels and classified species in the shared strata.", t10)
+```
+
+```{r tab-s4-3, results = "asis"}
+t11 <- gw18[, .(Level = c(`Mediterranean-climate pool` = "Cs region",
+                          `Biogeographic region` = "Region")[level],
+                Unit = unit, Species = species, Genera = genera, `Obligate genera` = obligate_genera,
+                `S (species)` = pct(S_obligate), `G (genera)` = pct(G_obligate),
+                `Top 3 genera` = ifelse(is.na(top3_obligate_share), "–", pct(top3_obligate_share)))]
+si_tab("Table S4.3. Species-weighted (S) and genus-weighted (G) obligate share of each Mediterranean-climate region and biogeographic region, and the share of the obligate species in the three largest obligate genera. The difference S − G is positive when obligate genera are richer in species than other genera.", t11)
+t12 <- dec18[, .(`Region 1` = region_1, `Region 2` = region_2,
+                 `S difference (95% CI)` = paste0(pts(S_difference), " (", pts(S_low), " to ",
+                                                  pts(S_high), ")"),
+                 `G difference (95% CI)` = paste0(pts(G_difference), " (", pts(G_low), " to ",
+                                                  pts(G_high), ")"),
+                 `Richness term` = pts(R_difference))]
+si_tab("Table S4.4. Decomposition of regional contrasts in the obligate share (percentage points) into the difference in genus-weighted share (how many genera are obligate) and the richness term (how rich in species the obligate genera are), with 95% intervals from resampling genera within each region.", t12)
+```
+
+```{r tab-s4-5, results = "asis"}
+t13 <- bmed[classified >= 5, .(Climates = target, Region = region, Pixels = f0(pixels),
+                               Classified = classified,
+                               `Obligate (95% CI)` = ci(obligate_share, boot_low, boot_high),
+                               Bounds = paste0(pct(lower_bound), "–", pct(upper_bound)))]
+si_tab("Table S4.5. Obligate share of the classified species recorded in each biogeographic region in the climate strata of the Cape and southern Australia, and of the Mediterranean Basin, outside the five Mediterranean-climate regions (regions with at least five classified species), with 95% intervals from resampling genera and the bounds set by unclassified species.", t13)
+```
+
+## Appendix S5. What remains once region and lineage are known {-}
+
+Figure S5.1 and Table S5.1 test whether the obligacy signal reflects glacial stability. Figure S5.2 tests soils, fire and long-term aridity, and Table S5.2 gives the effect of every property on obligacy given region and lineage, with Holm-adjusted p-values. Figures S5.3 and S5.4 and Tables S5.3–S5.7 give the association of precipitation seasonality with obligacy under strong controls, the drought measures, every genus with both obligate and facultative species, the within-genus permutation tests and larval carnivory. Figure S5.5 and Table S5.8 give the ant analyses, and Figure S5.6 the permutation nulls.
+
+```{r fig-s5-1, results = "asis"}
+si_fig(d6, "plot_stability_tests.png", "Figure S5.1. Glacial stability or southern geography? (A) Deviance explained when logistic regressions with different predictors predict the obligacy of species in held-out subfamilies (triangles) or genera (diamonds; median and range of 20 splits). (B) Effect of the LGM temperature anomaly on obligacy given region and lineage, across subsets and checks; labels give obligate and all associated species.")
+```
+
+```{r tab-s5-1, results = "asis"}
+t14 <- seff[, .(Analysis = analysis, Species = species, Obligate = obligate, Genera = genera,
+                Estimate = f2(estimate), SE = f2(se), p = pv(p))]
+si_tab("Table S5.1. Effect of the LGM temperature anomaly on obligacy (log odds per SD) given region (fixed effect) and lineage (random intercepts of subfamily and genus), across subsets and checks.", t14)
+```
+
+```{r fig-s5-2, results = "asis"}
+si_fig(d8, "plot_southern_drivers.png", "Figure S5.2. Soils, fire and long-term aridity. (A) Properties of the species of each strategy, by hemisphere. (B) Gain in cross-validated deviance explained over latitude and hemisphere when each property is added, for held-out subfamilies and genera. (C) Effect of each property on obligacy given lineage, with and without region; filled points have p < 0.05.")
+```
+
+```{r tab-s5-2, results = "asis"}
+t15 <- holm19[order(p), .(Property = pname(property), Estimate = f2(estimate), SE = f2(se),
+                          p = pv(p), `Holm p` = pv(p_holm))]
+si_tab("Table S5.2. Effect of each environmental property on obligacy (log odds per SD) given region (fixed effect) and lineage (random intercepts of subfamily and genus), with p-values adjusted by the Holm method over all properties.", t15)
+```
+
+```{r fig-s5-3, results = "asis"}
+si_fig(d11, "plot_seasonality.png", "Figure S5.3. Precipitation seasonality and obligacy under strong controls. (A) Effect of precipitation seasonality (log odds per SD, 95% interval) on three contrasts given region and lineage, with added climate, with species-specific evidence only, within genera, without the three large southern obligate genera, and within each region with enough species; filled points have p < 0.05; labels give the species coded 1 and all species. (B) Deviance explained in each held-out subfamily by four predictor sets. (C) Median precipitation seasonality of the obligate against the facultative species of each genus that has both.")
+si_fig(d19, "plot_mixed_genera.png", "Figure S5.4. Seasonality and drought within the mixed genera. (a) Every genus with both obligate and facultative species: the median precipitation seasonality of its facultative (blue) and obligate (orange) species, with the species as small points; labels give the main region and the species counts. (b) Within-genus slope of each property on obligacy and on obligate mutualism (genus fixed effects) against its permutation null (grey: 95% of 9,999 permutations). (c) Effects of each property given region and lineage on three contrasts (log odds per SD, 95% intervals).")
+```
+
+```{r tab-s5-3, results = "asis"}
+t16 <- sea[, .(Contrast = contrast_names[contrast], Analysis = analysis, Species = species,
+               `Coded 1` = events, Estimate = f2(estimate), SE = f2(se), p = pv(p))]
+si_tab("Table S5.3. Effect of precipitation seasonality (log odds per SD) on three contrasts, given region and lineage, across controls and subsets. Species-specific evidence: a directly recorded class, and for parasite against mutualist also a directly recorded subtype.", t16)
+```
+
+```{r tab-s5-4, results = "asis"}
+t17 <- dr19[, .(Contrast = contrast_names[contrast], Property = pname(property), Species = species,
+                `Coded 1` = events, Estimate = f2(estimate), SE = f2(se), p = pv(p))]
+si_tab("Table S5.4. Effects of precipitation seasonality and three measures of drought (dry months: precipitation in mm below twice the mean temperature in °C; longest run of consecutive dry months; precipitation of the driest month) on three contrasts, given region and lineage (log odds per SD).", t17)
+t18 <- wg19[, .(Contrast = contrast_names[contrast], Property = pname(property), Genera = genera,
+                Species = species, Slope = f2(slope),
+                `Null 95%` = paste0(f2(null_low), " to ", f2(null_high)), p = pv(p_two_sided))]
+si_tab("Table S5.5. Within-genus slopes (logistic regression with genus as a fixed effect, standardised property) in the genera containing both outcomes of each contrast, against 9,999 permutations of the property among the species of each genus (two-sided p).", t18)
+```
+
+```{r tab-s5-6, results = "asis"}
+t19 <- mix19[order(-obligate, -seasonality_difference),
+             .(Genus = paste0("*", genus, "*"), Subfamily = subfamily, Region = main_region,
+               `Obl./fac.` = paste0(obligate, "/", facultative),
+               `Species-specific` = pct(species_specific),
+               `Seasonality difference` = paste0(f0(seasonality_difference), " (", f0(seasonality_low),
+                                                 " to ", f0(seasonality_high), ")"),
+               `Dry-month difference` = paste0(num(dry_difference, 1), " (", num(dry_low, 1), " to ",
+                                               num(dry_high, 1), ")"))]
+si_tab("Table S5.6. Every genus with both obligate and facultative species: subfamily, main region, obligate and facultative species, the share of its species with species-specific evidence, and the difference between the median precipitation seasonality (CV, %) and the median number of dry months of its obligate and facultative species, with 95% intervals from resampling species within each strategy.", t19)
+t20 <- carn19[, .(Strategy = type_names[strategy], Species = species,
+                  `Carnivory recorded` = carnivory_recorded, Carnivorous = carnivorous,
+                  `Direct evidence` = carnivory_direct, `Carnivorous (direct)` = carnivorous_direct,
+                  Seasonality = f0(seasonality), `Dry months` = num(dry_months, 1))]
+si_tab("Table S5.7. Larval carnivory recorded for the associated species of each strategy (all records, and records with direct evidence), with the median precipitation seasonality and dry months of their records. Obligate parasites develop in ant nests; obligate mutualists may be tended in nests or outside them, which the data do not record.", t20)
+```
+
+```{r fig-s5-5, results = "asis"}
+si_fig(d21, "plot_ants.png", "Figure S5.5. Ants. (a) Effect of the estimated ant species richness of each lycaenid species' records (Kass et al., 2022) on three contrasts, given lineage and given region and lineage (log odds per SD, 95% intervals). (b, c) The ant genera recorded with the most obligate lycaenid species, across biogeographic regions and Mediterranean-climate regions: species of each genus recorded there in the Global Ant Biodiversity Informatics database (shading), and the lycaenid species of each strategy recorded with the genus there (symbols).")
+```
+
+```{r tab-s5-8, results = "asis"}
+t21 <- ar21[, .(Contrast = contrast_names[contrast],
+                Richness = c(log_ant_species = "Ant species", log_ant_genera = "Ant genera")[property],
+                Given = given, Species = species, Estimate = f2(estimate), SE = f2(se), p = pv(p))]
+si_tab("Table S5.8. Effect of the estimated ant species and genus richness (log) of each lycaenid species' records on three contrasts, given lineage and given region and lineage (log odds per SD).", t21)
+```
+
+```{r fig-s5-6, results = "asis"}
+si_fig(d14, "plot_null_models.png", "Figure S5.6. Null models and matched-only trees. (a) Within-genus effect of precipitation seasonality on obligacy in the data (line) and in permutations of seasonality among the species of each genus (histogram). (b) Origins of obligacy per region on four trees. (c) For each regional composition gradient steeper than 0.3 log odds per SD, the part not reproduced by lineages, as a z-score against permutations of strategies within genera (grey band: 95% of the null).")
+```
+
+## Appendix S6. Origins of obligacy {-}
+
+Table S6.1 tests whether gains and losses of obligacy depend on hemisphere (Pagel, 1994) on both trees, and Figure S6.1 shows the rates of the dependent model and the origins on the grafted Yumnam tree. Table S6.2 gives the origins of obligacy per region on all four trees. These counts depend on the tree and on the placement of unsampled species, and are exploratory.
+
+```{r tab-s6-1, results = "asis"}
+t22 <- ptest[, .(Tree = c(yumnam_2025 = "Yumnam (dated)", schar_2018 = "Schär")[tree],
+                 Species = species, `logL independent` = f2(logL_independent),
+                 `logL dependent` = f2(logL_dependent), LR = f2(lr), p = pv(p))]
+si_tab("Table S6.1. Correlated evolution of obligacy and hemisphere (Pagel, 1994): likelihoods of the independent and dependent models on both genus-grafted trees, with polytomies resolved at random.", t22)
+```
+
+```{r fig-s6-1, results = "asis"}
+si_fig(d9, "plot_history_origins.png", "Figure S6.1. History of obligacy on the grafted trees. (A) Ratio of the southern to the northern rate of gain and of loss of obligacy in the model in which these rates depend on hemisphere, on both trees; filled points: the dependent model fits better (p < 0.05). (B) Origins of obligacy in 100 stochastic character maps on the genus-grafted Yumnam tree, by the region of the obligate species descended from each origin; point size and position give the number of those species.")
+```
+
+```{r tab-s6-2, results = "asis"}
+gfull <- merge(CJ(map = unique(ogt$map), region = unique(c(ogt$region, osum$region))), ogt,
+               all.x = TRUE)
+gfull[is.na(N), N := 0L]
+og_t <- gfull[, .(genus_tree = paste0(median(N), " (", quantile(N, 0.025), "–",
+                                      quantile(N, 0.975), ")")), by = region]
+om_t <- dcast(omt[, .(region, tree, v = paste0(origins_median, " (", round(origins_low), "–",
+                                               round(origins_high), ")"))], region ~ tree,
+              value.var = "v")
+gs_t <- osum[, .(region, grafted = paste0(origins_median, " (", round(origins_low), "–",
+                                          round(origins_high), ")"), obligate)]
+t23 <- Reduce(function(a, b) merge(a, b, by = "region", all = TRUE), list(gs_t, og_t, om_t))
+t23 <- t23[order(-obligate), .(Region = region, `Obligate species` = obligate,
+                               `Tree of genera` = genus_tree, `Matched, Yumnam` = yumnam_2025,
+                               `Matched, Schär` = schar_2018, `Grafted tree` = grafted)]
+si_tab("Table S6.2. Origins of obligacy per region (median and 95% range over 100 stochastic character maps) on the tree of genera, on the Yumnam and Schär trees pruned to their matched species, and on the genus-grafted Yumnam tree. Obligate species: classified obligate species of the region on the grafted tree.", t23)
+```

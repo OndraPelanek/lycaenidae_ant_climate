@@ -1,0 +1,514 @@
+---
+title: "Lycaenidae ant-interaction climate 03 - exploring climate and interaction strategies"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+This is the first, exploratory analysis of the climate study. It asks how much of the geographic variation in the proportions of lycaenid ant-interaction strategies is associated with present and past climate, and whether these associations hold beyond regional history and lineage. It is exploratory: models, predictor sets and thresholds will be revised before any confirmatory analysis, and no result here should be read as a test of a single hypothesis.
+
+The analysis has four parts. First, the climate predictors are screened for collinearity. Second, the strategy counts of the 500-km cells are related to each predictor and to groups of predictors (present climate, past climate, space and biogeographic realm) with binomial generalised additive models, and the deviance they explain is partitioned. Because species occur in many cells and strategies are clustered geographically and in lineages, the deviance explained by cell models is descriptive only (Hawkins et al. 2017). Third, the transferability of the climate models is tested by predicting each realm from models fitted to the others: a climate association that reflects a general process should predict, for example, the obligate associates of Australia from those of Africa. Fourth, strategies are related to species' own climates with taxonomic mixed models, separating the climate differences among genera from those among species of the same genus (van de Pol & Wright 2009). A full run takes about 5 min.
+
+# Setup
+
+## Packages
+
+`mgcv` fits the cell and species models, `data.table` handles the tables and `ggplot2` with `patchwork` draws the figures; `sf` is used for the maps.
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(mgcv)
+library(ggplot2)
+library(patchwork)
+library(sf)
+```
+
+## Variables
+
+The minimum number of classified species of a cell, the predictors and their groups, and the responses are fixed here.
+
+```{r setup_variables}
+# Cells enter the models with at least this many classified species (as in Fig. 1 of
+# butterfly_ant_interactions)
+min_classified <- 10
+
+# Predictors (columns of the cell and species tables) and their labels, in two groups
+present_vars <- c(bio01 = "Annual mean temperature", bio06 = "Min. temperature, coldest month",
+                  bio04 = "Temperature seasonality", log_bio12 = "log annual precipitation",
+                  log_aridity = "log aridity index (P/PET)", bio15 = "Precipitation seasonality",
+                  npp = "Net primary productivity", log_elevation_sd = "log elevation SD")
+past_vars <- c(lgm_anomaly_temperature = "LGM temperature anomaly",
+               lgm_anomaly_log_precipitation = "LGM log-precipitation anomaly",
+               log10_velocity_temperature = "Temperature velocity since LGM",
+               log10_velocity_precipitation = "Precipitation velocity since LGM",
+               lgm_ice_share = "Share under ice at the LGM")
+# The 800-kyr standard deviations of s01 are not used: in the emulated reconstruction they are
+# almost the same quantity as the LGM anomaly (see s01_prepare_climate), and the 800-kyr ice
+# share overlaps with the LGM ice share
+all_vars <- c(present_vars, past_vars)
+
+# Responses: the four strategies, each against all other classified species, and three nested
+# contrasts (successes / trials as count columns)
+responses <- list(
+  non_associated = c("n_n", "n_classified"),
+  facultative = c("n_f", "n_classified"),
+  mutualist = c("n_m", "n_classified"),
+  parasite = c("n_p", "n_classified"),
+  associated = c("n_assoc", "n_classified"),
+  obligate_of_associated = c("n_obl", "n_assoc"),
+  parasite_of_obligate = c("n_p", "n_obl"))
+
+# Colours of the interaction types and the map palette, as in butterfly_ant_interactions
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+magma_colours <- c("#FCFDBF", "#FC8961", "#B73779", "#51127C", "#000004")
+```
+
+## Folders
+
+The cell and species tables are read from `s02_build_assemblages`; outputs are written to this notebook's folder.
+
+```{r setup_folders}
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_data_intermediate <- path_resrepo("data/intermediate/s03_explore_climate")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+`write_table()` writes the output tables; `projections.R` and `maps.R` draw the maps.
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+source(here::here("code", "R", "projections.R"))
+source(here::here("code", "R", "maps.R"))
+```
+
+The cell table is prepared in the same way in every section, and the GAMs share their smooths.
+
+```{r define_helpers}
+# Read the cell table of a grid, derive the grouped counts and transformed predictors, and keep
+# cells with at least `min_classified` classified species and complete predictors
+read_cells <- function(cell_km = 500) {
+  d <- fread(file.path(dir_s02, paste0("cell_data_", cell_km, "km.csv")))
+  d[, `:=`(n_assoc = n_f + n_m + n_p, n_obl = n_m + n_p,
+           log_bio12 = log10(bio12 + 1), log_aridity = log10(aridity_index),
+           log_elevation_sd = log10(elevation_sd + 1))]
+  d <- d[n_classified >= min_classified]
+  d[complete.cases(d[, names(all_vars), with = FALSE])]
+}
+
+# Smooth terms of the climate predictors: low-rank thin-plate splines with shrinkage, so that
+# uninformative predictors can be penalised to zero
+climate_terms <- function(vars) paste0("s(", vars, ", k = 4, bs = 'ts')", collapse = " + ")
+
+# Spherical smooth of the cell centres (space) and a random effect of realm
+space_term <- "s(cell_latitude, cell_longitude, bs = 'sos', k = 60)"
+realm_term <- "s(realm, bs = 're')"
+
+# Fit a binomial GAM of `successes` out of `trials` with the given right-hand side; NULL when
+# the response has no variation
+fit_binomial_gam <- function(d, response, rhs) {
+  y <- d[[response[1]]]
+  n <- d[[response[2]]]
+  keep <- n > 0
+  if (sum(y[keep]) == 0 || all(y[keep] == n[keep])) return(NULL)
+  dd <- d[keep]
+  dd[, `:=`(y = y[keep], fail = n[keep] - y[keep])]
+  gam(as.formula(paste("cbind(y, fail) ~", adapt_basis(rhs, dd))), family = binomial,
+      data = dd, method = "REML")
+}
+
+# Reduce the basis dimension k of each one-variable smooth to the number of distinct values of
+# its variable in the data (some variables, such as the share of time under ice, are zero in
+# most cells); a linear term replaces the smooth when fewer than three distinct values remain,
+# and a constant variable is dropped
+adapt_basis <- function(rhs, dd) {
+  terms <- regmatches(rhs, gregexpr("s\\(([A-Za-z0-9_]+), k = ([0-9]+), bs = '[a-z]+'\\)",
+                                    rhs))[[1]]
+  for (tm in terms) {
+    v <- sub("s\\(([A-Za-z0-9_]+),.*", "\\1", tm)
+    k <- as.integer(sub(".*k = ([0-9]+),.*", "\\1", tm))
+    distinct <- uniqueN(dd[[v]])
+    new <- if (distinct < 2) "1" else if (distinct < 3) v else
+      if (distinct < k) sub("k = [0-9]+", paste("k =", distinct), tm) else tm
+    rhs <- sub(tm, new, rhs, fixed = TRUE)
+  }
+  rhs
+}
+
+# Deviance explained by a fitted GAM (NA when not fitted)
+dev_expl <- function(m) if (is.null(m)) NA_real_ else summary(m)$dev.expl
+```
+
+Each section below reads its inputs from disk and ends by removing its objects (in a hidden chunk), so only the objects defined in this setup carry over from one section to the next.
+
+```{r keep_setup_objects}
+# Objects of the setup, kept when each section clears its own objects
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Cells and predictors
+
+The cells with at least ten classified species are described, and the predictors are screened for collinearity (Spearman correlations among cells). Pairs correlated above 0.7 are listed; they are not removed here, because the grouped models below compare blocks of predictors rather than estimating single coefficients.
+
+*Inputs:* s02/cell_data_500km.csv
+*Outputs:* predictor_correlations_500km.csv
+
+```{r cells_predictors}
+d <- read_cells(500)
+cat("cells:", nrow(d), "; classified species-cell records:", sum(d$n_classified), "\n")
+print(d[, .(cells = .N, classified = sum(n_classified), n = sum(n_n), f = sum(n_f),
+            m = sum(n_m), p = sum(n_p)), by = realm][order(-cells)])
+
+# --- Correlations among the predictors ---
+r <- cor(d[, names(all_vars), with = FALSE], method = "spearman")
+rr <- as.data.table(as.table(r))[as.integer(factor(V1, names(all_vars))) <
+                                   as.integer(factor(V2, names(all_vars)))]
+setnames(rr, c("variable_1", "variable_2", "spearman"))
+write_table(rr[order(-abs(spearman))],
+            file.path(dir_data_intermediate, "predictor_correlations_500km.csv"))
+print(rr[abs(spearman) > 0.7][order(-abs(spearman))])
+```
+
+```{r clear_cells_predictors, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Single predictors
+
+Each response is related to each predictor alone with a binomial GAM (a shrinkage spline with up to three degrees of freedom). The table gives the deviance explained and the direction of the association (the sign of the Spearman correlation between the predictor and the cell proportion). These are marginal associations: correlated predictors share them, and spatial structure inflates them.
+
+*Inputs:* s02/cell_data_500km.csv
+*Outputs:* single_predictors_500km.csv, plot_single_predictors_500km.png
+
+```{r single_predictors}
+d <- read_cells(500)
+
+# --- One GAM per response and predictor ---
+single <- rbindlist(lapply(names(responses), function(resp) {
+  rbindlist(lapply(names(all_vars), function(v) {
+    m <- fit_binomial_gam(d, responses[[resp]], climate_terms(v))
+    k <- d[[responses[[resp]][2]]] > 0
+    prop <- d[[responses[[resp]][1]]][k] / d[[responses[[resp]][2]]][k]
+    data.table(response = resp, variable = v,
+               group = if (v %in% names(present_vars)) "present" else "past",
+               deviance_explained = dev_expl(m),
+               spearman = cor(d[[v]][k], prop, method = "spearman"),
+               cells = sum(k))
+  }))
+}))
+write_table(single, file.path(dir_data_intermediate, "single_predictors_500km.csv"))
+
+# --- Table: deviance explained (%) with the direction of association ---
+wide <- dcast(single[, .(response, variable,
+                         value = sprintf("%s%.0f", ifelse(spearman >= 0, "+", "-"),
+                                         100 * deviance_explained))],
+              variable ~ response, value.var = "value")
+print(wide[match(names(all_vars), variable), c("variable", names(responses)), with = FALSE])
+
+# --- Figure: deviance explained by each predictor ---
+single[, variable := factor(variable, rev(names(all_vars)), rev(all_vars))]
+single[, response := factor(response, names(responses))]
+p <- ggplot(single, aes(100 * deviance_explained, variable, fill = spearman > 0)) +
+  geom_col() +
+  facet_wrap(~ response, nrow = 1) +
+  scale_fill_manual(values = c(`TRUE` = "#B73779", `FALSE` = "#51127C"),
+                    labels = c(`TRUE` = "positive", `FALSE` = "negative"), name = "Direction") +
+  labs(x = "Deviance explained (%)", y = NULL) +
+  theme_minimal(base_size = 9) +
+  theme(legend.position = "bottom")
+ggsave(file.path(dir_data_intermediate, "plot_single_predictors_500km.png"), p,
+       width = 13, height = 5, dpi = 150, bg = "white", device = ragg::agg_png)
+p
+```
+
+```{r clear_single_predictors, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Partitioning present climate, past climate, space and realm
+
+For each response, binomial GAMs are fitted with present climate, past climate, both, a spherical smooth of the cell centres (space), realm, and climate together with space or realm. The deviance explained by each set and its unique and shared parts are derived by subtraction, as in variation partitioning (Borcard et al. 1992). The spherical smooth absorbs any broad-scale geographic pattern, whatever its cause, so the climate fraction that is not shared with space is a conservative estimate of a climate association, and the shared fraction cannot be attributed to either.
+
+*Inputs:* s02/cell_data_500km.csv
+*Outputs:* partition_500km.csv, plot_partition_500km.png
+
+```{r partition}
+d <- read_cells(500)
+d[, realm := factor(realm)]
+
+# --- Model sets ---
+sets <- list(
+  present = climate_terms(names(present_vars)),
+  past = climate_terms(names(past_vars)),
+  climate = climate_terms(names(all_vars)),
+  space = space_term,
+  realm = realm_term,
+  climate_space = paste(climate_terms(names(all_vars)), "+", space_term),
+  climate_realm = paste(climate_terms(names(all_vars)), "+", realm_term))
+
+# --- Fit all sets for all responses ---
+fits <- rbindlist(lapply(names(responses), function(resp) {
+  de <- sapply(sets, function(rhs) dev_expl(fit_binomial_gam(d, responses[[resp]], rhs)))
+  data.table(response = resp, set = names(sets), deviance_explained = de)
+}))
+wide <- dcast(fits, response ~ set, value.var = "deviance_explained")
+
+# --- Unique and shared fractions ---
+part <- wide[, .(response,
+                 present_unique = climate - past, past_unique = climate - present,
+                 present_past_shared = present + past - climate, climate = climate,
+                 climate_unique_of_space = climate_space - space,
+                 space_unique_of_climate = climate_space - climate,
+                 climate_space_shared = climate + space - climate_space,
+                 climate_space = climate_space,
+                 climate_unique_of_realm = climate_realm - realm,
+                 realm = realm, climate_realm = climate_realm)]
+write_table(merge(wide, part[, !c("climate", "climate_space", "realm", "climate_realm")],
+                  by = "response"),
+            file.path(dir_data_intermediate, "partition_500km.csv"))
+print(part[match(names(responses), response)], digits = 2)
+
+# --- Figure: climate, space and their shared part ---
+long <- melt(part[, .(response, `Climate only` = climate_unique_of_space,
+                      `Shared with space` = climate_space_shared,
+                      `Space only` = space_unique_of_climate)],
+             id.vars = "response", variable.name = "fraction")
+long[, response := factor(response, rev(names(responses)))]
+p <- ggplot(long, aes(100 * value, response, fill = fraction)) +
+  geom_col() +
+  scale_fill_manual(values = c("#B73779", "#FC8961", "grey60"), name = NULL) +
+  labs(x = "Deviance explained (%)", y = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+ggsave(file.path(dir_data_intermediate, "plot_partition_500km.png"), p,
+       width = 7, height = 4, dpi = 150, bg = "white", device = ragg::agg_png)
+p
+```
+
+```{r clear_partition, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Transfer between realms
+
+A model of climate alone is fitted to the cells of all realms but one and used to predict the held-out realm, for each realm with at least 15 cells. Predictive skill is the proportion of the held-out deviance explained relative to the training-set mean proportion (D2; negative when the model predicts worse than a constant). This tests whether the climate associations are general across continents or reflect the idiosyncrasies of particular regions. Because the held-out realm may lie outside the climate of the training realms, D2 also falls when climates do not overlap. Present and past climate are tested separately and together, with fewer basis functions (k = 3) to limit extrapolation.
+
+*Inputs:* s02/cell_data_500km.csv
+*Outputs:* realm_transfer_500km.csv
+
+```{r realm_transfer}
+d <- read_cells(500)
+realms <- d[, .N, by = realm][N >= 15]$realm
+sets <- list(present = names(present_vars), past = names(past_vars), climate = names(all_vars))
+
+# Binomial deviance of observed counts y of n under predicted probabilities p
+binomial_deviance <- function(y, n, p) {
+  p <- pmin(pmax(p, 1e-9), 1 - 1e-9)
+  2 * sum(ifelse(y > 0, y * log(y / (n * p)), 0) +
+            ifelse(n - y > 0, (n - y) * log((n - y) / (n * (1 - p))), 0))
+}
+
+transfer <- rbindlist(lapply(names(responses), function(resp) {
+  rbindlist(lapply(names(sets), function(s) {
+    rbindlist(lapply(realms, function(rl) {
+      train <- d[realm != rl]
+      test <- d[realm == rl & get(responses[[resp]][2]) > 0]
+      rhs <- paste0("s(", sets[[s]], ", k = 3, bs = 'ts')", collapse = " + ")
+      m <- fit_binomial_gam(train, responses[[resp]], rhs)
+      if (is.null(m) || nrow(test) < 5) return(NULL)
+      y <- test[[responses[[resp]][1]]]
+      n <- test[[responses[[resp]][2]]]
+      p_model <- predict(m, newdata = test, type = "response")
+      p_null <- sum(train[[responses[[resp]][1]]]) / sum(train[[responses[[resp]][2]]])
+      data.table(response = resp, set = s, held_out = rl, cells = nrow(test),
+                 observed = sum(y) / sum(n), predicted = sum(n * p_model) / sum(n),
+                 d2 = 1 - binomial_deviance(y, n, p_model) / binomial_deviance(y, n, p_null))
+    }))
+  }))
+}))
+write_table(transfer, file.path(dir_data_intermediate, "realm_transfer_500km.csv"))
+print(dcast(transfer[set == "climate"], response ~ held_out, value.var = "d2"), digits = 2)
+print(transfer[set == "climate" & response %in% c("mutualist", "parasite", "obligate_of_associated"),
+               .(response, held_out, observed = round(observed, 3),
+                 predicted = round(predicted, 3), d2 = round(d2, 2))])
+```
+
+```{r clear_realm_transfer, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+## Extrapolation and classification coverage of the held-out realms
+
+A failed transfer can mean that the climate associations do not generalise, but also that the held-out realm has climates the training realms lack (extrapolation) or that its fauna is incompletely classified. For each held-out realm, the table gives its classification coverage (classified species as a share of recorded species, per cell), the share of its cells whose values of all predictors lie within the range of the training cells, and, for the obligate share of associated species, the observed and predicted proportions in those cells only. If the Americas are predicted to hold obligate associates even in cells with climates inside the training range, extrapolation does not explain the prediction.
+
+*Inputs:* s02/cell_data_500km.csv
+*Outputs:* realm_transfer_checks_500km.csv
+
+```{r realm_transfer_checks}
+d <- read_cells(500)
+realms <- d[, .N, by = realm][N >= 15]$realm
+vars <- names(all_vars)
+rhs <- paste0("s(", vars, ", k = 3, bs = 'ts')", collapse = " + ")
+
+checks <- rbindlist(lapply(realms, function(rl) {
+  train <- d[realm != rl]
+  test <- d[realm == rl]
+
+  # Cells of the held-out realm with every predictor inside the range of the training cells
+  inside <- Reduce(`&`, lapply(vars, function(v)
+    test[[v]] >= min(train[[v]]) & test[[v]] <= max(train[[v]])))
+
+  # Obligate share of associated species, observed and predicted, in those cells
+  m <- fit_binomial_gam(train, responses$obligate_of_associated, rhs)
+  t_in <- test[inside & n_assoc > 0]
+  p_in <- if (nrow(t_in)) predict(m, newdata = t_in, type = "response") else numeric()
+  data.table(held_out = rl, cells = nrow(test),
+             median_coverage = median(test$coverage),
+             classified_species_cells = sum(test$n_classified),
+             share_cells_inside_training_range = mean(inside),
+             cells_inside = nrow(t_in),
+             obligate_observed_inside = if (nrow(t_in)) sum(t_in$n_obl) / sum(t_in$n_assoc) else NA,
+             obligate_predicted_inside = if (nrow(t_in))
+               sum(t_in$n_assoc * p_in) / sum(t_in$n_assoc) else NA)
+}))
+write_table(checks, file.path(dir_data_intermediate, "realm_transfer_checks_500km.csv"))
+print(checks, digits = 2)
+```
+
+```{r clear_realm_transfer_checks, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Species climates
+
+Each classified species is described by the median climate of the pixels holding its records (`s02_build_assemblages`). Three nested contrasts are modelled with binomial mixed models (GAMs with random intercepts for subfamily and genus): ant-associated against non-associated species, obligate against facultative associates, and parasites against obligate mutualists. Each predictor is split into the mean of the species' genus (between-genus component) and the species' deviation from it (within-genus component; van de Pol & Wright 2009). A within-genus association means that congeners in different climates differ in strategy; a between-genus association alone is consistent with lineages that differ in strategy and happen to occupy different climates, which climate need not explain. Predictors are standardised over the species of each contrast, so the coefficients are log odds ratios per standard deviation.
+
+*Inputs:* s02/species_climate.csv
+*Outputs:* species_models.csv, plot_species_models.png
+
+```{r species_models}
+sp <- fread(file.path(dir_s02, "species_climate.csv"))
+sp <- sp[interaction_type %in% c("n", "f", "m", "p")]
+sp[, `:=`(genus = factor(genus), subfamily = factor(subfamily))]
+sp[, `:=`(log_bio12 = log10(bio12 + 1), log_aridity = log10(aridity_index))]
+
+# Species have no within-cell elevation SD; their median elevation takes its place
+species_vars <- all_vars
+names(species_vars)[names(species_vars) == "log_elevation_sd"] <- "elevation"
+species_vars[["elevation"]] <- "Elevation"
+sp <- sp[complete.cases(sp[, names(species_vars), with = FALSE])]
+cat("classified species with a climate:", nrow(sp), "\n")
+
+contrasts <- list(
+  associated = list(rows = sp$interaction_type %in% c("n", "f", "m", "p"),
+                    y = sp$interaction_type %in% c("f", "m", "p")),
+  obligate_of_associated = list(rows = sp$interaction_type %in% c("f", "m", "p"),
+                                y = sp$interaction_type %in% c("m", "p")),
+  parasite_of_obligate = list(rows = sp$interaction_type %in% c("m", "p"),
+                              y = sp$interaction_type %in% "p"))
+
+# --- One model per contrast and predictor, with within- and between-genus components ---
+species_fits <- rbindlist(lapply(names(contrasts), function(ct) {
+  dd <- droplevels(sp[contrasts[[ct]]$rows])
+  dd[, y := as.integer(contrasts[[ct]]$y[contrasts[[ct]]$rows])]
+  rbindlist(lapply(names(species_vars), function(v) {
+    x <- as.numeric(scale(dd[[v]]))
+    dd[, `:=`(x_between = ave(x, genus), x_within = x - ave(x, genus))]
+
+    # Random intercepts of subfamily and genus as random-effect smooths (mgcv, REML); lme4's
+    # glmer crashed on some contrasts with near-complete separation among genera
+    m <- tryCatch(gam(y ~ x_within + x_between + s(subfamily, bs = "re") + s(genus, bs = "re"),
+                      data = dd, family = binomial, method = "REML"),
+                  error = function(e) NULL)
+    if (is.null(m)) return(NULL)
+    cf <- summary(m)$p.table
+    data.table(contrast = ct, variable = v, species = nrow(dd), events = sum(dd$y),
+               genera = uniqueN(dd$genus),
+               term = c("within_genus", "between_genus"),
+               estimate = cf[c("x_within", "x_between"), "Estimate"],
+               se = cf[c("x_within", "x_between"), "Std. Error"],
+               p = cf[c("x_within", "x_between"), "Pr(>|z|)"])
+  }))
+}))
+write_table(species_fits, file.path(dir_data_intermediate, "species_models.csv"))
+print(species_fits[p < 0.05, .(contrast, variable, term, estimate = round(estimate, 2),
+                               p = signif(p, 2))][order(contrast, term, p)])
+
+# --- Figure: coefficients with 95% intervals ---
+species_fits[, variable := factor(variable, rev(names(species_vars)), rev(species_vars))]
+p <- ggplot(species_fits, aes(estimate, variable, colour = term)) +
+  geom_vline(xintercept = 0, colour = "grey60") +
+  geom_pointrange(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se),
+                  position = position_dodge(width = 0.6), size = 0.25) +
+  facet_wrap(~ contrast, nrow = 1, scales = "free_x") +
+  scale_colour_manual(values = c(within_genus = "#B73779", between_genus = "grey40"),
+                      name = NULL) +
+  labs(x = "Log odds ratio per SD", y = NULL) +
+  theme_minimal(base_size = 9) +
+  theme(legend.position = "bottom")
+ggsave(file.path(dir_data_intermediate, "plot_species_models.png"), p,
+       width = 11, height = 5, dpi = 150, bg = "white", device = ragg::agg_png)
+p
+```
+
+```{r clear_species_models, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Maps of observed and climate-predicted proportions
+
+For the obligate share of associated species, the observed cell proportions are mapped beside the fitted values of the climate model and its residuals (observed minus fitted), to show where climate under- or over-predicts obligate associations.
+
+*Inputs:* s02/cell_data_500km.csv
+*Outputs:* plot_obligate_climate_fit_500km.png
+
+```{r map_climate_fit}
+d <- read_cells(500)
+m <- fit_binomial_gam(d, responses$obligate_of_associated, climate_terms(names(all_vars)))
+d <- d[n_assoc > 0]
+d[, `:=`(observed = n_obl / n_assoc, fitted = fitted(m))]
+d[, residual := observed - fitted]
+layers <- map_layers(equal_area_cell_polygons(as.data.frame(d), cell_km = 500))
+p <- plot_grid_map(layers, "observed", "Observed obligate share", magma_colours, limits = c(0, 1)) +
+  plot_grid_map(layers, "fitted", "Climate-fitted obligate share", magma_colours,
+                limits = c(0, 1)) +
+  plot_grid_map(layers, "residual", "Observed - fitted", c("#2166AC", "white", "#B2182B"),
+                midpoint = 0) +
+  plot_layout(ncol = 1)
+ggsave(file.path(dir_data_intermediate, "plot_obligate_climate_fit_500km.png"), p,
+       width = 6, height = 10, dpi = 150, bg = "white", device = ragg::agg_png)
+p
+```
+
+```{r clear_map_climate_fit, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+The R version and packages used to render this notebook are printed below.
+
+```{r save_r_environment}
+print(sessionInfo())
+```

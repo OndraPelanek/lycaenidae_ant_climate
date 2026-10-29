@@ -1,0 +1,432 @@
+---
+title: "Lycaenidae ant-interaction climate 19 - seasonal drought and obligacy within mixed genera"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+Precipitation seasonality was the one environmental property associated with obligacy once region and lineage were known (`s08`, `s11`), and the association held within genera (`s14`). An external review (29 October 2026) asked for this to be tested more rigorously and more transparently:
+
+1. **Drought, not only seasonality.** Precipitation seasonality (the coefficient of variation of monthly precipitation) is not the length or severity of a dry season. From the monthly WorldClim climate, each pixel gets the number of dry months (precipitation below twice the mean temperature, the Gaussen criterion), the longest run of consecutive dry months, and the precipitation of the driest month (WorldClim bio14). Their effects on obligacy and on obligate mutualism are estimated given region and lineage, as for seasonality.
+2. **Within genera, precisely.** The genera that contain both outcomes of a contrast are the only direct comparison among close relatives. A logistic regression with genus as a fixed effect estimates the within-genus effect of each property, and its null distribution comes from 9,999 permutations of the property among the species of each genus.
+3. **Every mixed genus shown.** For each genus with both obligate and facultative species: its species, region, evidence and the difference in seasonality and dry months between its obligate and facultative species, with an interval from resampling species within the genus.
+4. **Multiple testing.** Holm-adjusted p-values over all the environmental properties tested given region and lineage.
+5. **Nest-dwelling.** The data do not record where larvae develop. Obligate parasites develop in ant nests, so the comparison of parasites with mutualists tests whether the association is with life in nests; the recorded carnivory of larvae is tabulated as a further proxy.
+
+A full run takes about 15 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(mgcv)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+# Contrasts
+contrasts <- list(obligate = list(rows = c("f", "m", "p"), success = c("m", "p"),
+                                  label = "Obligate vs facultative"),
+                  mutualist = list(rows = c("f", "m"), success = "m",
+                                   label = "Obligate mutualist vs facultative"),
+                  parasite = list(rows = c("m", "p"), success = "p",
+                                  label = "Parasite vs mutualist"))
+
+# Properties: seasonality and the drought measures
+properties <- c(bio15 = "Precipitation seasonality (CV, %)", dry_months = "Dry months",
+                dry_run = "Longest run of dry months", bio14 = "Driest-month precipitation (mm)")
+
+# Permutations and bootstrap replicates
+n_perm <- 9999
+n_boot <- 2000
+
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s06 <- path_resrepo("data/intermediate/s06_test_stability")
+dir_s08 <- path_resrepo("data/intermediate/s08_test_southern_drivers")
+dir_data_intermediate <- path_resrepo("data/intermediate/s19_test_mixed_genera")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Read the 12 monthly WorldClim 2.1 layers of one variable from its zip archive
+read_monthly <- function(variable) {
+  zip <- file.path(dir_data_raw, "worldclim_2.1", paste0("wc2.1_10m_", variable, ".zip"))
+  files <- sort(grep("\\.tif$", unzip(zip, list = TRUE)$Name, value = TRUE))
+  rast(file.path("/vsizip", zip, files))
+}
+
+# Longest run of consecutive TRUE values in a circular year of 12 months
+longest_run <- function(x) {
+  if (anyNA(x)) return(NA_real_)
+  if (all(x == 1)) return(12)
+  r <- rle(c(x, x) == 1)
+  min(12, max(c(0, r$lengths[r$values])))
+}
+
+# Species of a contrast with the outcome coded, predictors standardised over these species
+contrast_data <- function(sp, ct) {
+  d <- copy(sp[interaction_type %in% contrasts[[ct]]$rows])
+  d[, `:=`(y = as.integer(interaction_type %in% contrasts[[ct]]$success),
+           region = factor(region), genus = factor(genus), subfamily = factor(subfamily))]
+  for (v in names(properties)) set(d, j = paste0(v, "_s"), value = as.numeric(scale(d[[v]])))
+  d
+}
+
+# Within-genus slope: logistic regression with genus as a fixed effect, on the genera that
+# contain both outcomes
+within_slope <- function(y, x, genus) {
+  fit <- suppressWarnings(glm.fit(cbind(x, model.matrix(~ genus - 1)), y, family = binomial()))
+  fit$coefficients[1]
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 8.5) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom", plot.tag = element_text(face = "bold", size = 11))
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Drought layers and the drought of each species
+
+*Inputs:* raw/worldclim_2.1/ monthly prec, tmin, tmax; s01/climate_present_10m.tif; s02/species_records.rds; s08/species_drivers.csv; raw/butterfly_ant_interactions/ species_table.csv, species_partners.csv
+*Outputs:* drought_10m.tif, species_drought.csv
+
+```{r drought_layers}
+prec <- read_monthly("prec")
+tavg <- (read_monthly("tmin") + read_monthly("tmax")) / 2
+dry <- prec < 2 * tavg
+drought <- c(sum(dry), app(dry, longest_run),
+             rast(file.path(dir_s01, "climate_present_10m.tif"))[["bio14"]])
+names(drought) <- c("dry_months", "dry_run", "bio14")
+writeRaster(drought, file.path(dir_data_intermediate, "drought_10m.tif"), overwrite = TRUE)
+
+# --- Median over each species' record pixels ---
+sp <- fread(file.path(dir_s08, "species_drivers.csv"), colClasses = c(pool_key = "character"))
+x <- readRDS(file.path(dir_s02, "species_records.rds"))
+x[, pool_key := as.character(pool_key)]
+x <- x[pool_key %in% sp$pool_key]
+x[, cell := cellFromXY(drought, cbind(decimalLongitude, decimalLatitude))]
+px <- unique(x[!is.na(cell), .(pool_key, cell)])
+v <- as.data.table(drought[px$cell])
+px <- cbind(px, v)
+med <- px[, lapply(.SD, median, na.rm = TRUE), by = pool_key, .SDcols = names(drought)]
+sp <- merge(sp[, setdiff(names(sp), names(drought)), with = FALSE], med, by = "pool_key")
+
+# --- Evidence basis and carnivory ---
+tab <- fread(file.path(dir_data_raw, "butterfly_ant_interactions", "species_table.csv"),
+             colClasses = c(pool_key = "character", gbif_key = "character"))
+partners <- fread(file.path(dir_data_raw, "butterfly_ant_interactions", "species_partners.csv"),
+                  colClasses = c(gbif_key = "character"))
+# One row per GBIF key: carnivorous if any of its rows is, with direct evidence if any row has it
+partners <- partners[, .(carnivory = if (all(is.na(carnivory))) NA_integer_ else
+                           max(carnivory, na.rm = TRUE),
+                         carnivory_direct = any(carnivory_basis == "direct")), by = gbif_key]
+tab <- merge(tab[, .(pool_key, gbif_key, interaction_type_basis)], partners, by = "gbif_key",
+             all.x = TRUE)
+# A species unit may pool several GBIF keys
+tab <- tab[, .(interaction_type_basis = interaction_type_basis[1],
+               carnivory = if (all(is.na(carnivory))) NA_integer_ else
+                 max(carnivory, na.rm = TRUE),
+               carnivory_direct = any(carnivory_direct %in% TRUE)), by = pool_key]
+sp <- merge(sp, tab, by = "pool_key", all.x = TRUE)
+write_table(sp, file.path(dir_data_intermediate, "species_drought.csv"))
+print(sp[, .(species = .N, bio15 = median(bio15), dry_months = median(dry_months),
+             dry_run = median(dry_run), bio14 = median(bio14)), by = interaction_type])
+print(round(cor(sp[, names(properties), with = FALSE], use = "complete.obs"), 2))
+```
+
+```{r clear_drought_layers, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Effects given region and lineage, with multiple-testing correction
+
+Each property is related to each contrast with region as a fixed effect and random intercepts of subfamily and genus (as in `s11`). The Holm adjustment for obligacy covers every property tested in this way: the LGM temperature anomaly (`s06`), the soil, fire and climate properties of `s08` and the drought measures here.
+
+*Inputs:* s19/species_drought.csv; s06/stability_effects.csv; s08/drivers_effects.csv
+*Outputs:* drought_effects.csv, holm_obligacy.csv
+
+```{r drought_effects}
+sp <- fread(file.path(dir_data_intermediate, "species_drought.csv"),
+            colClasses = c(pool_key = "character"))
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+effects <- rbindlist(lapply(names(contrasts), function(ct) {
+  d <- contrast_data(sp, ct)
+  rbindlist(lapply(names(properties), function(v) {
+    m <- gam(as.formula(paste("y ~ region +", paste0(v, "_s"), "+", lineage)), data = d,
+             family = binomial, method = "REML")
+    cf <- summary(m)$p.table[paste0(v, "_s"), ]
+    data.table(contrast = ct, property = v, species = nrow(d), events = sum(d$y),
+               estimate = cf[[1]], se = cf[[2]], p = cf[[4]])
+  }))
+}))
+write_table(effects, file.path(dir_data_intermediate, "drought_effects.csv"))
+print(effects, digits = 3)
+
+# --- Holm over every property tested for obligacy given region and lineage ---
+s06 <- fread(file.path(dir_s06, "stability_effects.csv"))[analysis == "All associated species"]
+s08 <- fread(file.path(dir_s08, "drivers_effects.csv"))[given_region == TRUE & driver != "bio15"]
+holm <- rbind(effects[contrast == "obligate", .(property, estimate, se, p, source = "s19")],
+              s06[, .(property = "lgm_anomaly_temperature", estimate, se, p, source = "s06")],
+              s08[, .(property = driver, estimate, se, p, source = "s08")])
+holm[, p_holm := p.adjust(p, method = "holm")]
+write_table(holm[order(p)], file.path(dir_data_intermediate, "holm_obligacy.csv"))
+print(holm[order(p)], digits = 3)
+```
+
+```{r clear_drought_effects, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Within genera: permutation tests
+
+For each contrast and property, the within-genus slope (logistic regression with genus as a fixed effect, standardised property) on the genera with both outcomes, and its null distribution from `r format(n_perm, big.mark = ",")` permutations of the property among the species of each genus.
+
+*Inputs:* s19/species_drought.csv
+*Outputs:* within_genus_tests.csv
+
+```{r within_genus}
+sp <- fread(file.path(dir_data_intermediate, "species_drought.csv"),
+            colClasses = c(pool_key = "character"))
+set.seed(20261029)
+tests <- rbindlist(lapply(names(contrasts), function(ct) {
+  d <- contrast_data(sp, ct)
+  mixed <- d[, .(both = uniqueN(y) == 2), by = genus][both == TRUE]$genus
+  d <- droplevels(d[genus %in% mixed])
+  idx <- split(seq_len(nrow(d)), d$genus)
+  rbindlist(lapply(names(properties), function(v) {
+    x <- as.numeric(scale(d[[v]]))
+    obs <- within_slope(d$y, x, d$genus)
+    null <- vapply(seq_len(n_perm), function(r) {
+      xp <- x
+      for (i in idx) xp[i] <- x[i][sample.int(length(i))]
+      within_slope(d$y, xp, d$genus)
+    }, numeric(1))
+    data.table(contrast = ct, property = v, genera = length(mixed), species = nrow(d),
+               events = sum(d$y), slope = obs,
+               null_low = quantile(null, 0.025), null_high = quantile(null, 0.975),
+               p_upper = (1 + sum(null >= obs)) / (n_perm + 1),
+               p_two_sided = (1 + sum(abs(null) >= abs(obs))) / (n_perm + 1))
+  }))
+}))
+write_table(tests, file.path(dir_data_intermediate, "within_genus_tests.csv"))
+print(tests, digits = 3)
+```
+
+```{r clear_within_genus, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Every mixed genus
+
+For each genus with both obligate and facultative species: its species of each strategy, region, evidence and the median seasonality and dry months of its obligate and facultative species, with the difference and its 95% interval from resampling species within each strategy of the genus.
+
+*Inputs:* s19/species_drought.csv
+*Outputs:* mixed_genera_full.csv, mixed_genera_species.csv
+
+```{r mixed_genera}
+sp <- fread(file.path(dir_data_intermediate, "species_drought.csv"),
+            colClasses = c(pool_key = "character"))
+mixed <- sp[, .(f = sum(interaction_type == "f"), o = sum(interaction_type %in% c("m", "p"))),
+            by = genus][f > 0 & o > 0]$genus
+d <- sp[genus %in% mixed]
+d[, group := fifelse(interaction_type == "f", "facultative", "obligate")]
+write_table(d[, .(genus, subfamily, species, interaction_type, group, region,
+                  interaction_type_basis, bio15, dry_months, dry_run, bio14)],
+            file.path(dir_data_intermediate, "mixed_genera_species.csv"))
+
+set.seed(20261029)
+boot_diff <- function(a, b) {
+  replicate(n_boot, median(a[sample.int(length(a), replace = TRUE)]) -
+              median(b[sample.int(length(b), replace = TRUE)]))
+}
+tab <- d[, {
+  o <- .SD[group == "obligate"]
+  f <- .SD[group == "facultative"]
+  bs <- boot_diff(o$bio15, f$bio15)
+  bd <- boot_diff(o$dry_months, f$dry_months)
+  list(subfamily = subfamily[1], facultative = nrow(f),
+       mutualist = sum(interaction_type == "m"), parasite = sum(interaction_type == "p"),
+       regions = paste(names(sort(table(region), decreasing = TRUE)), collapse = ", "),
+       main_region = names(which.max(table(region))),
+       species_specific = mean(interaction_type_basis %in% c("direct",
+                                                             "direct_class_inferred_subtype")),
+       seasonality_obligate = median(o$bio15), seasonality_facultative = median(f$bio15),
+       seasonality_difference = median(o$bio15) - median(f$bio15),
+       seasonality_low = quantile(bs, 0.025), seasonality_high = quantile(bs, 0.975),
+       dry_obligate = median(o$dry_months), dry_facultative = median(f$dry_months),
+       dry_difference = median(o$dry_months) - median(f$dry_months),
+       dry_low = quantile(bd, 0.025), dry_high = quantile(bd, 0.975))
+}, by = genus]
+tab[, obligate := mutualist + parasite]
+write_table(tab[order(-obligate, -seasonality_difference)],
+            file.path(dir_data_intermediate, "mixed_genera_full.csv"))
+print(tab[order(-obligate)], digits = 2)
+cat("Seasonality higher in obligate species:", tab[seasonality_difference > 0, .N], "of",
+    nrow(tab), "; with an interval above zero:", tab[seasonality_low > 0, .N],
+    "; below zero:", tab[seasonality_high < 0, .N], "\n")
+```
+
+```{r clear_mixed_genera, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Nest-dwelling and carnivory
+
+Obligate parasites develop in ant nests; obligate mutualists may or may not. The table gives, for each strategy, the species with recorded larval carnivory and the median seasonality and dry months.
+
+*Inputs:* s19/species_drought.csv
+*Outputs:* carnivory.csv
+
+```{r carnivory}
+sp <- fread(file.path(dir_data_intermediate, "species_drought.csv"),
+            colClasses = c(pool_key = "character"))
+carn <- sp[, .(species = .N, carnivory_recorded = sum(!is.na(carnivory)),
+               carnivorous = sum(carnivory == 1, na.rm = TRUE),
+               carnivory_direct = sum(carnivory_direct),
+               carnivorous_direct = sum(carnivory == 1 & carnivory_direct, na.rm = TRUE),
+               seasonality = median(bio15), dry_months = median(dry_months)),
+           by = .(strategy = interaction_type)]
+write_table(carn, file.path(dir_data_intermediate, "carnivory.csv"))
+print(carn)
+```
+
+```{r clear_carnivory, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) Every genus with both obligate and facultative species: the median precipitation seasonality of its facultative (blue) and obligate (orange) species, joined by a line, with the species as small points; genera ordered by the difference, labelled with their main region and species counts. (b) Within-genus slope of each property on obligacy and on obligate mutualism (genus fixed effects), against its permutation null (grey: 95% of 9,999 permutations). (c) Effects of each property given region and lineage (log odds per SD, 95% intervals), with Holm-adjusted p-values for obligacy.
+
+*Inputs:* s19/ mixed_genera_full.csv, mixed_genera_species.csv, within_genus_tests.csv, drought_effects.csv, holm_obligacy.csv
+*Outputs:* plot_mixed_genera.png
+
+```{r plot_mixed_genera}
+tab <- fread(file.path(dir_data_intermediate, "mixed_genera_full.csv"))
+spp <- fread(file.path(dir_data_intermediate, "mixed_genera_species.csv"))
+tests <- fread(file.path(dir_data_intermediate, "within_genus_tests.csv"))
+effects <- fread(file.path(dir_data_intermediate, "drought_effects.csv"))
+holm <- fread(file.path(dir_data_intermediate, "holm_obligacy.csv"))
+
+# --- a: dumbbells ---
+tab[, label := sprintf("%s (%s; %d obl., %d fac.)", genus, main_region, obligate, facultative)]
+lev <- tab[order(seasonality_difference)]$label
+tab[, label := factor(label, lev)]
+spp <- merge(spp, tab[, .(genus, label)], by = "genus")
+panel_a <- ggplot(tab, aes(y = label)) +
+  geom_segment(aes(x = seasonality_facultative, xend = seasonality_obligate, yend = label),
+               colour = "grey55", linewidth = 0.6) +
+  geom_point(data = spp, aes(x = bio15, colour = group), size = 0.9, alpha = 0.35,
+             position = position_jitter(height = 0.12, width = 0, seed = 1)) +
+  geom_point(aes(x = seasonality_facultative), colour = type_colours[["f"]], size = 2.6) +
+  geom_point(aes(x = seasonality_obligate), colour = type_colours[["m"]], size = 2.6) +
+  scale_colour_manual(values = c(facultative = type_colours[["f"]],
+                                 obligate = type_colours[["m"]]), name = NULL) +
+  labs(x = "Precipitation seasonality (CV, %)", y = NULL,
+       title = "Obligate and facultative species of the same genus") +
+  theme_figure() + theme(axis.text.y = element_text(size = 7.5, face = "italic"))
+
+# --- b: within-genus permutation tests ---
+tests[, `:=`(property = factor(properties[property], rev(properties)),
+             contrast = factor(sapply(contrasts, `[[`, "label")[contrast],
+                               sapply(contrasts, `[[`, "label")))]
+tb <- tests[contrast != "Parasite vs mutualist"]
+panel_b <- ggplot(tb, aes(y = property)) +
+  geom_linerange(aes(xmin = null_low, xmax = null_high), colour = "grey80", linewidth = 3) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_point(aes(x = slope), size = 2.2) +
+  geom_text(aes(x = slope, label = sprintf("p = %.4f", p_two_sided)), vjust = -1, size = 2.3,
+            colour = "grey30") +
+  facet_wrap(~ contrast, ncol = 1) +
+  scale_x_continuous(expand = expansion(mult = 0.15)) +
+  labs(x = "Within-genus slope (log odds per SD; grey: 95% of permutations)", y = NULL,
+       title = "Within genera, against permutations") +
+  theme_figure()
+
+# --- c: given region and lineage ---
+effects[, `:=`(property = factor(properties[property], rev(properties)),
+               contrast = factor(sapply(contrasts, `[[`, "label")[contrast],
+                                 sapply(contrasts, `[[`, "label")))]
+panel_c <- ggplot(effects, aes(estimate, property, colour = contrast)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), width = 0,
+                linewidth = 0.5, orientation = "y", position = position_dodge(width = 0.6)) +
+  geom_point(size = 2, position = position_dodge(width = 0.6)) +
+  scale_colour_manual(values = c("#3B3B3B", "#E69F00", "#CC79A7"), name = NULL) +
+  labs(x = "Effect given region and lineage (log odds per SD, 95% CI)", y = NULL,
+       title = "Given region and lineage: drier climates, for mutualists only",
+       subtitle = sprintf("Holm-adjusted p for obligacy (%d properties): dry months %.3f, seasonality %.3f",
+                          nrow(holm), holm[property == "dry_months"]$p_holm,
+                          holm[property == "bio15"]$p_holm)) +
+  guides(colour = guide_legend(ncol = 1)) +
+  theme_figure()
+
+fig <- panel_a / (panel_b | panel_c) + plot_layout(heights = c(1.1, 1)) +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")")
+save_figure(fig, "plot_mixed_genera", 10, 10)
+fig
+```
+
+```{r clear_plot_mixed_genera, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

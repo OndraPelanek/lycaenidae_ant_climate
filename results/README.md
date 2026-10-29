@@ -1,7 +1,3 @@
-# Results of analyses
+# Results
 
-The final results from a given analyses will be stored here. Ideally, use a set
-of directories corresponding to the scripts in the `code` directory that
-generated the files (e.g. the script `/code/s01_process_data.R` will save to
-`results/s01_process_data`). This approach makes it easy to track where
-results come from.
+Rendered notebooks are saved in `results/<notebook>/<notebook>.html` by `resrepo::knit_to_results()`; they may be generated locally but are not versioned. Tables and figures of each notebook are stored in the corresponding versioned `data/intermediate/s0*` folder. The R Markdown sources in `code/` are the canonical analysis documents.

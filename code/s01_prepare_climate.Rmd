@@ -1,0 +1,457 @@
+---
+title: "Lycaenidae ant-interaction climate 01 - climate of the grid cells"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+This is the first of the notebooks of the climate study. It describes present and past climate in the cells of the global Equal Earth grid used by `butterfly_ant_interactions` for the maps of interaction strategies (Fig. 1 of that study), so that the proportions of the strategies can later be related to climate.
+
+Present climate is taken from WorldClim 2.1 at 10 arc-minutes (Fick & Hijmans 2017): annual mean temperature, temperature seasonality, the warmest and coldest monthly extremes, annual precipitation, precipitation of the driest month and precipitation seasonality, an aridity index from Hargreaves potential evapotranspiration, and elevation and its variation within each cell. Productivity, the anomaly of the Last Glacial Maximum (21,000 years ago), the velocity of climate change since then and the variability of climate over the last 800,000 years are taken from the palaeoclimate reconstructions of Krapp et al. (2021), read with `pastclim` (Leonardi et al. 2023). Each cell is also assigned its majority biogeographic realm and biome (RESOLVE Ecoregions 2017; Dinerstein et al. 2017).
+
+All variables are summarised in square cells of 250, 500 and 1,000 km in the Equal Earth projection, with the cell indices of `butterfly_ant_interactions`, so that cell tables of the two repositories can be joined by their cell ids. The 10-arc-minute layers are also written for the species-level climate summaries of `s02_build_assemblages`. A full run takes about 15 min.
+
+# Setup
+
+## Packages
+
+`terra` reads and processes the rasters, `pastclim` the palaeoclimate reconstructions, `sf` the ecoregions and projections, `data.table` the cell tables and `ggplot2` with `patchwork` the maps; `rnaturalearth` and `scales` are called with `::`.
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(pastclim)
+library(sf)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+The cell sizes, the times of the palaeoclimate summaries and the smallest spatial gradients of the velocity calculation are fixed here.
+
+```{r setup_variables}
+# Cell sides of the Equal Earth grids (km); 500 km is the grid of the interaction maps
+cell_sizes_km <- c(250, 500, 1000)
+
+# Palaeoclimate reconstruction and its times (years before present)
+palaeo_dataset <- "Krapp2021"
+time_present_bp <- 0
+time_lgm_bp <- -21000
+years_since_lgm <- 21000
+
+# Smallest spatial gradients of the velocity calculation: 0.001 degC per km for temperature and
+# 0.0001 per km for log precipitation (about 0.01% per km), so that flat climates have large
+# but finite velocities
+min_gradient_temperature <- 0.001
+min_gradient_precipitation <- 0.0001
+
+# Sequential palette of the maps (light = low, dark = high), as in butterfly_ant_interactions
+magma_colours <- c("#FCFDBF", "#FC8961", "#B73779", "#51127C", "#000004")
+```
+
+## Folders
+
+The WorldClim layers, the `pastclim` files and the ecoregions are read from the versioned raw data; outputs are written to this notebook's folder in the versioned intermediate data.
+
+```{r setup_folders}
+# Raw data
+dir_data_raw <- path_resrepo("data/raw")
+dir_worldclim <- file.path(dir_data_raw, "worldclim_2.1")
+dir_pastclim <- file.path(dir_data_raw, "pastclim")
+
+# Outputs of this notebook
+dir_data_intermediate <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+
+# pastclim reads its files from the raw data, without changing the user's pastclim settings
+set_data_path(path_to_nc = dir_pastclim, ask = FALSE, write_config = FALSE,
+              copy_example = FALSE)
+```
+
+## Functions
+
+`write_table()` writes the output tables; `projections.R` gives the Equal Earth projection, `climate.R` the aridity, velocity and cell summaries and `maps.R` the map style of `butterfly_ant_interactions`.
+
+```{r load_functions}
+# Output tables
+source(here::here("code", "R", "write_table.R"))
+
+# Equal Earth projection, climate summaries and maps
+source(here::here("code", "R", "projections.R"))
+source(here::here("code", "R", "climate.R"))
+source(here::here("code", "R", "maps.R"))
+```
+
+WorldClim layers are read directly from their zip archives.
+
+```{r define_helpers}
+# Read the WorldClim 2.1 10-arc-minute layers of one archive, e.g. "tmin" gives the 12 monthly
+# layers and "bio" the 19 bioclimatic variables (named bio01 ... bio19)
+read_worldclim <- function(archive) {
+  zip <- file.path(dir_worldclim, paste0("wc2.1_10m_", archive, ".zip"))
+  files <- unzip(zip, list = TRUE)$Name
+  files <- files[grepl("\\.tif$", files)]
+  if (archive == "bio") {
+    number <- as.integer(sub(".*_bio_(\\d+)\\.tif$", "\\1", files))
+    files <- files[order(number)]
+  }
+  r <- rast(file.path("/vsizip", zip, files))
+  if (archive == "bio") names(r) <- sprintf("bio%02d", seq_len(nlyr(r)))
+  r
+}
+```
+
+Each section below reads its inputs from disk and ends by removing its objects (in a hidden chunk), so only the objects defined in this setup carry over from one section to the next.
+
+```{r keep_setup_objects}
+# Objects of the setup, kept when each section clears its own objects
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Present climate
+
+The present climate (1970-2000) of WorldClim 2.1 is used at 10 arc-minutes (about 18 km at the equator). Annual potential evapotranspiration is estimated by the Hargreaves equation from monthly minimum and maximum temperatures and extraterrestrial radiation, and the aridity index is annual precipitation divided by it (as in the CGIAR Global Aridity Index; values below 0.2 are arid, above 0.65 humid). Elevation is summarised as its mean and its area-weighted standard deviation in each cell, a measure of topographic heterogeneity.
+
+*Inputs:* raw/worldclim_2.1/ wc2.1_10m_bio.zip, wc2.1_10m_tmin.zip, wc2.1_10m_tmax.zip, wc2.1_10m_elev.zip
+*Outputs:* climate_present_10m.tif (the variables used at species level)
+
+```{r present_climate}
+# --- Bioclimatic variables and elevation ---
+bio <- read_worldclim("bio")
+elev <- read_worldclim("elev")
+names(elev) <- "elevation"
+
+# --- Aridity index ---
+# Hargreaves PET from the monthly temperatures, pixel by pixel on land
+tmin <- read_worldclim("tmin")
+tmax <- read_worldclim("tmax")
+land <- which(!is.na(values(bio[["bio01"]], mat = FALSE)))
+latitude <- yFromCell(bio, land)
+pet <- hargreaves_pet(values(tmin)[land, ], values(tmax)[land, ], latitude)
+pet_rast <- rast(bio[["bio01"]], vals = NA_real_)
+pet_rast[land] <- pet
+names(pet_rast) <- "pet"
+aridity <- bio[["bio12"]] / pet_rast
+names(aridity) <- "aridity_index"
+
+# --- Layers used at species level ---
+present <- c(bio[[c("bio01", "bio04", "bio05", "bio06", "bio12", "bio14", "bio15")]],
+             pet_rast, aridity, elev)
+present <- mask(present, bio[["bio01"]])
+writeRaster(present, file.path(dir_data_intermediate, "climate_present_10m.tif"),
+            overwrite = TRUE)
+present
+```
+
+```{r clear_present_climate, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Productivity and the Last Glacial Maximum
+
+Net primary productivity (NPP) is the present value of the reconstruction of Krapp et al. (2021), at 0.5 degrees. The anomaly of the Last Glacial Maximum is the change from 21,000 years ago to the present in the same reconstruction, which avoids differences between a simulation and observations. Temperature is used directly and precipitation on a log scale, so that its anomaly is a proportional change (log(P + 1)).
+
+Velocity of climate change since the Last Glacial Maximum follows Sandel et al. (2011): the anomaly, bilinearly interpolated to 10 arc-minutes and divided by the 21,000 years, is divided by the present spatial gradient of the same variable from WorldClim. Velocity (km per year) is the speed at which a population would have had to move to keep the same climate. Very flat climates have small gradients and large velocities; gradients are bounded below (see Variables), and velocities are log10-transformed before they are summarised.
+
+The reconstruction has no climate under the ice sheets of the LGM, which covered much of Canada and northern Europe. Leaving these areas without values would drop the most glaciated regions from every analysis of past climate. Instead, the anomaly under the ice is filled from the nearest ice-free pixels, a lower bound of the change. Velocity there is the distance to the nearest ice-free land of the LGM divided by 21,000 years, the slowest rate at which the area could have been recolonised. The LGM ice cover of each pixel is kept (`lgm_ice`), so cells and species with filled values can be identified and the results checked without them.
+
+*Inputs:* raw/pastclim/ Krapp2021_bio01, bio12 and npp files; s01/climate_present_10m.tif
+*Outputs:* climate_past_10m.tif (anomalies and velocities at 10 arc-minutes)
+
+```{r last_glacial_maximum}
+# --- Present productivity and the two time slices of the reconstruction ---
+past <- region_slice(time_bp = time_lgm_bp, bio_variables = c("bio01", "bio12"),
+                     dataset = palaeo_dataset)
+now <- region_slice(time_bp = time_present_bp, bio_variables = c("bio01", "bio12", "npp"),
+                    dataset = palaeo_dataset)
+
+# --- Ice at the LGM ---
+# The reconstruction has no climate under the LGM ice sheets (the files themselves are empty
+# there). Present land under ice is therefore defined as present land without a climate at
+# 21 ka; the BIOME4 ice biome of pastclim's get_ice_mask() is much wider and is not used.
+ice <- ifel(!is.na(now[["bio01"]]) & is.na(past[["bio01"]]), 1, 0)
+
+# --- Anomalies (present minus LGM) ---
+# Under the ice, the anomaly is filled from the nearest ice-free pixels (repeated 3 x 3 means
+# into empty pixels), which gives a lower bound of the change there; the share of a cell or a
+# species' range under ice is kept, so the filled values can be identified.
+present <- rast(file.path(dir_data_intermediate, "climate_present_10m.tif"))
+anomaly <- c(now[["bio01"]] - past[["bio01"]],
+             log(now[["bio12"]] + 1) - log(past[["bio12"]] + 1))
+names(anomaly) <- c("lgm_anomaly_temperature", "lgm_anomaly_log_precipitation")
+target <- !is.na(now[["bio01"]])
+for (i in 1:200) {
+  missing <- global(target & is.na(anomaly[[1]]), "sum")[[1]]
+  if (missing == 0) break
+  anomaly <- cover(anomaly, focal(anomaly, w = 3, fun = "mean", na.policy = "only",
+                                  na.rm = TRUE))
+}
+cat("filling of the anomaly under the ice: iterations", i, "; pixels left", missing, "\n")
+anomaly <- mask(anomaly, now[["bio01"]])
+anomaly_10m <- mask(resample(anomaly, present, method = "bilinear"), present[["bio01"]])
+
+# --- Velocities ---
+# Outside the ice: anomaly over time divided by the present spatial gradient (Sandel et al.
+# 2011). Under the ice, where the climate of the LGM is undefined, the velocity is the distance
+# to the nearest ice-free land of the LGM divided by the 21,000 years: the slowest rate at which
+# the area could have been recolonised.
+vt <- climate_velocity(anomaly_10m[["lgm_anomaly_temperature"]], present[["bio01"]],
+                       years_since_lgm, min_gradient_temperature)
+vp <- climate_velocity(anomaly_10m[["lgm_anomaly_log_precipitation"]],
+                       log(present[["bio12"]] + 1), years_since_lgm,
+                       min_gradient_precipitation)
+ice_10m <- mask(resample(ice, present, method = "near"), present[["bio01"]])
+names(ice_10m) <- "lgm_ice"
+distance_km <- resample(distance(past[["bio01"]]), present, method = "bilinear") / 1000
+ice_velocity <- distance_km / years_since_lgm
+velocity <- c(log10(ifel(ice_10m == 1, ice_velocity, vt[["velocity"]])),
+              log10(ifel(ice_10m == 1, ice_velocity, vp[["velocity"]])))
+names(velocity) <- c("log10_velocity_temperature", "log10_velocity_precipitation")
+cat("present land under LGM ice:",
+    round(100 * global(ice_10m, "mean", na.rm = TRUE)[[1]], 1), "% of pixels\n")
+
+# --- NPP at 10 arc-minutes ---
+npp_10m <- mask(resample(now[["npp"]], present, method = "bilinear"), present[["bio01"]])
+names(npp_10m) <- "npp"
+
+# --- Write the past-climate layers ---
+past_10m <- c(npp_10m, anomaly_10m, velocity, ice_10m)
+writeRaster(past_10m, file.path(dir_data_intermediate, "climate_past_10m.tif"),
+            overwrite = TRUE)
+
+# Share of pixels at the lower gradient bound, and the agreement of the reconstruction's present
+# temperature with WorldClim (a check of the reconstruction)
+gt <- values(vt[["gradient"]], mat = FALSE)
+gp <- values(vp[["gradient"]], mat = FALSE)
+cat("pixels at the gradient bound: temperature",
+    round(mean(gt < min_gradient_temperature, na.rm = TRUE), 3), "; precipitation",
+    round(mean(gp < min_gradient_precipitation, na.rm = TRUE), 3), "\n")
+check <- values(c(resample(now[["bio01"]], present, method = "bilinear"), present[["bio01"]]))
+cat("correlation of present temperature, Krapp2021 vs WorldClim:",
+    round(cor(check[, 1], check[, 2], use = "complete.obs"), 3), "\n")
+past_10m
+```
+
+```{r clear_last_glacial_maximum, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Climate variability over the last 800,000 years
+
+The variability of climate over the glacial-interglacial cycles is the standard deviation of the 800 millennial time slices of the reconstruction (0 to 799,000 years ago) at each 0.5-degree pixel, for temperature and log precipitation, together with the standard deviation over the last 22 slices (since the Last Glacial Maximum). Low values mark climatically stable regions (Dynesius & Jansson 2000; Jansson 2003). Pixels that are sea today are excluded.
+
+`pastclim` leaves ice-covered times without values, so in about a quarter of the present land pixels (those glaciated at some time) a standard deviation would describe only the ice-free times. The standard deviations are therefore kept only for pixels with a complete series, and the share of the 800 time slices without values (ice cover) is kept as a separate measure of glacial history.
+
+Two properties of the reconstruction limit what these measures can show. Krapp et al. (2021) is a statistical emulation in which the climate of each pixel follows a few global modes of variation, so the 800-kyr time series of a pixel correlates closely with the global mean series (median r = 0.93 in a check of 2,000 pixels, 28 October 2026). As a consequence, the standard deviations measure the local amplitude of one glacial-interglacial cycle and are almost the same quantity as the LGM anomaly (pixel correlation 0.99 for temperature). They are kept for completeness and for maps, but they are not independent tests of different historical mechanisms; velocity, which also depends on the spatial gradient, and ice cover differ from the anomaly.
+
+*Inputs:* raw/pastclim/ Krapp2021_bio01 and bio12 files
+*Outputs:* climate_variability_30m.tif
+
+```{r climate_variability}
+# --- Time series of the reconstruction ---
+times <- get_time_bp_steps(palaeo_dataset)
+series <- region_series(time_bp = times, bio_variables = c("bio01", "bio12"),
+                        dataset = palaeo_dataset)
+temperature <- series[["bio01"]]
+log_precipitation <- log(series[["bio12"]] + 1)
+
+# Present land: pixels with a present value
+land <- ifel(is.na(temperature[[which(time_bp(temperature) == 0)]]), NA, 1)
+
+# Share of the time slices without values (ice cover) at each pixel
+ice_share <- app(is.na(temperature), mean)
+
+# --- Standard deviations over all slices and since the LGM, for complete series only ---
+recent <- which(time_bp(temperature) >= -21000)
+complete <- ifel(ice_share > 0, NA, 1)
+variability <- c(mask(app(temperature, sd), complete),
+                 mask(app(log_precipitation, sd), complete),
+                 mask(app(temperature[[recent]], sd), complete),
+                 mask(app(log_precipitation[[recent]], sd), complete),
+                 ice_share)
+names(variability) <- c("sd800_temperature", "sd800_log_precipitation",
+                        "sd21_temperature", "sd21_log_precipitation", "ice_share_800")
+variability <- mask(variability, land)
+cat("present land pixels with ice in some slices:",
+    round(100 * global(mask(ice_share > 0, land), "mean", na.rm = TRUE)[[1]], 1), "%\n")
+writeRaster(variability, file.path(dir_data_intermediate, "climate_variability_30m.tif"),
+            overwrite = TRUE)
+cat("time slices:", nlyr(temperature), "; since the LGM:", length(recent), "\n")
+variability
+```
+
+```{r clear_climate_variability, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Realms and biomes
+
+Each 10-arc-minute pixel is assigned the biogeographic realm and biome of the RESOLVE ecoregion covering its centre (Dinerstein et al. 2017); the majority class of each cell is chosen later, weighted by pixel area. Rock and ice and the ecoregions without a realm are left unassigned.
+
+*Inputs:* raw/resolve_2017/Ecoregions2017.zip; s01/climate_present_10m.tif
+*Outputs:* realm_biome_10m.tif, realm_biome_codes.csv
+
+```{r realms_biomes}
+# --- Ecoregions ---
+eco <- st_read(file.path("/vsizip", file.path(dir_data_raw, "resolve_2017", "Ecoregions2017.zip"),
+                         "Ecoregions2017.shp"), quiet = TRUE)
+eco <- eco[, c("REALM", "BIOME_NAME")]
+eco <- eco[!is.na(eco$REALM) & eco$REALM != "N/A" & eco$BIOME_NAME != "Rock and Ice", ]
+
+# --- Codes of realms and biomes ---
+codes <- rbind(
+  data.frame(layer = "realm", code = seq_along(sort(unique(eco$REALM))),
+             name = sort(unique(eco$REALM))),
+  data.frame(layer = "biome", code = seq_along(sort(unique(eco$BIOME_NAME))),
+             name = sort(unique(eco$BIOME_NAME))))
+eco$realm <- match(eco$REALM, codes$name[codes$layer == "realm"])
+eco$biome <- match(eco$BIOME_NAME, codes$name[codes$layer == "biome"])
+
+# --- Rasterise onto the 10-arc-minute grid ---
+template <- rast(file.path(dir_data_intermediate, "climate_present_10m.tif"))[["bio01"]]
+v <- vect(eco)
+rb <- c(rasterize(v, template, field = "realm"), rasterize(v, template, field = "biome"))
+names(rb) <- c("realm", "biome")
+rb <- mask(rb, template)
+writeRaster(rb, file.path(dir_data_intermediate, "realm_biome_10m.tif"), overwrite = TRUE,
+            datatype = "INT2S")
+write_table(codes, file.path(dir_data_intermediate, "realm_biome_codes.csv"))
+codes
+```
+
+```{r clear_realms_biomes, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Cell summaries
+
+The pixels are assigned to the cells of each grid by the projected position of their centres, as the occurrence records are in `butterfly_ant_interactions`, and each variable is averaged with the pixels weighted by their area. Elevation also gets its area-weighted standard deviation, velocities their medians (they are skewed even on the log scale), and realm and biome their majority class with the share of the cell it covers. The land area of a cell is the summed area of its land pixels; coastal and island cells can have little land.
+
+*Inputs:* s01/ climate_present_10m.tif, climate_past_10m.tif, climate_variability_30m.tif, realm_biome_10m.tif, realm_biome_codes.csv
+*Outputs:* cell_climate_250km.csv, cell_climate_500km.csv, cell_climate_1000km.csv
+
+```{r cell_summaries}
+# --- Layers ---
+present <- rast(file.path(dir_data_intermediate, "climate_present_10m.tif"))
+past <- rast(file.path(dir_data_intermediate, "climate_past_10m.tif"))
+rb <- rast(file.path(dir_data_intermediate, "realm_biome_10m.tif"))
+variability <- rast(file.path(dir_data_intermediate, "climate_variability_30m.tif"))
+codes <- fread(file.path(dir_data_intermediate, "realm_biome_codes.csv"))
+layers_10m <- c(present, past, rb)
+
+# Area of a 10-arc-minute pixel at the equator (km2); pixel areas scale with cos(latitude)
+pixel_km2 <- prod(res(present)) * (pi / 180 * 6371.0088)^2
+
+for (cell_km in cell_sizes_km) {
+  # --- Pixels of each cell ---
+  d <- pixels_to_cells(layers_10m, cell_km)
+  dv <- pixels_to_cells(variability, cell_km)
+
+  # --- Area-weighted means, medians and standard deviations ---
+  means <- summarise_cells(d, c(names(present), "npp", "lgm_anomaly_temperature",
+                                "lgm_anomaly_log_precipitation", "lgm_ice"))
+  setnames(means, "lgm_ice", "lgm_ice_share")
+  medians <- summarise_cells(d, c("log10_velocity_temperature",
+                                  "log10_velocity_precipitation"), fun = "median")
+  topo <- summarise_cells(d, "elevation", fun = "sd", suffix = "_sd")
+  var_means <- summarise_cells(dv, names(variability))
+
+  # --- Land area, realm and biome ---
+  area <- d[, .(n_pixels = .N, land_area_km2 = sum(weight) * pixel_km2,
+                cell_x = cell_x[1], cell_y = cell_y[1]), by = cell_id]
+  realm <- majority_class(d, "realm")
+  biome <- majority_class(d, "biome")
+  realm[, realm := codes[layer == "realm"]$name[match(realm, codes[layer == "realm"]$code)]]
+  biome[, biome := codes[layer == "biome"]$name[match(biome, codes[layer == "biome"]$code)]]
+
+  # --- Combine and write ---
+  cells <- Reduce(function(a, b) merge(a, b, by = "cell_id", all.x = TRUE),
+                  list(area, means, medians, topo, var_means, realm, biome))
+
+  # Cell centres in longitude and latitude
+  centres <- st_as_sf(data.frame(x = (cells$cell_x + 0.5) * cell_km * 1000,
+                                 y = (cells$cell_y + 0.5) * cell_km * 1000),
+                      coords = c("x", "y"), crs = global_equal_area_crs())
+  ll <- st_coordinates(st_transform(centres, 4326))
+  cells[, `:=`(cell_longitude = ll[, 1], cell_latitude = ll[, 2])]
+  setcolorder(cells, c("cell_id", "cell_x", "cell_y", "cell_longitude", "cell_latitude"))
+  write_table(cells, file.path(dir_data_intermediate,
+                               paste0("cell_climate_", cell_km, "km.csv")))
+  cat(cell_km, "km:", nrow(cells), "land cells\n")
+}
+```
+
+```{r clear_cell_summaries, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Maps of the climate variables
+
+The cell values of the 500-km grid are mapped for checking, on the land-clipped Equal Earth cells of the interaction maps.
+
+*Inputs:* s01/cell_climate_500km.csv
+*Outputs:* plot_cell_climate_500km.png
+
+```{r map_climate}
+cells <- read.csv(file.path(dir_data_intermediate, "cell_climate_500km.csv"))
+layers <- map_layers(equal_area_cell_polygons(cells, cell_km = 500))
+
+# --- One panel per variable ---
+variables <- c(bio01 = "Annual mean temperature (°C)", bio04 = "Temperature seasonality",
+               bio06 = "Min. temperature of coldest month (°C)",
+               bio12 = "Annual precipitation (mm)", bio15 = "Precipitation seasonality",
+               aridity_index = "Aridity index (P/PET)", npp = "Net primary productivity",
+               elevation_sd = "Elevation SD (m)",
+               lgm_anomaly_temperature = "LGM temperature anomaly (°C)",
+               lgm_anomaly_log_precipitation = "LGM log-precipitation anomaly",
+               log10_velocity_temperature = "log10 temperature velocity (km/yr)",
+               log10_velocity_precipitation = "log10 precipitation velocity (km/yr)",
+               sd800_temperature = "Temperature SD, 800 kyr (°C)",
+               sd800_log_precipitation = "Log-precipitation SD, 800 kyr",
+               ice_share_800 = "Share of 800 kyr under ice",
+               lgm_ice_share = "Share under ice at the LGM")
+panels <- lapply(names(variables), function(v) {
+  trans <- if (v %in% c("bio12", "aridity_index")) "log10" else "identity"
+  plot_grid_map(layers, v, variables[[v]], palette = magma_colours, trans = trans)
+})
+p <- wrap_plots(panels, ncol = 3)
+ggsave(file.path(dir_data_intermediate, "plot_cell_climate_500km.png"), p,
+       width = 11, height = 13, dpi = 150, bg = "white", device = ragg::agg_png)
+p
+```
+
+```{r clear_map_climate, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+The R version and packages used to render this notebook are printed below, with the versions of the geospatial libraries (GDAL, PROJ, GEOS) used by `sf` and `terra`.
+
+```{r save_r_environment}
+print(sessionInfo())
+
+# Geospatial libraries bundled with (Windows) or linked by (Linux, macOS) sf and terra
+if ("sf" %in% loadedNamespaces()) print(sf::sf_extSoftVersion())
+if ("terra" %in% loadedNamespaces()) print(terra::gdal(lib = "all"))
+```

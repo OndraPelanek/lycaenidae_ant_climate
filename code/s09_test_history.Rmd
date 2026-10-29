@@ -1,0 +1,349 @@
+---
+title: "Lycaenidae ant-interaction climate 09 - how the southern concentration of obligate associates arose"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+Obligate associates are concentrated at southern mid-latitudes in several subfamilies (`s06_test_stability`), and neither glacial stability nor the measured soils and fire describe this better than geography (`s08_test_southern_drivers`). This notebook asks how the concentration arose on the phylogeny. Two histories make different predictions:
+
+- **Repeated evolution in the south.** If southern environments favour obligate association, it should have evolved more often in southern lineages: the rate of gain of obligacy should be higher where lineages live in the south, and the origins should be many and spread over several lineages.
+- **Few origins, then diversification.** If the concentration reflects contingency, a few southern origins followed by radiations (such as *Lepidochrysops*) should account for most obligate species, with similar gain rates in both hemispheres.
+
+Two analyses on the genus-grafted trees of `s04_fit_phylogenetic_models` (the dated Yumnam tree, and the Schär tree as a check):
+
+1. **Correlated evolution** of obligacy and hemisphere (Pagel 1994; `phytools::fitPagel`), comparing a model in which the rates of gain and loss of obligacy depend on the hemisphere of the lineage with one in which they do not.
+2. **Stochastic character maps** of obligacy (100 simulations; `phytools::make.simmap`), counting the origins of obligacy, the region of the species descended from each origin, and the number of obligate species each origin led to.
+
+The hemisphere of a lineage is treated as a binary character that evolves on the tree, a simplification of its biogeographic history. Species of genera grafted onto the trees take positions from taxonomy alone, and the polytomies of the grafted genera are resolved at random with very short branches, so the analyses describe the deep structure of the history more reliably than its details within genera. A full run takes about 10 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(ape)
+library(phytools)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+# Obligate strategies; species of all four strategies enter the analyses
+obligate_types <- c("m", "p")
+classified_types <- c("n", "f", "m", "p")
+
+# Number of stochastic character maps
+n_simmaps <- 100
+
+# Shortest branch after resolving polytomies, as a share of the tree height
+min_branch_share <- 1e-4
+
+# Regions, as in s05
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+tree_labels <- c(yumnam_2025 = "Yumnam tree (dated)", schar_2018 = "Schär tree (Grafen)")
+
+# Colours of the interaction types, as in butterfly_ant_interactions
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+type_labels <- c(n = "Non-associated", f = "Facultative", m = "Obligate mutualist",
+                 p = "Obligate parasite")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s04 <- path_resrepo("data/intermediate/s04_fit_phylogenetic_models")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_data_intermediate <- path_resrepo("data/intermediate/s09_test_history")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Resolve the polytomies of a tree at random and give zero-length branches a small length, so
+# that the Mk models and stochastic maps can be fitted; the same seed gives the same resolution
+prepare_tree <- function(tr, seed = 1) {
+  set.seed(seed)
+  tr <- multi2di(tr, random = TRUE)
+  floor <- min_branch_share * max(node.depth.edgelength(tr))
+  tr$edge.length[tr$edge.length < floor] <- floor
+  tr
+}
+
+# Save a figure with ragg; width and height in inches
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Species on the trees
+
+Every classified species on the grafted trees is coded as obligate or not, and gets its hemisphere (the sign of the median latitude of its records) and its region (`s05_compare_regions`).
+
+*Inputs:* s04/grafted_trees.rds; s05/species_regions.csv; s02/species_records.rds
+*Outputs:* history_species.csv
+
+```{r history_species}
+trees <- readRDS(file.path(dir_s04, "grafted_trees.rds"))
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+sp <- sp[interaction_type %in% classified_types & !is.na(region)]
+x <- readRDS(file.path(dir_s02, "species_records.rds"))[pool_key %in% sp$pool_key]
+lat <- x[, .(signed_latitude = median(decimalLatitude)), by = pool_key]
+sp <- merge(sp, lat, by = "pool_key")
+sp[, `:=`(obligate = as.integer(interaction_type %in% obligate_types),
+          hemisphere = ifelse(signed_latitude < 0, "South", "North"))]
+sp <- sp[species %in% trees$yumnam_2025$tip.label | species %in% trees$schar_2018$tip.label]
+write_table(sp[, .(species, genus, subfamily, interaction_type, obligate, hemisphere, region)],
+            file.path(dir_data_intermediate, "history_species.csv"))
+print(sp[, .(species = .N, obligate = sum(obligate)), by = hemisphere])
+```
+
+```{r clear_history_species, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Correlated evolution of obligacy and hemisphere
+
+For each tree, `fitPagel` compares two continuous-time Markov models of the two binary characters (obligacy and hemisphere), each with all rates free (ARD): one in which they evolve independently and one in which the rates of gain and loss of obligacy depend on the hemisphere (`dep.var = "x"`). The likelihood-ratio test asks whether obligacy evolves differently in southern and northern lineages; the rates of the dependent model show how.
+
+*Inputs:* s04/grafted_trees.rds; s09/history_species.csv
+*Outputs:* pagel_tests.csv, pagel_rates.csv
+
+```{r pagel}
+trees <- readRDS(file.path(dir_s04, "grafted_trees.rds"))
+sp <- fread(file.path(dir_data_intermediate, "history_species.csv"))
+tests <- list()
+rates <- list()
+for (study in names(trees)) {
+  d <- sp[species %in% trees[[study]]$tip.label]
+  tr <- prepare_tree(keep.tip(trees[[study]], d$species))
+  ob <- setNames(ifelse(d$obligate == 1, "obligate", "not"), d$species)
+  hm <- setNames(d$hemisphere, d$species)
+  f <- fitPagel(tr, ob, hm, model = "ARD", dep.var = "x")
+  tests[[study]] <- data.table(tree = study, species = nrow(d), logL_independent = f$independent.logL,
+                               logL_dependent = f$dependent.logL, lr = f$lik.ratio, p = f$P,
+                               aic_independent = f$independent.AIC,
+                               aic_dependent = f$dependent.AIC)
+
+  # Rates of gain and loss of obligacy in each hemisphere (dependent model). States of the
+  # combined character are "obligacy|hemisphere"
+  q <- f$dependent.Q
+  get_rate <- function(from, to) q[from, to]
+  rates[[study]] <- data.table(
+    tree = study,
+    hemisphere = c("North", "South", "North", "South"),
+    change = c("Gain", "Gain", "Loss", "Loss"),
+    rate = c(get_rate("not|North", "obligate|North"), get_rate("not|South", "obligate|South"),
+             get_rate("obligate|North", "not|North"), get_rate("obligate|South", "not|South")))
+}
+tests <- rbindlist(tests)
+rates <- rbindlist(rates)
+write_table(tests, file.path(dir_data_intermediate, "pagel_tests.csv"))
+write_table(rates, file.path(dir_data_intermediate, "pagel_rates.csv"))
+print(tests, digits = 4)
+print(dcast(rates, tree + change ~ hemisphere, value.var = "rate"), digits = 3)
+```
+
+```{r clear_pagel, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Origins of obligacy
+
+On the Yumnam tree, `r n_simmaps` stochastic character maps of obligacy (ARD model) are drawn. In each, every branch on which the character changes from not obligate to obligate is an origin. Each origin is assigned to the region holding most of the obligate species descended from it, and the number of those species measures the radiation that followed (losses and regains within a clade make this approximate). The results summarise the number of origins per region and the species descended from them across the maps.
+
+*Inputs:* s04/grafted_trees.rds; s09/history_species.csv
+*Outputs:* origins_by_map.csv, origins_summary.csv
+
+```{r origins}
+trees <- readRDS(file.path(dir_s04, "grafted_trees.rds"))
+sp <- fread(file.path(dir_data_intermediate, "history_species.csv"))
+d <- sp[species %in% trees$yumnam_2025$tip.label]
+tr <- prepare_tree(keep.tip(trees$yumnam_2025, d$species))
+ob <- setNames(ifelse(d$obligate == 1, "1", "0"), d$species)
+set.seed(20261028)
+maps <- make.simmap(tr, ob, model = "ARD", nsim = n_simmaps, message = FALSE)
+n_tip <- Ntip(tr)
+region_of <- setNames(d$region, d$species)
+obligate_tip <- setNames(d$obligate == 1, d$species)
+
+# --- Origins in each map ---
+origins <- rbindlist(lapply(seq_along(maps), function(s) {
+  m <- maps[[s]]
+  rbindlist(lapply(seq_len(nrow(m$edge)), function(i) {
+    states <- names(m$maps[[i]])
+    gains <- sum(head(states, -1) == "0" & tail(states, -1) == "1")
+    if (gains == 0) return(NULL)
+    child <- m$edge[i, 2]
+    tips <- if (child <= n_tip) m$tip.label[child] else
+      m$tip.label[getDescendants(m, child)[getDescendants(m, child) <= n_tip]]
+    ob_tips <- tips[obligate_tip[tips]]
+    if (!length(ob_tips)) return(NULL)
+    rg <- names(sort(table(region_of[ob_tips]), decreasing = TRUE))[1]
+    data.table(map = s, edge = i, gains = gains, region = rg,
+               obligate_descendants = length(ob_tips),
+               genera = uniqueN(d[species %in% ob_tips]$genus),
+               genus_example = names(sort(table(d[species %in% ob_tips]$genus),
+                                          decreasing = TRUE))[1])
+  }))
+}))
+write_table(origins, file.path(dir_data_intermediate, "origins_by_map.csv"))
+
+# --- Summary across maps ---
+per_map <- origins[, .(origins = .N, obligate_species = sum(obligate_descendants)),
+                   by = .(map, region)]
+per_map <- merge(CJ(map = seq_len(n_simmaps), region = region_levels), per_map,
+                 by = c("map", "region"), all.x = TRUE)
+per_map[is.na(origins), `:=`(origins = 0L, obligate_species = 0L)]
+summary <- per_map[, .(origins_median = median(origins), origins_low = quantile(origins, 0.025),
+                       origins_high = quantile(origins, 0.975)), by = region]
+summary <- merge(summary, d[, .(classified = .N, obligate = sum(obligate),
+                                associated_lineages = uniqueN(genus[interaction_type != "n"])),
+                            by = region], by = "region")
+summary[, origins_per_10_associated_genera := 10 * origins_median / associated_lineages]
+write_table(summary, file.path(dir_data_intermediate, "origins_summary.csv"))
+print(summary[order(-origins_median)], digits = 3)
+cat("origins per map: median", median(origins[, .N, by = map]$N), "; range",
+    paste(range(origins[, .N, by = map]$N), collapse = "-"), "\n")
+```
+
+```{r clear_origins, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figures
+
+The first figure shows the tree with the strategy of each species and its hemisphere. The second shows (A) the ratio of the southern to the northern rates of gain and loss of obligacy under the dependent model, on both trees (whose time units differ), and (B) the origins of obligacy per region, each drawn as a point whose size is the number of obligate species descended from it (pooled over the stochastic maps), with the median number of origins per region.
+
+*Inputs:* s04/grafted_trees.rds; s09/ history_species.csv, pagel_rates.csv, pagel_tests.csv, origins_by_map.csv, origins_summary.csv
+*Outputs:* plot_history_tree.png, plot_history_origins.png
+
+```{r plot_tree, fig.width = 8, fig.height = 8}
+trees <- readRDS(file.path(dir_s04, "grafted_trees.rds"))
+sp <- fread(file.path(dir_data_intermediate, "history_species.csv"))
+d <- sp[species %in% trees$yumnam_2025$tip.label]
+tr <- ladderize(keep.tip(trees$yumnam_2025, d$species))
+d <- d[match(tr$tip.label, species)]
+
+# Fan tree with two rings: strategy (inner) and hemisphere (outer)
+draw_tree <- function() {
+  par(mar = c(0, 0, 0, 0))
+  plot(tr, type = "fan", show.tip.label = FALSE, edge.width = 0.25, edge.color = "grey35",
+       x.lim = c(-1.25, 1.25) * max(node.depth.edgelength(tr)),
+       y.lim = c(-1.25, 1.25) * max(node.depth.edgelength(tr)))
+  h <- max(node.depth.edgelength(tr))
+  ring(rep(0.06 * h, Ntip(tr)), tr, style = "ring", offset = 0.01 * h,
+       col = type_colours[d$interaction_type])
+  ring(rep(0.03 * h, Ntip(tr)), tr, style = "ring", offset = 0.08 * h,
+       col = ifelse(d$hemisphere == "South", "grey15", "grey80"))
+  legend("bottomleft", bty = "n", cex = 0.75, pch = 15, pt.cex = 1.3,
+         col = c(type_colours, "grey15", "grey80"),
+         legend = c(type_labels, "Southern Hemisphere", "Northern Hemisphere"))
+}
+ragg::agg_png(file.path(dir_data_intermediate, "plot_history_tree.png"), width = 8, height = 8,
+              units = "in", res = 300, background = "white")
+draw_tree()
+invisible(dev.off())
+draw_tree()
+```
+
+```{r plot_origins}
+rates <- fread(file.path(dir_data_intermediate, "pagel_rates.csv"))
+tests <- fread(file.path(dir_data_intermediate, "pagel_tests.csv"))
+origins <- fread(file.path(dir_data_intermediate, "origins_by_map.csv"))
+summary <- fread(file.path(dir_data_intermediate, "origins_summary.csv"))
+
+# --- A: southern relative to northern rates of gain and loss of obligacy ---
+# The two trees have different time units (millions of years, Grafen units), so rates are shown
+# as the ratio of the southern to the northern rate on a log scale
+ratio <- dcast(rates, tree + change ~ hemisphere, value.var = "rate")
+ratio <- merge(ratio, tests[, .(tree, p)], by = "tree")
+ratio[, `:=`(ratio = South / North,
+             tree_label = factor(tree_labels[tree], rev(tree_labels)),
+             change = factor(change, c("Gain", "Loss"),
+                             c("Gain of obligacy", "Loss of obligacy")),
+             label = ifelse(p < 0.001, "dependent model: p < 0.001",
+                            sprintf("dependent model: p = %.2f", p)))]
+panel_a <- ggplot(ratio, aes(ratio, tree_label)) +
+  geom_vline(xintercept = 1, colour = "grey55", linewidth = 0.4) +
+  geom_segment(aes(x = 1, xend = ratio, yend = tree_label), linewidth = 0.6,
+               colour = "grey40") +
+  geom_point(aes(fill = p < 0.05), shape = 21, size = 2.6, stroke = 0.6) +
+  geom_text(aes(label = label), vjust = -1.1, size = 2.4, colour = "grey30") +
+  facet_wrap(~ change, ncol = 1) +
+  scale_x_log10(breaks = c(0.01, 0.1, 1, 10), labels = c("1/100", "1/10", "1", "10"),
+                limits = c(0.005, 20)) +
+  scale_fill_manual(values = c(`TRUE` = "black", `FALSE` = "white"), guide = "none") +
+  labs(x = "Southern rate / northern rate (log scale)", y = NULL,
+       title = "Obligacy in southern relative to northern lineages") +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        strip.text = element_text(face = "bold", hjust = 0),
+        plot.title = element_text(face = "bold", size = 9.5))
+
+# --- B: origins per region, sized by the obligate species they led to ---
+origins[, region := factor(region, rev(region_levels))]
+summary[, region := factor(region, rev(region_levels))]
+panel_b <- ggplot(origins, aes(obligate_descendants, region)) +
+  geom_jitter(aes(size = obligate_descendants), height = 0.22, width = 0, alpha = 0.06,
+              colour = "grey20", stroke = 0) +
+  geom_text(data = summary[origins_median > 0 | obligate > 0],
+            aes(x = Inf, y = region,
+                label = sprintf("%g origin%s / %d obligate spp.", origins_median,
+                                ifelse(origins_median == 1, "", "s"), obligate)),
+            inherit.aes = FALSE, hjust = 1.02, size = 2.5, colour = "grey15") +
+  scale_x_log10(expand = expansion(mult = c(0.05, 0.6))) +
+  scale_size_area(max_size = 6, guide = "none") +
+  labs(x = "Obligate species descended from an origin (log scale)", y = NULL,
+       title = "Origins of obligacy and the radiations that followed") +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        plot.title = element_text(face = "bold", size = 9.5))
+
+fig <- (panel_a | panel_b) + plot_layout(widths = c(1, 1.5)) +
+  plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(face = "bold", size = 12))
+save_figure(fig, "plot_history_origins", 11, 4.8)
+fig
+```
+
+```{r clear_plots, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

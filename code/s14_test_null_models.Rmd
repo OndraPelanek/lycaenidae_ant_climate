@@ -1,0 +1,415 @@
+---
+title: "Lycaenidae ant-interaction climate 14 - null models and matched-only trees"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+The external review of 28 October 2026 asked how surprising two results are under null models that keep the structure of lineages, and whether the origins of obligacy survive without grafted species. This notebook adds three checks:
+
+1. **Seasonality within genera (`s11`).** Obligate species live in more seasonal climates than their congeners. Under the null hypothesis, a species' precipitation seasonality is unrelated to its strategy within its genus. Seasonality is permuted among the species of each genus (keeping each genus's climates, its strategies and the region of each species), and the within-genus effect is re-estimated.
+2. **Lineage turnover along gradients (`s05`).** Within regions, the composition expected from the lineages present reproduced most of the observed composition gradients. Because the lineage expectation is built from the observed strategies, agreement is partly built in. Under the null hypothesis that strategies vary within genera at random with respect to place, strategies are permuted among the species of each genus (keeping the composition of every genus). The null distribution of the part of each gradient not reproduced by lineages (observed minus expected slope) shows whether strategies change within lineages along gradients more than chance.
+3. **Origins on matched-only trees (`s09`, `s10`).** Stochastic maps of obligacy on the published trees pruned to the species matched to their tips, without grafting, on both trees.
+
+A full run takes about 20 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(mgcv)
+library(ape)
+library(phytools)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+# Permutations
+n_perm_seasonality <- 199
+n_perm_gradients <- 199
+
+# Contrasts of the seasonality null (s11)
+contrasts <- list(obligate = list(rows = c("f", "m", "p"), success = c("m", "p"),
+                                  label = "Obligate vs facultative"),
+                  mutualist = list(rows = c("f", "m"), success = "m",
+                                   label = "Obligate mutualist vs facultative"))
+
+# Gradients of s05: hexagons of resolution 5 with at least this many classified species, regions
+# with at least 15 such hexagons, and slopes reported when the observed slope exceeds this
+min_classified <- 10
+min_cells <- 15
+min_slope <- 0.3
+gvars <- c(bio01 = "Temperature", log_aridity = "Aridity", lgm_anomaly_temperature = "LGM anomaly")
+
+# Stochastic maps on the matched-only trees, and branch lengths as in s04
+n_simmaps <- 100
+branch <- c(yumnam_2025 = "published", schar_2018 = "grafen")
+min_branch_share <- 1e-4
+
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+type_labels <- c(n = "Non-associated", f = "Facultative", m = "Obligate mutualist",
+                 p = "Obligate parasite")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_s08 <- path_resrepo("data/intermediate/s08_test_southern_drivers")
+dir_s09 <- path_resrepo("data/intermediate/s09_test_history")
+dir_s10 <- path_resrepo("data/intermediate/s10_test_diversification")
+dir_s11 <- path_resrepo("data/intermediate/s11_test_seasonality")
+dir_data_intermediate <- path_resrepo("data/intermediate/s14_test_null_models")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+
+tree_files <- c(
+  yumnam_2025 = file.path(dir_data_raw, "phylogenies", "yumnam_2025",
+                          "21Jan2025_30June23_SubfamAdded_RelTime_DivergenceTime_928sp.nwk"),
+  schar_2018 = file.path(dir_data_raw, "phylogenies", "schar_2018", "treemacro.nex"))
+crosswalk_files <- c(
+  yumnam_2025 = file.path(dir_data_raw, "butterfly_ant_interactions", "crosswalk_yumnam_2025.csv"),
+  schar_2018 = file.path(dir_data_raw, "butterfly_ant_interactions", "crosswalk_schar_2018.csv"))
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+source(here::here("code", "R", "phylogeny.R"))
+```
+
+```{r define_helpers}
+# Permute a vector within groups (sample() is avoided on single values)
+permute_within <- function(x, group) {
+  ave(seq_along(x), group, FUN = function(i) i[sample.int(length(i))])
+}
+
+# Linear slopes (log odds per SD) of the observed and lineage-expected strategy shares along
+# each predictor within each region (as in s05), from the species' strategies `type` and the
+# presence of species in hexagons
+gradient_slopes <- function(type, sp, pres, cells) {
+  types <- names(type_colours)
+  ind <- data.table(pool_key = sp$pool_key, genus = sp$genus, subfamily = sp$subfamily)
+  for (k in types) set(ind, j = k, value = as.numeric(type == k))
+  loo <- function(group) ind[, c(list(pool_key = pool_key, n_group = .N - 1),
+                                 lapply(.SD, function(z) (sum(z) - z) / pmax(.N - 1, 1))),
+                             by = group, .SDcols = types]
+  expected <- loo("genus")[, c("pool_key", "n_group", types), with = FALSE]
+  lonely <- expected$n_group == 0
+  by_subfamily <- loo("subfamily")
+  expected[lonely, (types) := by_subfamily[match(expected$pool_key[lonely], pool_key), types,
+                                           with = FALSE]]
+  setnames(expected, types, paste0("e_", types))
+  obs <- ind[, c("pool_key", types), with = FALSE]
+  p <- merge(merge(pres, obs, by = "pool_key"), expected, by = "pool_key")
+  agg <- p[, c(list(n_classified = .N), lapply(.SD, sum)), by = cell_id,
+           .SDcols = c(types, paste0("e_", types))]
+  dr_all <- merge(cells, agg, by = "cell_id")
+  rbindlist(lapply(unique(dr_all$region), function(rg) {
+    dr <- dr_all[region == rg]
+    rbindlist(lapply(names(gvars), function(v) rbindlist(lapply(types, function(k) {
+      if (sum(dr[[k]]) == 0) return(NULL)
+      so <- coef(suppressWarnings(glm(dr[[k]] / dr$n_classified ~ dr[[v]],
+                                      weights = dr$n_classified, family = quasibinomial)))[2]
+      se <- coef(suppressWarnings(glm(dr[[paste0("e_", k)]] / dr$n_classified ~ dr[[v]],
+                                      weights = dr$n_classified, family = quasibinomial)))[2]
+      data.table(region = rg, variable = v, type = k, observed_slope = so, expected_slope = se)
+    }))))
+  }))
+}
+
+# Resolve polytomies at random and give zero-length branches a small length (as in s09)
+prepare_tree <- function(tr, seed = 1) {
+  set.seed(seed)
+  tr <- multi2di(tr, random = TRUE)
+  floor <- min_branch_share * max(node.depth.edgelength(tr))
+  tr$edge.length[tr$edge.length < floor] <- floor
+  tr
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Seasonality within genera: permutation null
+
+The model of `s11` (region, the species' deviation from its genus mean seasonality and the genus mean, random intercepts of subfamily and genus) is fitted to the data and to `r n_perm_seasonality` data sets in which seasonality is permuted among the species of each genus. The random-effect variances are fixed at those of the fit to the data. The p-value is the share of permutations with an effect at least as large as observed (one-sided, including the observed).
+
+*Inputs:* s08/species_drivers.csv
+*Outputs:* seasonality_null.csv
+
+```{r seasonality_null}
+sp <- fread(file.path(dir_s08, "species_drivers.csv"), colClasses = c(pool_key = "character"))
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+rhs <- paste("y ~ region + bio15_within + bio15_between +", lineage)
+
+set.seed(20261029)
+null <- rbindlist(lapply(names(contrasts), function(ct) {
+  d <- copy(sp[interaction_type %in% contrasts[[ct]]$rows])
+  d[, `:=`(y = as.integer(interaction_type %in% contrasts[[ct]]$success),
+           region = factor(region), genus = factor(genus), subfamily = factor(subfamily),
+           bio15_s = as.numeric(scale(bio15)))]
+  within_fit <- function(x, sp = NULL) {
+    d[, `:=`(bio15_within = x - ave(x, genus), bio15_between = ave(x, genus))]
+    m <- if (is.null(sp)) gam(as.formula(rhs), data = d, family = binomial, method = "REML")
+         else gam(as.formula(rhs), data = d, family = binomial, sp = sp)
+    list(estimate = summary(m)$p.table["bio15_within", 1], sp = m$sp)
+  }
+  obs <- within_fit(d$bio15_s)
+  perm <- vapply(seq_len(n_perm_seasonality), function(r)
+    within_fit(d$bio15_s[permute_within(d$bio15_s, d$genus)], obs$sp)$estimate, numeric(1))
+  data.table(contrast = ct, permutation = c(0L, seq_len(n_perm_seasonality)),
+             estimate = c(obs$estimate, perm),
+             mixed_genera = d[, uniqueN(y) == 2, by = genus][, sum(V1)])
+}))
+write_table(null, file.path(dir_data_intermediate, "seasonality_null.csv"))
+print(null[, .(observed = estimate[permutation == 0],
+               null_low = quantile(estimate[permutation > 0], 0.025),
+               null_high = quantile(estimate[permutation > 0], 0.975),
+               p_one_sided = mean(estimate >= estimate[permutation == 0]),
+               mixed_genera = mixed_genera[1]), by = contrast], digits = 3)
+```
+
+```{r clear_seasonality_null, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Lineage turnover along gradients: within-genus shuffle null
+
+The slopes of `s05` (hexagons of resolution 5; regions with at least `r min_cells` hexagons of at least `r min_classified` classified species; temperature, aridity and the LGM anomaly, standardised over these hexagons) are recomputed for the data and for `r n_perm_gradients` data sets in which strategies are permuted among the classified species of each genus. For the slopes whose observed value exceeds `r min_slope` in absolute value, the part not reproduced by lineages (observed minus expected slope, signed in the direction of the observed slope) is compared with its null distribution. Summed over these slopes, it measures how much strategies change within lineages along the gradients.
+
+*Inputs:* s05/ species_regions.csv, presence_hex5.csv, cell_data_hex5.csv
+*Outputs:* gradient_null.csv, gradient_null_summary.csv
+
+```{r gradient_null}
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+sp <- sp[interaction_type %in% names(type_colours)]
+cells <- fread(file.path(dir_s05, "cell_data_hex5.csv"))
+cells <- cells[n_classified >= min_classified & !is.na(region)]
+cells[, log_aridity := log10(aridity_index)]
+cells <- cells[is.finite(bio01) & is.finite(log_aridity) & is.finite(lgm_anomaly_temperature)]
+cells <- cells[region %in% cells[, .N, by = region][N >= min_cells]$region]
+for (v in names(gvars)) set(cells, j = v, value = as.numeric(scale(cells[[v]])))
+cells <- cells[, c("cell_id", "region", names(gvars)), with = FALSE]
+pres <- fread(file.path(dir_s05, "presence_hex5.csv"), colClasses = c(pool_key = "character"))
+pres <- pres[cell_id %in% cells$cell_id & pool_key %in% sp$pool_key]
+
+observed <- gradient_slopes(sp$interaction_type, sp, pres, cells)
+focal <- observed[abs(observed_slope) > min_slope, .(region, variable, type,
+                                                     sign = sign(observed_slope))]
+
+set.seed(20261029)
+runs <- rbindlist(lapply(0:n_perm_gradients, function(r) {
+  type <- if (r == 0) sp$interaction_type else
+    sp$interaction_type[permute_within(seq_len(nrow(sp)), sp$genus)]
+  s <- if (r == 0) observed else gradient_slopes(type, sp, pres, cells)
+  s <- merge(s, focal, by = c("region", "variable", "type"))
+  s[, `:=`(permutation = r, within_lineage = sign * (observed_slope - expected_slope))]
+}))
+write_table(runs, file.path(dir_data_intermediate, "gradient_null.csv"))
+
+# --- Per slope: the within-lineage part as a z-score against its own null distribution, so
+# that slopes of small, noisy regions (such as New Guinea) do not dominate the summaries ---
+runs[, `:=`(null_mean = mean(within_lineage[permutation > 0]),
+            null_sd = sd(within_lineage[permutation > 0])), by = .(region, variable, type)]
+runs[, z := (within_lineage - null_mean) / null_sd]
+per_slope <- runs[, .(observed_slope = observed_slope[permutation == 0],
+                      within_observed = within_lineage[permutation == 0],
+                      null_low = quantile(within_lineage[permutation > 0], 0.025),
+                      null_high = quantile(within_lineage[permutation > 0], 0.975),
+                      z = z[permutation == 0],
+                      p_one_sided = mean(within_lineage >= within_lineage[permutation == 0])),
+                  by = .(region, variable, type)]
+
+# --- Over all slopes: the mean z, against its distribution over the permutations ---
+total <- runs[, .(mean_z = mean(z), lineage_share = median(expected_slope / observed_slope)),
+              by = permutation]
+summary_total <- data.table(
+  slopes = nrow(focal),
+  mean_z_observed = total[permutation == 0]$mean_z,
+  mean_z_null_high = quantile(total[permutation > 0]$mean_z, 0.975),
+  p_one_sided = mean(total$mean_z >= total[permutation == 0]$mean_z),
+  lineage_share_observed = total[permutation == 0]$lineage_share,
+  lineage_share_null_median = median(total[permutation > 0]$lineage_share),
+  slopes_beyond_null = per_slope[, sum(within_observed > null_high)])
+write_table(per_slope, file.path(dir_data_intermediate, "gradient_null_summary.csv"))
+write_table(summary_total, file.path(dir_data_intermediate, "gradient_null_total.csv"))
+print(per_slope[order(-within_observed)], digits = 2)
+print(summary_total, digits = 3)
+```
+
+```{r clear_gradient_null, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Origins of obligacy on matched-only trees
+
+Each published tree is pruned to the classified species matched to its tips (no grafting), with branch lengths as in `s04`; polytomies are resolved at random. Stochastic maps of obligacy (ARD model, `r n_simmaps` maps) are counted as in `s09`: every gain of obligacy that leads to obligate species is an origin, assigned to the region of most of these species.
+
+*Inputs:* raw/phylogenies/ trees; raw/butterfly_ant_interactions/ crosswalks; s09/history_species.csv
+*Outputs:* origins_matched.csv
+
+```{r origins_matched}
+sp <- fread(file.path(dir_s09, "history_species.csv"))
+set.seed(20261029)
+origins <- rbindlist(lapply(names(tree_files), function(study) {
+  cw <- read.csv(crosswalk_files[[study]], na.strings = c("", "NA"))
+  matched <- intersect(sp$species, cw$analysis_species[cw$matched])
+  tr <- prepare_tree(prepare_analysis_tree(read_published_tree(tree_files[[study]]), cw,
+                                           matched, branch[[study]]))
+  d <- sp[species %in% tr$tip.label]
+  tr <- keep.tip(tr, d$species)
+  ob <- setNames(ifelse(d$obligate == 1, "1", "0"), d$species)
+  maps <- make.simmap(tr, ob, model = "ARD", nsim = n_simmaps, message = FALSE)
+  n_tip <- Ntip(tr)
+  region_of <- setNames(d$region, d$species)
+  obligate_tip <- setNames(d$obligate == 1, d$species)
+  per_map <- rbindlist(lapply(seq_along(maps), function(s) {
+    m <- maps[[s]]
+    rbindlist(lapply(seq_len(nrow(m$edge)), function(i) {
+      states <- names(m$maps[[i]])
+      if (!any(head(states, -1) == "0" & tail(states, -1) == "1")) return(NULL)
+      child <- m$edge[i, 2]
+      tips <- if (child <= n_tip) m$tip.label[child] else
+        m$tip.label[getDescendants(m, child)[getDescendants(m, child) <= n_tip]]
+      ob_tips <- tips[obligate_tip[tips]]
+      if (!length(ob_tips)) return(NULL)
+      data.table(map = s, region = names(sort(table(region_of[ob_tips]), decreasing = TRUE))[1],
+                 obligate_descendants = length(ob_tips))
+    }))
+  }))
+  counts <- merge(CJ(map = seq_len(n_simmaps), region = region_levels),
+                  per_map[, .N, by = .(map, region)], all.x = TRUE)
+  counts[is.na(N), N := 0L]
+  out <- counts[, .(origins_median = median(N), origins_low = quantile(N, 0.025),
+                    origins_high = quantile(N, 0.975)), by = region]
+  out <- merge(out, d[, .(obligate = sum(obligate)), by = region], by = "region", all.x = TRUE)
+  out[, `:=`(tree = study, species = nrow(d))]
+}))
+origins[is.na(obligate), obligate := 0L]
+write_table(origins, file.path(dir_data_intermediate, "origins_matched.csv"))
+print(dcast(origins, region ~ tree, value.var = c("origins_median", "obligate")))
+```
+
+```{r clear_origins_matched, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(A) Within-genus effect of precipitation seasonality on obligacy (`s11`) in the data (line) and in permutations of seasonality among the species of each genus (histogram). (B) Origins of obligacy per region: on the grafted Yumnam tree (`s09`), on the tree of genera (`s10`), and on the matched-only Yumnam and Schär trees (medians and 95% ranges over stochastic maps). (C) For each composition gradient of `s05` steeper than `r min_slope`, the part not reproduced by lineages, as a z-score against its distribution when strategies are permuted within genera (grey band: 95% of that distribution).
+
+*Inputs:* s14/ seasonality_null.csv, gradient_null_summary.csv, origins_matched.csv; s09/origins_summary.csv; s10/origins_genus_tree.csv
+*Outputs:* plot_null_models.png
+
+```{r plot_null_models}
+snull <- fread(file.path(dir_data_intermediate, "seasonality_null.csv"))
+gnull <- fread(file.path(dir_data_intermediate, "gradient_null_summary.csv"))
+om <- fread(file.path(dir_data_intermediate, "origins_matched.csv"))
+og <- fread(file.path(dir_s09, "origins_summary.csv"))
+ogt <- fread(file.path(dir_s10, "origins_genus_tree.csv"))
+base <- theme_minimal(base_size = 8.5) +
+  theme(panel.grid.minor = element_blank(), plot.title = element_text(face = "bold", size = 9.5),
+        strip.text = element_text(face = "bold"), legend.position = "bottom")
+
+# --- A: seasonality null ---
+snull[, contrast := factor(sapply(contrasts, `[[`, "label")[contrast],
+                           sapply(contrasts, `[[`, "label"))]
+p_lab <- snull[, .(p = mean(estimate >= estimate[permutation == 0]),
+                   obs = estimate[permutation == 0]), by = contrast]
+panel_a <- ggplot(snull[permutation > 0], aes(estimate)) +
+  geom_histogram(bins = 30, fill = "grey75", colour = "white", linewidth = 0.2) +
+  geom_vline(data = p_lab, aes(xintercept = obs), colour = "#E69F00", linewidth = 0.8) +
+  geom_text(data = p_lab, aes(x = obs, y = Inf, label = sprintf("p = %.3f", p)),
+            hjust = 1.1, vjust = 1.5, size = 2.5) +
+  facet_wrap(~ contrast, ncol = 1) +
+  labs(x = "Within-genus effect of seasonality (log odds per SD)", y = "Permutations",
+       title = "Seasonality within genera") +
+  base
+
+# --- B: gradient null, as z-scores of each slope against its own null, by region ---
+gtot <- fread(file.path(dir_data_intermediate, "gradient_null_total.csv"))
+gnull[, region := factor(region, rev(region_levels))]
+panel_b <- ggplot(gnull, aes(z, region)) +
+  annotate("rect", xmin = -1.96, xmax = 1.96, ymin = -Inf, ymax = Inf, fill = "grey93") +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_point(aes(colour = type), size = 2, alpha = 0.9,
+             position = position_jitter(height = 0.18, width = 0, seed = 1)) +
+  scale_colour_manual(values = type_colours, labels = type_labels, name = NULL) +
+  labs(x = "Gradient not reproduced by lineages (z-score against within-genus permutations)",
+       y = NULL, title = "Strategy change within lineages along gradients",
+       subtitle = sprintf(paste("%d gradients steeper than %.1f; grey band: 95%% of the null;",
+                                "mean z = %.2f (p = %.3f)"),
+                          gtot$slopes, min_slope, gtot$mean_z_observed, gtot$p_one_sided)) +
+  base + theme(plot.subtitle = element_text(colour = "grey35", size = 7.5))
+
+# --- C: origins under four trees ---
+oc <- rbind(
+  og[, .(region, tree = "Grafted species tree", origins_median, origins_low, origins_high)],
+  ogt[, .(origins_median = median(N), origins_low = quantile(N, 0.025),
+          origins_high = quantile(N, 0.975)), by = region][, tree := "Tree of genera"],
+  om[, .(region, tree = c(yumnam_2025 = "Matched-only Yumnam tree",
+                          schar_2018 = "Matched-only Schär tree")[tree],
+         origins_median, origins_low, origins_high)], fill = TRUE)
+oc <- oc[region %in% c("Southern Africa", "Australia", "Indomalayan", "Palearctic",
+                       "Tropical Africa", "New Guinea and islands")]
+oc[, `:=`(region = factor(region, rev(region_levels)),
+          tree = factor(tree, c("Grafted species tree", "Matched-only Yumnam tree",
+                                "Matched-only Schär tree", "Tree of genera")))]
+panel_c <- ggplot(oc, aes(origins_median, region, colour = tree)) +
+  geom_errorbar(aes(xmin = origins_low, xmax = origins_high), width = 0, linewidth = 0.5,
+                orientation = "y", position = position_dodge(width = 0.7)) +
+  geom_point(size = 1.8, position = position_dodge(width = 0.7)) +
+  scale_colour_manual(values = c("grey45", "#2C7FB8", "#7FCDBB", "#B73779"), name = NULL) +
+  labs(x = "Origins of obligacy (median, 95% range of maps)", y = NULL,
+       title = "Origins without grafting") +
+  guides(colour = guide_legend(ncol = 2)) +
+  base
+
+fig <- (panel_a | panel_c) / panel_b + plot_layout(heights = c(1.2, 1)) +
+  plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(face = "bold", size = 12))
+save_figure(fig, "plot_null_models", 10, 8.5)
+fig
+```
+
+```{r clear_plot_null_models, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

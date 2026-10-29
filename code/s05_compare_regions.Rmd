@@ -1,0 +1,600 @@
+---
+title: "Lycaenidae ant-interaction climate 05 - climate and strategies within regions, across grains and grids"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+The global analyses (`s03_explore_climate`, `s04_fit_phylogenetic_models`) showed that lineage composition describes most of the geography of interaction strategies, and that the regions differ in which strategies their lineages contain (no obligate associates are recorded in the Americas). If history sets the regional species pool, climate can act only on the strategies within it, and its relationships may differ between regions: for example, cold may filter ant association in the Palaearctic, while in an obligate-rich Australian pool aridity may favour facultative over obligate associates. A single global slope would average such relationships.
+
+This notebook therefore compares the climate relationships of the strategies *within* biogeographic regions. Africa is split into southern Africa (south of 15° S) and the rest, and Australasia into Australia and New Guinea and the islands, because their faunas and histories differ. Four steps follow:
+
+1. The strategies of each region, with the number of genera and subfamilies behind each, which shows how many independent lineages any regional comparison rests on.
+2. Species-level relationships within each region (binomial models with random effects of genus and subfamily), with predictors standardised on the global scale so that slopes are comparable, and a test of whether one common slope fits all regions.
+3. The composition of cell assemblages along climate gradients within regions.
+4. The robustness of the within-region cell relationships to the grain (250 to 1,000 km), the grid (Equal Earth squares or the equal-area ISEA hexagons of `dggridR`, which `geoGraph` uses for connectivity analyses) and unequal sampling (weighting cells by their classified species or equally; at least 5, 10 or 20 classified species).
+
+A full run takes about 15 min.
+
+# Setup
+
+## Packages
+
+`mgcv` fits the models, `dggridR` builds the hexagonal grids, `terra` and `sf` handle the rasters and maps, `data.table` the tables and `ggplot2` with `patchwork` the figures.
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(mgcv)
+library(terra)
+library(sf)
+library(dggridR)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+The regions, the predictors, the grids and the colours are fixed here. Five predictors are compared: annual mean temperature, the aridity index, precipitation seasonality, the LGM temperature anomaly and absolute latitude (as a descriptive gradient, because it summarises several climatic and historical gradients at once).
+
+```{r setup_variables}
+# Regions: RESOLVE realms, with Africa south of 15 degrees S and Australia (Australasia south of
+# 10 degrees S, west of 160 degrees E) separated
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+
+# Predictors and their labels
+vars <- c(bio01 = "Annual mean temperature", log_aridity = "Aridity index (log P/PET)",
+          bio15 = "Precipitation seasonality", lgm_anomaly_temperature = "LGM temperature anomaly",
+          abs_latitude = "Absolute latitude")
+
+# Nested contrasts of the species models
+contrasts <- list(
+  associated = list(rows = c("n", "f", "m", "p"), success = c("f", "m", "p"),
+                    label = "Ant-associated vs non-associated"),
+  obligate = list(rows = c("f", "m", "p"), success = c("m", "p"),
+                  label = "Obligate vs facultative"),
+  parasite = list(rows = c("m", "p"), success = "p", label = "Parasite vs mutualist"))
+
+# A regional species model needs at least this many species in each outcome
+min_outcome <- 8
+
+# Grids: Equal Earth squares (from s02) and ISEA aperture-3 hexagons (dggridR resolutions 6,
+# 5 and 4: about 70,000, 210,000 and 630,000 km2)
+square_grids <- c(sq250 = 250, sq500 = 500, sq1000 = 1000)
+hex_grids <- c(hex6 = 6, hex5 = 5, hex4 = 4)
+
+# Minimum classified species of a cell: main value and the sensitivity values
+min_classified <- 10
+min_classified_alternatives <- c(5, 20)
+
+# Colours of the interaction types and labels, as in butterfly_ant_interactions
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+type_labels <- c(n = "Non-associated", f = "Facultative", m = "Obligate mutualist",
+                 p = "Obligate parasite")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_data_intermediate <- path_resrepo("data/intermediate/s05_compare_regions")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+source(here::here("code", "R", "projections.R"))
+source(here::here("code", "R", "maps.R"))
+```
+
+Regions are assigned in the same way to pixels, cells and species, and the climate layers and species tables are read in the same way in every section.
+
+```{r define_helpers}
+# Region of points from their realm name and coordinates
+assign_region <- function(realm, lon, lat) {
+  # Points without a realm (rock, ice, unassigned coasts) stay without a region
+  r <- as.character(realm)
+  afr <- !is.na(r) & r == "Afrotropic"
+  r[afr] <- ifelse(lat[afr] < -15, "Southern Africa", "Tropical Africa")
+  aus <- !is.na(r) & r == "Australasia"
+  r[aus] <- ifelse(lat[aus] < -10 & lon[aus] < 160, "Australia", "New Guinea and islands")
+  r[!is.na(r) & r == "Oceania"] <- "New Guinea and islands"
+  factor(r, region_levels)
+}
+
+# Classified species with their climates, transformed predictors and region (computed in the
+# species-regions section)
+read_species <- function() {
+  sp <- fread(file.path(dir_data_intermediate, "species_regions.csv"), colClasses = c(pool_key = "character"))
+  sp <- sp[interaction_type %in% names(type_colours)]
+  sp[, `:=`(region = factor(region, region_levels), genus = factor(genus),
+            subfamily = factor(subfamily))]
+  sp
+}
+
+# Global standardisation of the predictors over the classified species (or cells), so that
+# slopes are comparable between regions
+standardise <- function(d, vars) {
+  for (v in vars) set(d, j = v, value = (d[[v]] - mean(d[[v]], na.rm = TRUE)) /
+                        sd(d[[v]], na.rm = TRUE))
+  d
+}
+
+# Save a figure with ragg; width and height in inches
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Species regions
+
+Each species is assigned to the region holding most of the 10-arc-minute pixels with its records. Its climate is taken from `s02_build_assemblages` (median over the same pixels), with the absolute latitude of its pixels.
+
+*Inputs:* s02/ species_records.rds, species_climate.csv; s01/ realm_biome_10m.tif, realm_biome_codes.csv
+*Outputs:* species_regions.csv
+
+```{r species_regions}
+x <- readRDS(file.path(dir_s02, "species_records.rds"))
+rb <- rast(file.path(dir_s01, "realm_biome_10m.tif"))
+codes <- fread(file.path(dir_s01, "realm_biome_codes.csv"))[layer == "realm"]
+
+# --- Region of each unique pixel of each species ---
+x[, pixel := cellFromXY(rb, cbind(decimalLongitude, decimalLatitude))]
+px <- unique(x[!is.na(pixel), .(pool_key, pixel)])
+px[, realm := codes$name[match(rb[["realm"]][pixel][[1]], codes$code)]]
+xy <- xyFromCell(rb, px$pixel)
+px[, region := assign_region(realm, xy[, 1], xy[, 2])]
+
+# --- Majority region of each species and its share of the species' pixels ---
+reg <- px[!is.na(region), .N, by = .(pool_key, region)][order(pool_key, -N)]
+reg[, share := N / sum(N), by = pool_key]
+reg <- reg[!duplicated(pool_key), .(pool_key, region, region_share = share)]
+
+sp <- fread(file.path(dir_s02, "species_climate.csv"), colClasses = c(pool_key = "character"))
+sp <- merge(sp, reg, by = "pool_key")
+sp[, log_aridity := log10(aridity_index)]
+write_table(sp, file.path(dir_data_intermediate, "species_regions.csv"))
+print(dcast(sp[interaction_type %in% names(type_colours)], region ~ interaction_type,
+            fun.aggregate = length))
+cat("median share of a species' pixels in its region:", round(median(sp$region_share), 2), "\n")
+```
+
+```{r clear_species_regions, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Strategies and lineages of the regions
+
+For each region, the number of classified species of each strategy, and the number of genera and subfamilies they belong to. A strategy carried by many species of one genus offers one historical origin, not many independent observations, so the genus counts show how many lineages a regional climate relationship could rest on.
+
+*Inputs:* s05/species_regions.csv
+*Outputs:* region_lineages.csv, plot_region_lineages.png
+
+```{r region_lineages}
+sp <- read_species()
+lin <- sp[, .(species = .N, genera = uniqueN(genus), subfamilies = uniqueN(subfamily)),
+          by = .(region, interaction_type)]
+lin[, share := species / sum(species), by = region]
+write_table(lin[order(region, interaction_type)],
+            file.path(dir_data_intermediate, "region_lineages.csv"))
+print(dcast(lin, region ~ interaction_type, value.var = c("species", "genera")))
+
+# --- Figure: share of species (bars) and number of genera (labels) per strategy and region ---
+lin[, `:=`(region = factor(region, rev(region_levels)),
+           interaction_type = factor(interaction_type, rev(names(type_colours))))]
+totals <- lin[, .(n = sum(species)), by = region]
+p <- ggplot(lin, aes(share, region, fill = interaction_type)) +
+  geom_col(width = 0.7, colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = ifelse(share > 0.06, paste0(genera, " g"), "")),
+            position = position_stack(vjust = 0.5), size = 2.5, colour = "white") +
+  geom_text(data = totals, aes(x = 1.01, y = region, label = paste0("n = ", n)),
+            inherit.aes = FALSE, hjust = 0, size = 2.6, colour = "grey25") +
+  scale_fill_manual(values = type_colours, labels = type_labels,
+                    breaks = names(type_colours), name = NULL) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1.13),
+                     breaks = seq(0, 1, 0.25), expand = expansion(mult = 0)) +
+  labs(x = "Share of classified species (labels: number of genera)", y = NULL) +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        legend.position = "bottom")
+save_figure(p, "plot_region_lineages", 7, 3.6)
+p
+```
+
+```{r clear_region_lineages, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Species-level climate relationships within regions
+
+For each region, contrast and predictor, a binomial model relates the strategy to the predictor, with random intercepts of genus and subfamily (`mgcv`, REML), when the region has at least `r min_outcome` species of each outcome. Predictors are standardised over all classified species, so a slope is the change in log odds per global standard deviation and slopes are comparable between regions. Then, for each contrast and predictor, a model of all regions with region-specific slopes is compared with a model with one common slope (both with region intercepts and the random effects); a clearly better fit of the region-specific model (approximate likelihood-ratio test) means that the relationship differs between regions.
+
+*Inputs:* s05/species_regions.csv
+*Outputs:* region_slopes_species.csv, region_heterogeneity_species.csv, plot_region_slopes_species.png
+
+```{r region_slopes_species}
+sp <- standardise(read_species(), names(vars))
+
+slopes <- list()
+heterogeneity <- list()
+for (ct in names(contrasts)) {
+  d <- droplevels(sp[interaction_type %in% contrasts[[ct]]$rows])
+  d[, y := as.integer(interaction_type %in% contrasts[[ct]]$success)]
+
+  # Regions with enough species of both outcomes
+  counts <- d[, .(events = sum(y), non_events = sum(1 - y), species = .N,
+                  genera = uniqueN(genus)), by = region]
+  ok <- counts[events >= min_outcome & non_events >= min_outcome]$region
+
+  for (v in names(vars)) {
+    # --- One model per region ---
+    for (rg in ok) {
+      dr <- droplevels(d[region == rg])
+      re <- if (nlevels(dr$subfamily) > 1) "+ s(subfamily, bs = 're') + s(genus, bs = 're')" else
+        "+ s(genus, bs = 're')"
+      m <- tryCatch(gam(as.formula(paste("y ~", v, re)), data = dr, family = binomial,
+                        method = "REML"), error = function(e) NULL)
+      if (is.null(m)) next
+      cf <- summary(m)$p.table
+      slopes[[paste(ct, v, rg)]] <- data.table(
+        contrast = ct, variable = v, region = rg, estimate = cf[v, 1], se = cf[v, 2],
+        p = cf[v, 4], counts[region == rg, .(species, events, genera)])
+    }
+
+    # --- Common against region-specific slopes, across the regions with enough species ---
+    dd <- droplevels(d[region %in% ok])
+    if (nlevels(dd$region) < 2) next
+    f0 <- as.formula(paste("y ~ region +", v, "+ s(subfamily, bs = 're') + s(genus, bs = 're')"))
+    f1 <- as.formula(paste("y ~ region + region:", v,
+                           "+ s(subfamily, bs = 're') + s(genus, bs = 're')"))
+    m0 <- gam(f0, data = dd, family = binomial, method = "ML")
+    m1 <- gam(f1, data = dd, family = binomial, method = "ML")
+    a <- anova(m0, m1, test = "Chisq")
+    heterogeneity[[paste(ct, v)]] <- data.table(
+      contrast = ct, variable = v, regions = nlevels(dd$region),
+      deviance_difference = a$Deviance[2], df = a$Df[2], p = a$`Pr(>Chi)`[2])
+  }
+}
+slopes <- rbindlist(slopes)
+heterogeneity <- rbindlist(heterogeneity)
+write_table(slopes, file.path(dir_data_intermediate, "region_slopes_species.csv"))
+write_table(heterogeneity, file.path(dir_data_intermediate, "region_heterogeneity_species.csv"))
+print(heterogeneity, digits = 3)
+
+# --- Figure: slopes by region (rows), predictor (columns) and contrast (panel rows) ---
+slopes[, `:=`(region = factor(region, rev(region_levels)),
+              variable = factor(vars[variable], vars),
+              contrast = factor(sapply(contrasts, `[[`, "label")[contrast],
+                                sapply(contrasts, `[[`, "label")),
+              fill_key = ifelse(p < 0.05, "p < 0.05", "p >= 0.05"))]
+het_labels <- heterogeneity[, .(variable = factor(vars[variable], vars),
+                                contrast = factor(sapply(contrasts, `[[`, "label")[contrast],
+                                                  sapply(contrasts, `[[`, "label")),
+                                label = ifelse(p < 0.001, "differ: p < 0.001",
+                                               sprintf("differ: p = %.2f", p)))]
+p <- ggplot(slopes, aes(estimate, region)) +
+  geom_vline(xintercept = 0, colour = "grey55", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), width = 0,
+                linewidth = 0.5, orientation = "y") +
+  geom_point(aes(fill = fill_key), shape = 21, size = 1.9, stroke = 0.5) +
+  geom_text(data = het_labels, aes(x = -Inf, y = Inf, label = label), inherit.aes = FALSE,
+            hjust = -0.05, vjust = 1.2, size = 2.3, colour = "grey30") +
+  facet_grid(contrast ~ variable, scales = "free", space = "free_y",
+             labeller = label_wrap_gen(width = 18)) +
+  scale_fill_manual(values = c(`p < 0.05` = "black", `p >= 0.05` = "white"), name = NULL) +
+  coord_cartesian(xlim = c(-4, 4)) +
+  labs(x = "Log odds ratio per global SD (95% CI)", y = NULL) +
+  theme_minimal(base_size = 8.5) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        strip.text = element_text(face = "bold"), strip.text.y = element_text(angle = 0),
+        legend.position = "bottom", panel.spacing = grid::unit(8, "pt"))
+save_figure(p, "plot_region_slopes_species", 11, 6.5)
+p
+```
+
+```{r clear_region_slopes_species, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Hexagonal grids
+
+Equal Earth squares have equal areas but distorted shapes towards the edges of the projection. The ISEA aperture-3 hexagonal grids of `dggridR` (Sahr et al. 2003) have equal areas and nearly uniform shapes on the whole sphere, six equidistant neighbours, and are the grids of `geoGraph`, so assemblages built on them can later be used for connectivity analyses (least-cost paths, conductance). Species records and climate pixels are assigned to the hexagons containing them, exactly as for the squares, and each hexagon gets the area-weighted mean climate and the majority region of its land pixels.
+
+*Inputs:* s02/species_records.rds, species_climate.csv; s01/ climate_present_10m.tif, climate_past_10m.tif, realm_biome_10m.tif, realm_biome_codes.csv
+*Outputs:* cell_data_hex6.csv, cell_data_hex5.csv, cell_data_hex4.csv, presence_hex6.csv, presence_hex5.csv, presence_hex4.csv, hex_polygons.rds
+
+```{r hex_grids}
+x <- readRDS(file.path(dir_s02, "species_records.rds"))
+tab <- fread(file.path(dir_s02, "species_climate.csv"), colClasses = c(pool_key = "character"))
+layers <- c(rast(file.path(dir_s01, "climate_present_10m.tif"))[[c("bio01", "bio15",
+                                                                     "aridity_index")]],
+            rast(file.path(dir_s01, "climate_past_10m.tif"))[["lgm_anomaly_temperature"]],
+            rast(file.path(dir_s01, "realm_biome_10m.tif"))[["realm"]])
+codes <- fread(file.path(dir_s01, "realm_biome_codes.csv"))[layer == "realm"]
+pix <- as.data.table(as.data.frame(layers, xy = TRUE, na.rm = FALSE))[!is.na(bio01)]
+pix[, `:=`(weight = cos(y * pi / 180),
+           region = assign_region(codes$name[match(realm, codes$code)], x, y))]
+
+polygons <- list()
+for (g in names(hex_grids)) {
+  dg <- dgconstruct(res = hex_grids[[g]])
+
+  # --- Assemblages: unique species per hexagon ---
+  x[, hex := dgGEO_to_SEQNUM(dg, decimalLongitude, decimalLatitude)$seqnum]
+  pres <- unique(x[, .(pool_key, cell_id = hex)])
+  pres[, interaction_type := tab$interaction_type[match(pool_key, tab$pool_key)]]
+  write_table(pres[, .(pool_key, cell_id)],
+              file.path(dir_data_intermediate, paste0("presence_", g, ".csv")))
+  cells <- pres[, .(n_total = .N, n_classified = sum(interaction_type %in% c("n", "f", "m", "p")),
+                    n_n = sum(interaction_type %in% "n"), n_f = sum(interaction_type %in% "f"),
+                    n_m = sum(interaction_type %in% "m"), n_p = sum(interaction_type %in% "p")),
+                by = cell_id]
+
+  # --- Climate and majority region of the land pixels of each hexagon ---
+  pix[, cell_id := dgGEO_to_SEQNUM(dg, x, y)$seqnum]
+  clim <- pix[, .(bio01 = weighted.mean(bio01, weight), bio15 = weighted.mean(bio15, weight),
+                  aridity_index = weighted.mean(aridity_index, weight, na.rm = TRUE),
+                  lgm_anomaly_temperature = weighted.mean(lgm_anomaly_temperature, weight,
+                                                          na.rm = TRUE)),
+              by = cell_id]
+  reg <- pix[!is.na(region), .(w = sum(weight)), by = .(cell_id, region)][
+    order(cell_id, -w)][!duplicated(cell_id), .(cell_id, region)]
+  centres <- dgSEQNUM_to_GEO(dg, cells$cell_id)
+  cells[, `:=`(cell_longitude = centres$lon_deg, cell_latitude = centres$lat_deg)]
+  cells <- merge(merge(cells, clim, by = "cell_id"), reg, by = "cell_id", all.x = TRUE)
+  write_table(cells, file.path(dir_data_intermediate, paste0("cell_data_", g, ".csv")))
+
+  # Polygons of the occupied hexagons, for maps
+  polygons[[g]] <- dgcellstogrid(dg, cells$cell_id)
+  cat(g, ": hexagon area", round(dggetres(dg)$area_km[dggetres(dg)$res == hex_grids[[g]]]),
+      "km2;", nrow(cells), "occupied hexagons,", sum(cells$n_classified >= min_classified),
+      "with >=", min_classified, "classified species\n")
+}
+saveRDS(polygons, file.path(dir_data_intermediate, "hex_polygons.rds"))
+```
+
+```{r clear_hex_grids, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Composition along climate gradients within regions: lineage turnover or change within lineages?
+
+Within each region with at least 15 cells, the share of each strategy among the classified species of a cell is smoothed along temperature, aridity and the LGM temperature anomaly, on the hexagons of resolution 5 (about 210,000 km², close to the 500-km squares of Fig. 1).
+
+A gradient in composition can arise in two ways: the genera present change along the gradient (lineage turnover), or species of the same genera differ in strategy along it (change within lineages). To separate them, each classified species is given the strategy composition of its congeners (leaving the species itself out; species without classified congeners take the composition of their subfamily, again without themselves). The mean of these values over a cell's species is the composition expected from the lineages present alone. If the expected composition (dashed lines) follows the observed one (solid lines) along a gradient, the gradient is lineage turnover; if the observed composition changes more steeply than the expected one, strategies change within lineages along the gradient.
+
+Curves are quasi-binomial GAMs of the cell proportions weighted by the classified species of each cell; the table compares the linear slopes (log odds per global SD) of the observed and expected proportions. Cells share species, so these describe the assemblages rather than test hypotheses.
+
+*Inputs:* s05/ cell_data_hex5.csv, presence_hex5.csv, species_regions.csv
+*Outputs:* region_gradient_slopes_hex5.csv, plot_region_gradients_hex5.png
+
+```{r region_gradients}
+cells <- fread(file.path(dir_data_intermediate, "cell_data_hex5.csv"))
+cells <- cells[n_classified >= min_classified & !is.na(region)]
+cells[, `:=`(log_aridity = log10(aridity_index), region = factor(region, region_levels))]
+cells <- cells[is.finite(bio01) & is.finite(log_aridity) & is.finite(lgm_anomaly_temperature)]
+keep <- cells[, .N, by = region][N >= 15]$region
+cells <- droplevels(cells[region %in% keep])
+gvars <- c(bio01 = "Annual mean temperature (°C)", log_aridity = "Aridity index (log10 P/PET)",
+           lgm_anomaly_temperature = "LGM temperature anomaly (°C)")
+types <- names(type_colours)
+
+# --- Lineage expectation of each classified species: its congeners' (or subfamily's) strategies ---
+sp <- read_species()
+ind <- sp[, c(list(pool_key = pool_key, genus = genus, subfamily = subfamily),
+              lapply(setNames(types, types), function(k) as.numeric(interaction_type == k)))]
+leave_one_out <- function(group) {
+  ind[, c(list(pool_key = pool_key, n_group = .N - 1),
+          lapply(.SD, function(z) (sum(z) - z) / pmax(.N - 1, 1))), by = group, .SDcols = types]
+}
+by_genus <- leave_one_out("genus")
+by_subfamily <- leave_one_out("subfamily")
+expected <- by_genus[, c("pool_key", "n_group", types), with = FALSE]
+lonely <- expected$n_group == 0
+expected[lonely, (types) := by_subfamily[match(expected$pool_key[lonely], pool_key),
+                                         types, with = FALSE]]
+cat("species with no classified congener (subfamily expectation used):", sum(lonely), "\n")
+
+# --- Expected composition of each cell: mean over its classified species ---
+pres <- fread(file.path(dir_data_intermediate, "presence_hex5.csv"),
+              colClasses = c(pool_key = "character"))
+pres <- merge(pres[cell_id %in% cells$cell_id], expected, by = "pool_key")
+exp_cells <- pres[, lapply(.SD, mean), by = cell_id, .SDcols = types]
+setnames(exp_cells, types, paste0("e_", types))
+cells <- merge(cells, exp_cells, by = "cell_id")
+
+# --- Smoothed observed and expected shares along each predictor within each region ---
+fit_curve <- function(prop, w, x, grid) {
+  if (all(prop == 0)) return(rep(0, length(grid)))
+  m <- gam(prop ~ s(x, k = 4), weights = w, family = quasibinomial, method = "REML")
+  as.numeric(predict(m, newdata = data.frame(x = grid), type = "response"))
+}
+curves <- rbindlist(lapply(levels(cells$region), function(rg) {
+  dr <- cells[region == rg]
+  rbindlist(lapply(names(gvars), function(v) {
+    grid <- seq(min(dr[[v]]), max(dr[[v]]), length.out = 60)
+    rbindlist(lapply(types, function(k) {
+      # Strategies absent from the region's classified species are not drawn
+      if (sum(dr[[paste0("n_", k)]]) == 0) return(NULL)
+      obs <- dr[[paste0("n_", k)]] / dr$n_classified
+      data.table(region = rg, variable = v, type = k, x = grid,
+                 observed = fit_curve(obs, dr$n_classified, dr[[v]], grid),
+                 expected = fit_curve(dr[[paste0("e_", k)]], dr$n_classified, dr[[v]], grid))
+    }))
+  }))
+}))
+
+# --- Linear slopes of the observed and expected shares (log odds per global SD) ---
+z <- copy(cells)
+z <- standardise(z, names(gvars))
+slopes <- rbindlist(lapply(levels(z$region), function(rg) {
+  dr <- z[region == rg]
+  rbindlist(lapply(names(gvars), function(v) rbindlist(lapply(types, function(k) {
+    if (sum(dr[[paste0("n_", k)]]) == 0) return(NULL)
+    obs <- dr[[paste0("n_", k)]] / dr$n_classified
+    so <- coef(glm(obs ~ dr[[v]], weights = dr$n_classified, family = quasibinomial))[2]
+    se <- coef(glm(dr[[paste0("e_", k)]] ~ dr[[v]], weights = dr$n_classified,
+                   family = quasibinomial))[2]
+    data.table(region = rg, variable = v, type = k, cells = nrow(dr),
+               observed_slope = so, expected_slope = se)
+  }))))
+}))
+slopes[, lineage_share := ifelse(abs(observed_slope) > 0.1, expected_slope / observed_slope,
+                                 NA_real_)]
+write_table(slopes, file.path(dir_data_intermediate, "region_gradient_slopes_hex5.csv"))
+print(slopes[abs(observed_slope) > 0.3][order(region, variable, type)], digits = 2)
+
+# --- Figure: one panel per region and predictor, with its own predictor axis ---
+points <- rbindlist(lapply(names(gvars), function(v) rbindlist(lapply(types, function(k)
+  cells[get(paste0("n_", k)) > 0 | region %in% curves[type == k, unique(region)],
+        .(region, variable = v, type = k, x = get(v),
+          prop = get(paste0("n_", k)) / n_classified)]))))
+points <- points[paste(region, type) %in% curves[, paste(region, type)]]
+long <- melt(curves, measure.vars = c("observed", "expected"), variable.name = "source",
+             value.name = "share")
+for (d in list(long, points)) {
+  d[, `:=`(variable = factor(gvars[variable], gvars), type = factor(type, types),
+           region = factor(region, region_levels))]
+}
+long[, source := factor(source, c("observed", "expected"),
+                        c("Observed", "Expected from lineages present"))]
+p <- ggplot(long, aes(x, share, colour = type)) +
+  geom_point(data = points, aes(x, prop), size = 0.35, alpha = 0.3, stroke = 0) +
+  geom_line(aes(linetype = source), linewidth = 0.75) +
+  facet_wrap(region ~ variable, scales = "free_x", ncol = 3,
+             labeller = label_wrap_gen(width = 34, multi_line = FALSE)) +
+  scale_colour_manual(values = type_colours, labels = type_labels, name = NULL) +
+  scale_linetype_manual(values = c("solid", "22"), name = NULL) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1), breaks = c(0, 0.5, 1)) +
+  labs(x = NULL, y = "Share of classified species") +
+  theme_minimal(base_size = 8.5) +
+  theme(panel.grid.minor = element_blank(), strip.text = element_text(face = "bold", size = 7.5),
+        legend.position = "bottom", legend.box = "vertical",
+        panel.spacing = grid::unit(6, "pt"))
+save_figure(p, "plot_region_gradients_hex5", 8, 11)
+p
+```
+
+```{r clear_region_gradients, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Robustness of the within-region cell relationships to grain, grid and sampling
+
+For each grid (squares of 250, 500 and 1,000 km; hexagons of resolutions 6, 5 and 4), region with at least 15 cells, strategy and predictor, a binomial regression of the cell proportion on the standardised predictor gives the slope of the relationship, (a) with cells weighted by their classified species (each species counted in every cell it occupies) and (b) with all cells weighted equally, for cells with at least 10 classified species, and (c) with at least 5 or 20 classified species. The summary gives, for each region, strategy and predictor, the sign of the main estimate (hexagons of resolution 5, species weights, at least 10 species) and the share of the other analyses with the same sign. Consistency across analyses, not the p-values of individual cell regressions (which ignore shared species and spatial autocorrelation), is the information here.
+
+*Inputs:* s02/cell_data_250km.csv, cell_data_500km.csv, cell_data_1000km.csv; s05/ cell_data_hex6.csv, cell_data_hex5.csv, cell_data_hex4.csv
+*Outputs:* region_slopes_cells.csv, region_slope_consistency.csv, plot_region_slope_consistency.png
+
+```{r robustness_cells}
+# --- Cell tables of all grids, with regions and standardised predictors ---
+read_grid <- function(g) {
+  d <- if (g %in% names(square_grids)) {
+    fread(file.path(dir_s02, paste0("cell_data_", square_grids[[g]], "km.csv")))[
+      , region := assign_region(realm, cell_longitude, cell_latitude)]
+  } else fread(file.path(dir_data_intermediate, paste0("cell_data_", g, ".csv")))
+  d[, `:=`(log_aridity = log10(aridity_index), abs_latitude = abs(cell_latitude),
+           grid = g)]
+  d <- d[!is.na(region) & complete.cases(d[, names(vars), with = FALSE])]
+  d[, c("grid", "cell_id", "region", "n_classified", paste0("n_", names(type_colours)),
+                      names(vars)), with = FALSE]
+}
+all_cells <- rbindlist(lapply(c(names(square_grids), names(hex_grids)), read_grid))
+
+# --- Slopes of every grid, weighting and threshold ---
+settings <- rbind(CJ(grid = c(names(square_grids), names(hex_grids)),
+                     weighting = c("species", "equal"), threshold = min_classified),
+                  CJ(grid = "hex5", weighting = "species", threshold = min_classified_alternatives))
+slopes <- rbindlist(lapply(seq_len(nrow(settings)), function(i) {
+  s <- settings[i]
+  d <- all_cells[grid == s$grid & n_classified >= s$threshold]
+  d <- standardise(d, names(vars))
+  rbindlist(lapply(unique(d$region), function(rg) {
+    dr <- d[region == rg]
+    if (nrow(dr) < 15) return(NULL)
+    rbindlist(lapply(names(type_colours), function(k) {
+      y <- dr[[paste0("n_", k)]]
+      if (sum(y) == 0 || all(y == dr$n_classified)) return(NULL)
+      rbindlist(lapply(names(vars), function(v) {
+        # Equal weights: each cell's proportion counts once (quasi-binomial on proportions)
+        m <- if (s$weighting == "species") {
+          glm(cbind(y, dr$n_classified - y) ~ dr[[v]], family = quasibinomial)
+        } else glm(y / dr$n_classified ~ dr[[v]], family = quasibinomial)
+        data.table(s, region = rg, type = k, variable = v, cells = nrow(dr),
+                   estimate = coef(m)[2])
+      }))
+    }))
+  }))
+}))
+write_table(slopes, file.path(dir_data_intermediate, "region_slopes_cells.csv"))
+
+# --- Consistency of the sign with the main analysis ---
+main <- slopes[grid == "hex5" & weighting == "species" & threshold == min_classified,
+               .(region, type, variable, main = estimate)]
+cons <- merge(slopes[!(grid == "hex5" & weighting == "species" & threshold == min_classified)],
+              main, by = c("region", "type", "variable"))
+cons <- cons[, .(analyses = .N, same_sign = mean(sign(estimate) == sign(main)),
+                 main = main[1]), by = .(region, type, variable)]
+write_table(cons, file.path(dir_data_intermediate, "region_slope_consistency.csv"))
+cat("share of region-strategy-predictor relationships whose sign holds in >= 90% of the",
+    "alternative analyses:", round(mean(cons$same_sign >= 0.9), 2), "\n")
+
+# --- Figure: main slope (colour) and its consistency (point size) ---
+cons[, `:=`(region = factor(region, rev(region_levels)), variable = factor(vars[variable], vars),
+            type = factor(type_labels[type], type_labels),
+            consistent = same_sign >= 0.9)]
+# Colour limits at the 95th percentile of the absolute slopes; steeper slopes take the end colour
+lim <- unname(quantile(abs(cons$main), 0.95))
+p <- ggplot(cons, aes(variable, region)) +
+  geom_tile(aes(fill = main), colour = "white", linewidth = 0.6) +
+  geom_point(data = cons[consistent == FALSE], shape = 4, size = 1.6, colour = "grey20") +
+  facet_wrap(~ type, nrow = 1) +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey95", high = "#B2182B", midpoint = 0,
+                       limits = c(-lim, lim), oob = scales::squish,
+                       name = "Slope (log odds per SD)") +
+  labs(x = NULL, y = NULL,
+       caption = "x: sign not consistent in at least 90% of the alternative grids, grains, weightings and thresholds") +
+  theme_minimal(base_size = 8.5) +
+  theme(panel.grid = element_blank(), axis.text.x = element_text(angle = 40, hjust = 1),
+        strip.text = element_text(face = "bold"), legend.position = "bottom",
+        plot.caption = element_text(hjust = 0, size = 7.5, colour = "grey30"))
+save_figure(p, "plot_region_slope_consistency", 11, 4.2)
+p
+```
+
+```{r clear_robustness_cells, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

@@ -1,0 +1,323 @@
+---
+title: "Lycaenidae ant-interaction climate 06 - glacial stability or southern history?"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+`s04_fit_phylogenetic_models` found one climate signal that predicts the strategies of lineages a model was not fitted to: obligate associates are more frequent, across subfamilies, where the temperature changed little since the Last Glacial Maximum (LGM), and secondarily where the climate is drier. A small LGM anomaly also marks the southern continents, where most obligate lineages live, so the signal could reflect climatic stability (H6) or a history shared by southern lineages that has nothing to do with stability. This notebook tests the two explanations against each other for the obligate-against-facultative contrast.
+
+1. **Does the anomaly add to region?** A model that knows only the region of each species represents shared regional history. If adding the LGM anomaly improves the prediction of held-out subfamilies and genera, the anomaly carries information beyond regional identity.
+2. **Latitude and hemisphere** are compared with the anomaly as rival descriptions, because the anomaly increases with latitude.
+3. **The anomaly effect conditional on region**, with random effects of subfamily and genus, is estimated in the full sample, within each hemisphere, within the genera that contain both strategies (deviations from the genus mean), without *Lepidochrysops*, *Thestor*, *Chrysoritis* or southern Africa, with aridity as a covariate, and with the anomaly of a second reconstruction (Beyer et al. 2020; the same model family as Krapp et al. 2021, so a check of the data handling rather than an independent reconstruction).
+
+A full run takes about 5 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(mgcv)
+library(terra)
+library(pastclim)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+# Contrast: obligate (mutualist or parasite) against facultative associates
+obligate_types <- c("m", "p")
+associated_types <- c("f", "m", "p")
+
+# Repeats of the 10-fold genus cross-validation
+genus_cv_repeats <- 20
+
+# Times of the LGM and the present in the second reconstruction
+second_dataset <- "Beyer2020"
+time_lgm_bp <- -21000
+
+# Colours as in s04
+model_colour <- "black"
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_data_intermediate <- path_resrepo("data/intermediate/s06_test_stability")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+
+# pastclim reads its files from the raw data, without changing the user's settings
+set_data_path(path_to_nc = file.path(dir_data_raw, "pastclim"), ask = FALSE,
+              write_config = FALSE, copy_example = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+The cross-validation fits logistic regressions on a model matrix built from all species, so that a region absent from the training species gets the baseline (a coefficient of zero) rather than an error.
+
+```{r define_helpers}
+# Binomial deviance of 0/1 outcomes y under probabilities q
+binary_deviance <- function(y, q) {
+  q <- pmin(pmax(q, 1e-9), 1 - 1e-9)
+  -2 * sum(y * log(q) + (1 - y) * log(1 - q))
+}
+
+# Cross-validated deviance explained: each group of `fold` is predicted by a logistic regression
+# fitted to the other groups, against the outcome proportion of the training species
+cv_d2 <- function(d, rhs, fold) {
+  X <- model.matrix(as.formula(paste("~", rhs)), data = d)
+  q <- q0 <- numeric(nrow(d))
+  for (k in unique(fold)) {
+    test <- fold == k
+    fit <- suppressWarnings(glm.fit(X[!test, , drop = FALSE], d$y[!test], family = binomial()))
+    b <- fit$coefficients
+    b[is.na(b)] <- 0
+    q[test] <- plogis(X[test, , drop = FALSE] %*% b)
+    q0[test] <- mean(d$y[!test])
+  }
+  1 - binary_deviance(d$y, q) / binary_deviance(d$y, q0)
+}
+
+# Save a figure with ragg; width and height in inches
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Species of the contrast
+
+The associated species with a climate and a region (`s05_compare_regions`) are coded 1 if obligate and 0 if facultative. Each species also gets the median signed latitude of its pixels (for the hemisphere) and the LGM temperature anomaly of the second reconstruction, the median over its pixels with a value (pixels under the LGM ice have none). Predictors are standardised over the species of the contrast.
+
+*Inputs:* s05/species_regions.csv; s02/species_records.rds; raw/pastclim/Beyer2020 file
+*Outputs:* species_stability.csv
+
+```{r species_stability}
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+sp <- sp[interaction_type %in% associated_types & !is.na(region)]
+sp <- sp[is.finite(lgm_anomaly_temperature) & is.finite(log_aridity) & is.finite(abs_latitude)]
+sp[, y := as.integer(interaction_type %in% obligate_types)]
+
+# --- Signed latitude and the second reconstruction's anomaly over each species' pixels ---
+x <- readRDS(file.path(dir_s02, "species_records.rds"))[pool_key %in% sp$pool_key]
+times <- get_time_bp_steps(second_dataset)
+t_lgm <- times[which.min(abs(times - time_lgm_bp))]
+second <- region_slice(time_bp = 0, bio_variables = "bio01", dataset = second_dataset) -
+  region_slice(time_bp = t_lgm, bio_variables = "bio01", dataset = second_dataset)
+x[, `:=`(anomaly_second = extract(second, cbind(decimalLongitude, decimalLatitude))[, 1])]
+per <- x[, .(signed_latitude = median(decimalLatitude),
+             lgm_anomaly_second = median(anomaly_second, na.rm = TRUE)), by = pool_key]
+sp <- merge(sp, per, by = "pool_key")
+sp[, `:=`(hemisphere = factor(ifelse(signed_latitude < 0, "South", "North")),
+          region = factor(region), genus = factor(genus), subfamily = factor(subfamily))]
+cat("LGM time step of", second_dataset, ":", t_lgm, "; correlation of the two anomalies among",
+    "species:", round(cor(sp$lgm_anomaly_temperature, sp$lgm_anomaly_second,
+                          use = "complete.obs"), 3), "\n")
+
+# --- Standardised predictors ---
+for (v in c("lgm_anomaly_temperature", "lgm_anomaly_second", "log_aridity", "abs_latitude")) {
+  set(sp, j = paste0(v, "_z"), value = as.numeric(scale(sp[[v]])))
+}
+write_table(sp, file.path(dir_data_intermediate, "species_stability.csv"))
+print(sp[, .(species = .N, obligate = sum(y)), by = .(hemisphere, region)][order(hemisphere)])
+```
+
+```{r clear_species_stability, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Does the anomaly add to region, latitude and hemisphere?
+
+Logistic regressions with different predictor sets predict the species of held-out subfamilies (each in turn) and of held-out genera (ten groups, 20 random splits). The region-only model represents shared regional history: it predicts obligacy from the share of obligate species in each region among the training lineages. The gain from adding the anomaly to region is the information the anomaly carries beyond regional identity; the same gain is computed for the latitude and hemisphere model.
+
+*Inputs:* s06/species_stability.csv
+*Outputs:* stability_cv.csv
+
+```{r stability_cv}
+sp <- fread(file.path(dir_data_intermediate, "species_stability.csv"),
+            colClasses = c(pool_key = "character"))
+sp[, `:=`(region = factor(region), hemisphere = factor(hemisphere))]
+
+sets <- c(
+  region = "region",
+  anomaly = "lgm_anomaly_temperature_z",
+  `region + anomaly` = "region + lgm_anomaly_temperature_z",
+  `region + anomaly + aridity` = "region + lgm_anomaly_temperature_z + log_aridity_z",
+  `latitude x hemisphere` = "abs_latitude_z * hemisphere",
+  `latitude x hemisphere + anomaly` = "abs_latitude_z * hemisphere + lgm_anomaly_temperature_z")
+
+set.seed(20261028)
+genera <- unique(as.character(sp$genus))
+genus_folds <- lapply(seq_len(genus_cv_repeats), function(r)
+  setNames(sample(rep_len(1:10, length(genera))), genera))
+res <- rbindlist(lapply(names(sets), function(s) {
+  sub <- data.table(set = s, scheme = "subfamily", repeat_id = 1L,
+                    cv_d2 = cv_d2(sp, sets[[s]], as.character(sp$subfamily)))
+  gen <- rbindlist(lapply(seq_along(genus_folds), function(r)
+    data.table(set = s, scheme = "genus", repeat_id = r,
+               cv_d2 = cv_d2(sp, sets[[s]], genus_folds[[r]][as.character(sp$genus)]))))
+  rbind(sub, gen)
+}))
+write_table(res, file.path(dir_data_intermediate, "stability_cv.csv"))
+print(dcast(res[, .(cv_d2 = median(cv_d2)), by = .(set, scheme)], set ~ scheme,
+            value.var = "cv_d2"), digits = 3)
+```
+
+```{r clear_stability_cv, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# The anomaly effect conditional on region, across subsets and checks
+
+The effect of the standardised LGM temperature anomaly on obligacy is estimated with region as a fixed effect and random intercepts of subfamily and genus (`mgcv`, REML), so it is a common within-region slope after accounting for lineage. The same model is fitted to the subsets and variants listed below. Within genera, the anomaly is split into the genus mean and the species' deviation from it, and the slope of the deviation is reported: it uses only the genera with both strategies.
+
+*Inputs:* s06/species_stability.csv
+*Outputs:* stability_effects.csv
+
+```{r stability_effects}
+sp <- fread(file.path(dir_data_intermediate, "species_stability.csv"),
+            colClasses = c(pool_key = "character"))
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+
+# One fit of the anomaly term (or of `term`) with region as fixed effect
+fit_effect <- function(d, label, anomaly = "lgm_anomaly_temperature_z", extra = "",
+                       region = TRUE, term = anomaly) {
+  d <- droplevels(copy(d))
+  d[, `:=`(genus = factor(genus), subfamily = factor(subfamily), region = factor(region))]
+  rhs <- paste(c(if (region && nlevels(d$region) > 1) "region", anomaly, extra, lineage),
+               collapse = " + ")
+  rhs <- gsub("\\+  \\+", "+", rhs)
+  m <- gam(as.formula(paste("y ~", rhs)), data = d, family = binomial, method = "REML")
+  cf <- summary(m)$p.table
+  data.table(analysis = label, species = nrow(d), obligate = sum(d$y),
+             genera = uniqueN(d$genus), estimate = cf[term, 1], se = cf[term, 2],
+             p = cf[term, 4])
+}
+
+# Within genera: deviation of the species' anomaly from its genus mean
+within <- copy(sp)
+within[, `:=`(anomaly_within = lgm_anomaly_temperature_z - ave(lgm_anomaly_temperature_z, genus),
+              anomaly_between = ave(lgm_anomaly_temperature_z, genus))]
+
+effects <- rbind(
+  fit_effect(sp, "All associated species"),
+  fit_effect(sp, "With aridity as covariate", extra = "log_aridity_z"),
+  fit_effect(sp, "Without region (lineage only)", region = FALSE),
+  fit_effect(sp[hemisphere == "South"], "Southern Hemisphere species"),
+  fit_effect(sp[hemisphere == "North"], "Northern Hemisphere species"),
+  fit_effect(sp[region != "Southern Africa"], "Without southern Africa"),
+  fit_effect(sp[genus != "Lepidochrysops"], "Without Lepidochrysops"),
+  fit_effect(sp[genus != "Thestor"], "Without Thestor"),
+  fit_effect(sp[genus != "Chrysoritis"], "Without Chrysoritis"),
+  fit_effect(sp[!genus %in% c("Lepidochrysops", "Thestor", "Chrysoritis")],
+             "Without all three"),
+  fit_effect(sp[is.finite(lgm_anomaly_second_z)], "Second reconstruction (Beyer 2020)",
+             anomaly = "lgm_anomaly_second_z"),
+  fit_effect(within, "Within genera (deviation from genus mean)",
+             anomaly = "anomaly_within + anomaly_between", term = "anomaly_within"))
+write_table(effects, file.path(dir_data_intermediate, "stability_effects.csv"))
+print(effects, digits = 3)
+```
+
+```{r clear_stability_effects, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+Panel A compares the cross-validated deviance explained of the predictor sets for held-out subfamilies and genera; the gain from region to region plus anomaly is the information the anomaly adds to regional identity. Panel B shows the anomaly effect conditional on region and lineage across the subsets and checks; negative values mean more obligate species where the climate changed less since the LGM.
+
+*Inputs:* s06/ stability_cv.csv, stability_effects.csv
+*Outputs:* plot_stability_tests.png
+
+```{r plot_stability}
+res <- fread(file.path(dir_data_intermediate, "stability_cv.csv"))
+effects <- fread(file.path(dir_data_intermediate, "stability_effects.csv"))
+
+# --- A: cross-validated deviance explained ---
+set_order <- c("region", "anomaly", "region + anomaly", "region + anomaly + aridity",
+               "latitude x hemisphere", "latitude x hemisphere + anomaly")
+cvs <- res[, .(median = median(cv_d2), low = min(cv_d2), high = max(cv_d2)), by = .(set, scheme)]
+cvs[, `:=`(set = factor(set, rev(set_order)),
+           scheme = factor(scheme, c("subfamily", "genus"),
+                           c("Held-out subfamilies", "Held-out genera (20 splits)")))]
+panel_a <- ggplot(cvs, aes(100 * median, set, shape = scheme)) +
+  geom_vline(xintercept = 0, colour = "grey55", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = 100 * low, xmax = 100 * high), width = 0, linewidth = 0.5,
+                orientation = "y", position = position_dodge(width = 0.5)) +
+  geom_point(size = 2, position = position_dodge(width = 0.5)) +
+  scale_shape_manual(values = c(17, 18), name = NULL) +
+  labs(x = "Cross-validated deviance explained (%)", y = NULL,
+       title = "Prediction of new lineages") +
+  guides(shape = guide_legend(ncol = 1)) +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        legend.position = "bottom", plot.title = element_text(face = "bold", size = 9.5))
+
+# --- B: anomaly effect across subsets and checks ---
+effects[, `:=`(analysis = factor(analysis, rev(analysis)),
+               fill_key = ifelse(p < 0.05, "p < 0.05", "p >= 0.05"),
+               label = paste0(obligate, "/", species))]
+panel_b <- ggplot(effects, aes(estimate, analysis)) +
+  geom_vline(xintercept = 0, colour = "grey55", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), width = 0,
+                linewidth = 0.5, orientation = "y") +
+  geom_point(aes(fill = fill_key), shape = 21, size = 2, stroke = 0.6) +
+  geom_text(aes(x = Inf, label = label), hjust = 1.05, size = 2.4, colour = "grey35") +
+  scale_fill_manual(values = c(`p < 0.05` = "black", `p >= 0.05` = "white"), name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.25))) +
+  labs(x = "LGM anomaly effect on obligacy (log odds per SD, 95% CI)", y = NULL,
+       title = "Anomaly effect given region and lineage") +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        legend.position = "bottom", plot.title = element_text(face = "bold", size = 9.5))
+
+fig <- (panel_a | panel_b) + plot_layout(widths = c(1, 1.25)) +
+  plot_annotation(tag_levels = "A",
+                  caption = "Labels in B: obligate / all associated species in the analysis.") &
+  theme(plot.tag = element_text(face = "bold", size = 12))
+save_figure(fig, "plot_stability_tests", 10.5, 4.6)
+fig
+```
+
+```{r clear_plot_stability, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```
