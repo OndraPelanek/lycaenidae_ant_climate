@@ -1,0 +1,284 @@
+---
+title: "Lycaenidae ant-interaction climate 31 - what the drier places of obligate mutualists are"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+`s29` found that obligate mutualists occupy places with more dry months than the hexagons around them, relative to their facultative congeners, whereas the dry months available in those hexagons matter little. A dry month is a month with precipitation in mm below twice the mean temperature in °C (`s19`), so a place can have more dry months because it receives less rain, because it is warmer (often lower), or both; and places with less rain are often more open. This notebook asks what the drier places of obligate mutualists are:
+
+1. **Use beyond availability for each property.** As in `s29`, for every associated species and property: the median over its record pixels minus the mean over all land in the hexagons of about 210,000 km² holding its records. Properties: dry months; annual mean temperature (WorldClim bio01); annual precipitation (log10, bio12); driest-month precipitation (log10 of 1 + mm, bio14); elevation; net primary productivity (`s01`); and the cover of trees (four tree classes together), shrubs, herbaceous vegetation and cultivated vegetation from the 1-km consensus land cover of Tuanmu & Jetz (2014), averaged to 10 arc-minutes.
+2. **Which of them carry the association.** Each related to obligate mutualism and to obligacy given region and lineage (as in `s19`) and within genera (conditional logistic regression on genus), alone and together: dry months with temperature and precipitation (is it rain or warmth?), dry months with tree cover and elevation (is it open or low places?), and all of these together.
+
+Patterns only: which properties of the places go with obligate mutualism, not why.
+
+A full run takes about 5 min (most of it averaging the land cover).
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(dggridR)
+library(mgcv)
+library(survival)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+contrasts <- list(mutualist = list(rows = c("f", "m"), success = "m",
+                                   label = "Obligate mutualist vs facultative"),
+                  obligate = list(rows = c("f", "m", "p"), success = c("m", "p"),
+                                  label = "Obligate vs facultative"))
+properties <- c(dry_months = "Dry months", bio01 = "Annual mean temperature",
+                log_bio12 = "Annual precipitation (log)", log_bio14 = "Driest-month precipitation (log)",
+                elevation = "Elevation", npp = "Net primary productivity", tree = "Tree cover",
+                shrub = "Shrub cover", herb = "Herbaceous cover", cultivated = "Cultivated cover")
+# Joint models: sets of properties entered together
+joint_sets <- list(`Dry months + temperature + precipitation` = c("dry_months", "bio01", "log_bio12"),
+                   `Dry months + tree cover + elevation` = c("dry_months", "tree", "elevation"),
+                   `All six` = c("dry_months", "bio01", "log_bio12", "tree", "elevation", "npp"))
+hex_res <- 5
+landcover_classes <- c(tree = "1", tree = "2", tree = "3", tree = "4", shrub = "5", herb = "6",
+                       cultivated = "7")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_s19 <- path_resrepo("data/intermediate/s19_test_mixed_genera")
+dir_s29 <- path_resrepo("data/intermediate/s29_test_dry_availability")
+dir_data_intermediate <- path_resrepo("data/intermediate/s31_test_dry_habitat")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+contrast_data <- function(sp, ct) {
+  d <- copy(sp[interaction_type %in% contrasts[[ct]]$rows])
+  d[, y := as.integer(interaction_type %in% contrasts[[ct]]$success)]
+  d[, `:=`(genus = factor(genus), subfamily = factor(subfamily), region = factor(region))]
+  d
+}
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom", plot.tag = element_text(face = "bold", size = 11))
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Land cover at 10 arc-minutes
+
+The percentage cover of each class (1-km cells) averaged over the 20 × 20 cells of each 10-arc-minute pixel; tree cover is the sum of the four tree classes.
+
+*Inputs:* raw/landcover_earthenv2014/Consensus_reduced_class_1–7.tif; s19/drought_10m.tif
+*Outputs:* landcover_10m.tif
+
+```{r landcover}
+template <- rast(file.path(dir_s19, "drought_10m.tif"))[["dry_months"]]
+lc <- lapply(unique(names(landcover_classes)), function(nm) {
+  files <- file.path(dir_data_raw, "landcover_earthenv2014",
+                     paste0("Consensus_reduced_class_", landcover_classes[names(landcover_classes) == nm],
+                            ".tif"))
+  agg <- lapply(files, function(f) aggregate(rast(f), fact = 20, fun = "mean", na.rm = TRUE))
+  r <- Reduce(`+`, agg)
+  r <- resample(extend(r, template), template, method = "near")
+  names(r) <- nm
+  r
+})
+lc <- rast(lc)
+writeRaster(lc, file.path(dir_data_intermediate, "landcover_10m.tif"), overwrite = TRUE)
+print(global(lc, c("mean", "max"), na.rm = TRUE))
+```
+
+```{r clear_landcover, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Use beyond availability for each property
+
+*Inputs:* s19/drought_10m.tif; s01/ climate_present_10m.tif, climate_past_10m.tif; s31/landcover_10m.tif; s02/species_records.rds; s05/presence_hex5.csv; s29/species_availability.csv
+*Outputs:* species_habitat.csv
+
+```{r beyond}
+cl <- rast(file.path(dir_s01, "climate_present_10m.tif"))
+stack <- c(rast(file.path(dir_s19, "drought_10m.tif"))[["dry_months"]],
+           cl[["bio01"]], log10(cl[["bio12"]] + 1), log10(cl[["bio14"]] + 1), cl[["elevation"]],
+           rast(file.path(dir_s01, "climate_past_10m.tif"))[["npp"]],
+           rast(file.path(dir_data_intermediate, "landcover_10m.tif")))
+names(stack) <- names(properties)
+px <- as.data.table(as.data.frame(stack, xy = TRUE, cells = TRUE, na.rm = FALSE))
+px <- px[is.finite(dry_months)]
+dg <- dgconstruct(res = hex_res)
+px[, cell_id := dgGEO_to_SEQNUM(dg, x, y)$seqnum]
+hex <- px[, lapply(.SD, mean, na.rm = TRUE), by = cell_id, .SDcols = names(properties)]
+
+# Species of s29 (associated species with dry months and hexagons)
+sp <- fread(file.path(dir_s29, "species_availability.csv"), colClasses = c(pool_key = "character"))[
+  grain == "hex5", .(pool_key, species, genus, subfamily, region, interaction_type)]
+# Used: median over each species' record pixels
+rec <- readRDS(file.path(dir_s02, "species_records.rds"))
+rec[, pool_key := as.character(pool_key)]
+rec <- rec[pool_key %in% sp$pool_key]
+rec[, cell := cellFromXY(stack, cbind(decimalLongitude, decimalLatitude))]
+rc <- merge(unique(rec[!is.na(cell), .(pool_key, cell)]), px[, c("cell", names(properties)), with = FALSE],
+            by = "cell")
+used <- rc[, lapply(.SD, median, na.rm = TRUE), by = pool_key, .SDcols = names(properties)]
+# Available: mean over the hexagons holding the species' records
+pres <- fread(file.path(dir_s05, "presence_hex5.csv"), colClasses = c(pool_key = "character"))
+pres <- merge(pres[pool_key %in% sp$pool_key], hex, by = "cell_id")
+avail <- pres[, lapply(.SD, mean, na.rm = TRUE), by = pool_key, .SDcols = names(properties)]
+both <- merge(used, avail, by = "pool_key", suffixes = c("_used", "_available"))
+for (v in names(properties)) set(both, j = paste0(v, "_beyond"),
+                                 value = both[[paste0(v, "_used")]] - both[[paste0(v, "_available")]])
+sp <- merge(sp, both, by = "pool_key")
+write_table(sp, file.path(dir_data_intermediate, "species_habitat.csv"))
+print(sp[, lapply(.SD, mean, na.rm = TRUE), by = interaction_type,
+         .SDcols = paste0(names(properties), "_beyond")], digits = 2)
+cat("Correlations of use beyond availability with dry months (beyond):\n")
+print(round(cor(sp[, paste0(names(properties), "_beyond"), with = FALSE],
+                use = "pairwise.complete.obs")[, "dry_months_beyond"], 2))
+```
+
+```{r clear_beyond, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Which properties carry the association
+
+Each property's use beyond availability (standardised over the species of the contrast) given region and lineage, alone and in the joint sets; and within the genera containing both outcomes (conditional logistic regression on genus), alone and in the joint sets. Species lacking any property of a model are left out of that model.
+
+*Inputs:* s31/species_habitat.csv
+*Outputs:* habitat_effects.csv
+
+```{r effects}
+sp <- fread(file.path(dir_data_intermediate, "species_habitat.csv"),
+            colClasses = c(pool_key = "character"))
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+sets <- c(setNames(as.list(names(properties)), paste("Alone:", properties)), joint_sets)
+effects <- rbindlist(lapply(names(contrasts), function(ct) {
+  d0 <- contrast_data(sp, ct)
+  rbindlist(lapply(names(sets), function(s) {
+    v <- sets[[s]]
+    cols <- paste0(v, "_beyond")
+    d <- d0[complete.cases(d0[, cols, with = FALSE])]
+    for (cc in cols) set(d, j = paste0(cc, "_z"), value = as.numeric(scale(d[[cc]])))
+    z <- paste0(cols, "_z")
+    m <- gam(as.formula(paste("y ~ region +", paste(z, collapse = " + "), "+", lineage)), data = d,
+             family = binomial, method = "REML")
+    pt <- summary(m)$p.table[z, , drop = FALSE]
+    given <- data.table(analysis = "Given region and lineage", property = v, estimate = pt[, 1],
+                        se = pt[, 2], p = pt[, 4], species = nrow(d))
+    mixed <- d[, .(both = uniqueN(y) == 2), by = genus][both == TRUE]$genus
+    dw <- droplevels(d[genus %in% mixed])
+    for (cc in cols) set(dw, j = paste0(cc, "_w"), value = as.numeric(scale(dw[[cc]])))
+    w <- paste0(cols, "_w")
+    cf <- summary(clogit(as.formula(paste("y ~", paste(w, collapse = " + "), "+ strata(genus)")),
+                         data = dw))$coefficients
+    within <- data.table(analysis = "Within genera", property = v, estimate = cf[, "coef"],
+                         se = cf[, "se(coef)"], p = cf[, "Pr(>|z|)"], species = nrow(dw))
+    rbind(given, within)[, `:=`(contrast = ct, model = s)]
+  }))
+}))
+effects[, joint := !grepl("^Alone", model)]
+write_table(effects, file.path(dir_data_intermediate, "habitat_effects.csv"))
+print(effects[contrast == "mutualist", .(analysis, model, property, estimate, se, p)], digits = 2)
+```
+
+```{r clear_effects, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) Effect of the use beyond availability of each property (log odds per SD, 95% intervals) on obligate mutualism against facultative species, given region and lineage (dark) and within genera (light), each property alone. (b) The effect of dry months when entered together with temperature and precipitation, with tree cover and elevation, and with all of these and net primary productivity, given region and lineage and within genera.
+
+*Inputs:* s31/habitat_effects.csv
+*Outputs:* plot_dry_habitat.png
+
+```{r plot_dry_habitat}
+ef <- fread(file.path(dir_data_intermediate, "habitat_effects.csv"))[contrast == "mutualist"]
+alone <- ef[joint == FALSE]
+alone[, property := factor(properties[property], rev(properties))]
+panel_a <- ggplot(alone, aes(estimate, property, colour = analysis)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), width = 0,
+                linewidth = 0.5, orientation = "y", position = position_dodge(width = 0.6)) +
+  geom_point(size = 2, position = position_dodge(width = 0.6)) +
+  scale_colour_manual(values = c(`Given region and lineage` = "#3B3B3B", `Within genera` = "#E69F00"),
+                      name = NULL) +
+  labs(x = "Effect of use beyond availability (log odds per SD)", y = NULL,
+       title = "Each property alone") +
+  theme_figure()
+jt <- ef[joint == TRUE]
+jt[, `:=`(property = factor(properties[property], rev(properties)),
+          model = factor(model, names(joint_sets)))]
+panel_b <- ggplot(jt, aes(estimate, property, colour = analysis)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), width = 0,
+                linewidth = 0.5, orientation = "y", position = position_dodge(width = 0.6)) +
+  geom_point(size = 2, position = position_dodge(width = 0.6)) +
+  facet_wrap(~ model, ncol = 1, scales = "free_y") +
+  scale_colour_manual(values = c(`Given region and lineage` = "#3B3B3B", `Within genera` = "#E69F00"),
+                      name = NULL) +
+  coord_cartesian(xlim = c(-2.5, 3)) +
+  labs(x = "Effect (log odds per SD)", y = NULL, title = "Properties together") +
+  theme_figure()
+fig <- (panel_a | panel_b) + plot_layout(widths = c(1, 1), guides = "collect") +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")") &
+  theme(legend.position = "bottom")
+save_figure(fig, "plot_dry_habitat", 9, 6.5)
+fig
+```
+
+```{r clear_plot_dry_habitat, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

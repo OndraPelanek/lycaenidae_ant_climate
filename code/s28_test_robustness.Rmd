@@ -1,0 +1,522 @@
+---
+title: "Lycaenidae ant-interaction climate 28 - robustness of the main results (fourth review)"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+A fourth external review (29 October 2026) asked for three robustness checks of the paper's main results:
+
+1. **A flexible climate model.** The climate models of `s20` are additive and linear in six predictors, which may disadvantage climate. Here a generalised additive model with a smooth term for each predictor and a smooth interaction of temperature and aridity predicts the same held-out realms and subfamilies as the linear climate model and lineage, on identical folds. Every model is also fitted with species-specific evidence only, because types presumed from relatives could favour lineage.
+2. **Shared climates with species-specific evidence only.** The standardised comparisons of `s18` (Cape and southern Australia against the Mediterranean Basin) and `s24` (southern Africa and Australia against every other region) repeated with the species whose type was recorded for the species itself.
+3. **Dry seasons, genus by genus.** The association of obligate mutualism with dry months (`s19`):
+   - left out one genus at a time;
+   - estimated with every mixed genus weighted equally;
+   - tested in phylogenetic logistic regressions on both grafted trees;
+   - and repeated with a water-balance measure, the months in which precipitation falls below the potential evapotranspiration of the month (Hargreaves equation, as in `s01`).
+
+A full run takes about 20 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(mgcv)
+library(ape)
+library(phylolm)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+climate_vars <- c("bio01", "log_aridity", "bio15", "lgm_anomaly_temperature",
+                  "lgm_anomaly_log_precipitation", "log10_velocity_temperature")
+contrasts <- list(associated = list(rows = c("n", "f", "m", "p"), success = c("f", "m", "p"),
+                                    specific = c("direct", "direct_class_inferred_subtype"),
+                                    label = "Ant-associated vs non-associated"),
+                  obligate = list(rows = c("f", "m", "p"), success = c("m", "p"),
+                                  specific = c("direct", "direct_class_inferred_subtype"),
+                                  label = "Obligate vs facultative"),
+                  mutualist = list(rows = c("f", "m"), success = "m",
+                                   specific = c("direct", "direct_class_inferred_subtype"),
+                                   label = "Obligate mutualist vs facultative"),
+                  parasite = list(rows = c("m", "p"), success = "p", specific = "direct",
+                                  label = "Parasite vs mutualist"))
+types <- c("n", "f", "m", "p")
+specific_basis <- c("direct", "direct_class_inferred_subtype")
+n_boot <- 500
+min_pixels <- 5
+min_species_stratum <- 3
+phyloglm_btol <- 30
+
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+southern_regions <- c("Southern Africa", "Australia")
+model_colours <- c(climate = "#B73779", `climate (flexible)` = "#D55E00",
+                   lineage = "#3B3B3B")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s04 <- path_resrepo("data/intermediate/s04_fit_phylogenetic_models")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_s13 <- path_resrepo("data/intermediate/s13_compare_matched_climates")
+dir_s19 <- path_resrepo("data/intermediate/s19_test_mixed_genera")
+dir_data_intermediate <- path_resrepo("data/intermediate/s28_test_robustness")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+source(here::here("code", "R", "climate.R"))
+source(here::here("code", "R", "lineage_prediction.R"))
+```
+
+```{r define_helpers}
+# Binomial deviance and AUC (as in s20)
+binary_deviance <- function(y, q) {
+  q <- pmin(pmax(q, 1e-9), 1 - 1e-9)
+  -2 * sum(y * log(q) + (1 - y) * log(1 - q))
+}
+auc <- function(y, q) {
+  if (length(unique(y)) < 2) return(NA_real_)
+  r <- rank(signif(q, 8))
+  n1 <- sum(y == 1)
+  n0 <- sum(y == 0)
+  (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+# Evidence basis of each species unit (first row of the parent table)
+read_basis <- function() {
+  fread(file.path(dir_data_raw, "butterfly_ant_interactions", "species_table.csv"),
+        colClasses = c(pool_key = "character"))[, .(basis = interaction_type_basis[1]),
+                                                by = pool_key]
+}
+
+# Shared strata and standardised shares (as in s24), for any table of pixels with `region` and
+# stratum `s`, and species with `region`, `s`, `genus`, `type`
+shared_strata <- function(area, sp_n, pr) {
+  occ <- area[region %in% pr & pixels >= min_pixels]
+  ok <- merge(occ, sp_n[region %in% pr], by = c("region", "s"))[n >= min_species_stratum]
+  s_ok <- ok[, .N, by = s][N == 2]$s
+  a <- area[region %in% pr & s %in% s_ok]
+  a[, share := pixels / sum(pixels), by = region]
+  a[, .(w = mean(share)), by = s]
+}
+standardised <- function(sp, w, pr, gw = NULL) {
+  d <- sp[region %in% pr & s %in% w$s]
+  d[, g := if (is.null(gw)) 1 else gw[genus]]
+  d[is.na(g), g := 0]
+  cnt <- d[, .(ob = sum(g * (type %in% c("m", "p"))), tot = sum(g)), by = .(region, s)]
+  keep <- cnt[tot > 0, .N, by = s][N == 2]$s
+  cnt <- merge(cnt[s %in% keep], w[s %in% keep], by = "s")
+  cnt[, w := w / sum(w), by = region]
+  cnt[, .(obligate = sum(w * ob / tot), strata = .N), by = region]
+}
+pair_contrast <- function(sp, area, pr) {
+  sp_n <- sp[, .(n = uniqueN(pool_key)), by = .(region, s)]
+  w <- shared_strata(area, sp_n, pr)
+  if (!nrow(w)) return(NULL)
+  obs <- standardised(sp, w, pr)
+  if (nrow(obs) < 2) return(NULL)
+  genera <- unique(sp[region %in% pr & s %in% w$s]$genus)
+  bt <- vapply(seq_len(n_boot), function(b) {
+    gw <- setNames(tabulate(sample.int(length(genera), replace = TRUE), length(genera)), genera)
+    o <- standardised(sp, w, pr, gw)
+    if (nrow(o) < 2) NA_real_ else o[region == pr[1]]$obligate - o[region == pr[2]]$obligate
+  }, numeric(1))
+  data.table(pair = paste(pr, collapse = " vs "), strata = obs$strata[1],
+             obligate_1 = obs[region == pr[1]]$obligate, obligate_2 = obs[region == pr[2]]$obligate,
+             difference = obs[region == pr[1]]$obligate - obs[region == pr[2]]$obligate,
+             difference_low = quantile(bt, 0.025, na.rm = TRUE),
+             difference_high = quantile(bt, 0.975, na.rm = TRUE))
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          panel.grid.major.y = element_blank(),
+          plot.title = element_text(face = "bold", size = base_size + 0.5),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom", plot.tag = element_text(face = "bold", size = 11))
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# 1. A flexible climate model, and species-specific evidence
+
+For each contrast, evidence set and scheme (held-out realms; held-out subfamilies), every held-out unit is predicted by: the linear climate model of `s20` (logistic regression); the flexible climate model (binomial GAM with `s(x, k = 4)` for each of the six predictors and `ti(temperature, aridity, k = 4)`, smoothing estimated by REML in each fold); and lineage (random intercepts of subfamily and genus, variances from the fit to all species of the contrast; a species of an unseen genus or subfamily gets the average prediction over the random effects it does not know; not for held-out subfamilies, whose lineages are unknown by design). Pooled deviance explained relative to the training share, and AUC, with 95% intervals from resampling genera.
+
+*Inputs:* s05/species_regions.csv; raw/butterfly_ant_interactions/species_table.csv
+*Outputs:* flexible_climate.csv
+
+```{r flexible_climate}
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+sp <- merge(sp[interaction_type %in% types & !is.na(region) & subfamily != ""], read_basis(),
+            by = "pool_key", all.x = TRUE)
+sp <- sp[complete.cases(sp[, climate_vars, with = FALSE])]
+
+flex_rhs <- paste(c(paste0("s(", climate_vars, ", k = 4)"), "ti(bio01, log_aridity, k = 4)"),
+                  collapse = " + ")
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+
+set.seed(20261029)
+pred <- rbindlist(lapply(c("associated", "obligate", "parasite"), function(ct) {
+  rbindlist(lapply(c("all", "specific"), function(ev) {
+    d <- copy(sp[interaction_type %in% contrasts[[ct]]$rows])
+    if (ev == "specific") d <- d[basis %in% contrasts[[ct]]$specific]
+    d[, y := as.integer(interaction_type %in% contrasts[[ct]]$success)]
+    for (v in climate_vars) set(d, j = v, value = as.numeric(scale(d[[v]])))
+    d[, `:=`(genus = factor(genus), subfamily = factor(subfamily))]
+    schemes <- list(`held-out realm` = d$region, `held-out subfamily` = as.character(d$subfamily))
+    rbindlist(lapply(names(schemes), function(s) rbindlist(lapply(unique(schemes[[s]]), function(u) {
+      test <- schemes[[s]] == u
+      if (sum(test) < 5 || length(unique(d$y[!test])) < 2) return(NULL)
+      train <- d[!test]
+      X <- model.matrix(as.formula(paste("~", paste(climate_vars, collapse = " + "))), data = d)
+      fit <- suppressWarnings(glm.fit(X[!test, , drop = FALSE], train$y, family = binomial()))
+      b <- fit$coefficients
+      b[is.na(b)] <- 0
+      q_lin <- as.numeric(plogis(X[test, , drop = FALSE] %*% b))
+      m_flex <- tryCatch(gam(as.formula(paste("y ~", flex_rhs)), data = train, family = binomial,
+                             method = "REML"), error = function(e) NULL)
+      q_flex <- if (is.null(m_flex)) rep(NA_real_, sum(test)) else
+        as.numeric(predict(m_flex, newdata = d[test], type = "response"))
+      out <- d[test, .(genus, y)]
+      out[, `:=`(q0 = mean(train$y), climate = q_lin, `climate (flexible)` = q_flex)]
+      if (s == "held-out realm") {
+        # Random-effect variances estimated on the training species only (REML in each fold)
+        m_lin <- gam(as.formula(paste("y ~", lineage)), data = train, family = binomial,
+                     method = "REML", drop.unused.levels = FALSE)
+        out[, lineage := predict_lineage(m_lin, train, d[test])]
+      }
+      out[, `:=`(contrast = ct, evidence = ev, scheme = s, unit = u)]
+    }), fill = TRUE)), fill = TRUE)
+  }), fill = TRUE)
+}), fill = TRUE)
+
+pl <- melt(pred, id.vars = c("genus", "y", "q0", "contrast", "evidence", "scheme", "unit"),
+           measure.vars = c("climate", "climate (flexible)", "lineage"), variable.name = "model",
+           value.name = "q")[is.finite(q)]
+metric <- function(y, q, q0) c(d2 = 1 - binary_deviance(y, q) / binary_deviance(y, q0),
+                               auc = auc(y, q))
+res <- pl[, {
+  m <- metric(y, q, q0)
+  idx <- split(seq_len(.N), genus)
+  bt <- t(replicate(n_boot, {
+    i <- unlist(idx[sample.int(length(idx), replace = TRUE)], use.names = FALSE)
+    metric(y[i], q[i], q0[i])
+  }))
+  list(species = .N, d2 = m[["d2"]], d2_low = quantile(bt[, "d2"], 0.025, na.rm = TRUE),
+       d2_high = quantile(bt[, "d2"], 0.975, na.rm = TRUE), auc = m[["auc"]],
+       auc_low = quantile(bt[, "auc"], 0.025, na.rm = TRUE),
+       auc_high = quantile(bt[, "auc"], 0.975, na.rm = TRUE))
+}, by = .(contrast, evidence, scheme, model)]
+write_table(res, file.path(dir_data_intermediate, "flexible_climate.csv"))
+print(res, digits = 2)
+```
+
+```{r clear_flexible_climate, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# 2. Shared climates with species-specific evidence
+
+*Inputs:* s13/ pixel_strata.rds, record_pixels.rds, taxa.csv; raw/butterfly_ant_interactions/species_table.csv
+*Outputs:* shared_climates_specific.csv
+
+```{r shared_specific}
+pix <- readRDS(file.path(dir_s13, "pixel_strata.rds"))
+rec <- readRDS(file.path(dir_s13, "record_pixels.rds"))
+rec[, pool_key := as.character(pool_key)]
+taxa <- fread(file.path(dir_s13, "taxa.csv"), colClasses = c(pool_key = "character"))
+taxa <- merge(taxa[classified == TRUE], read_basis(), by = "pool_key", all.x = TRUE)
+
+run_design <- function(px, region_col, pairs, evidence) {
+  p <- px[!is.na(get(region_col)), .(cell, region = as.character(get(region_col)), s = stratum)]
+  area <- p[, .(pixels = .N), by = .(region, s)]
+  t <- if (evidence == "specific") taxa[basis %in% specific_basis] else taxa
+  sp <- unique(merge(rec[cell %in% p$cell], p, by = "cell")[, .(region, s, pool_key)])
+  sp <- merge(sp, t[, .(pool_key, genus, type = interaction_type)], by = "pool_key")
+  rbindlist(lapply(pairs, function(pr) pair_contrast(sp, area, pr)))
+}
+set.seed(20261029)
+med_pairs <- list(c("Cape", "Mediterranean Basin"), c("Southern Australia", "Mediterranean Basin"))
+all_pairs <- unlist(lapply(southern_regions, function(a)
+  lapply(setdiff(region_levels, southern_regions), function(b) c(a, b))), recursive = FALSE)
+res <- rbindlist(lapply(c("all", "specific"), function(ev) rbind(
+  run_design(pix, "med_region", med_pairs, ev)[, design := "Mediterranean-climate regions"],
+  run_design(pix, "region", all_pairs, ev)[, design := "All land"])[, evidence := ev]))
+write_table(res, file.path(dir_data_intermediate, "shared_climates_specific.csv"))
+print(dcast(res, design + pair ~ evidence, value.var = c("difference", "difference_low")),
+      digits = 2)
+```
+
+```{r clear_shared_specific, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# 3. Dry seasons, genus by genus
+
+## Water-balance months
+
+For every pixel holding records of an associated species, the number of months in which precipitation is below the month's Hargreaves potential evapotranspiration; the median over each species' record pixels.
+
+*Inputs:* raw/worldclim_2.1/ monthly prec, tmin, tmax; s19/species_drought.csv; s02/species_records.rds
+*Outputs:* species_drought_balance.csv
+
+```{r water_balance}
+read_monthly <- function(variable) {
+  zip <- file.path(dir_data_raw, "worldclim_2.1", paste0("wc2.1_10m_", variable, ".zip"))
+  files <- sort(grep("\\.tif$", unzip(zip, list = TRUE)$Name, value = TRUE))
+  rast(file.path("/vsizip", zip, files))
+}
+sp <- fread(file.path(dir_s19, "species_drought.csv"), colClasses = c(pool_key = "character"))
+x <- readRDS(file.path(dir_s02, "species_records.rds"))
+x[, pool_key := as.character(pool_key)]
+prec <- read_monthly("prec")
+x <- x[pool_key %in% sp$pool_key]
+x[, cell := cellFromXY(prec, cbind(decimalLongitude, decimalLatitude))]
+px <- unique(x[!is.na(cell), .(pool_key, cell)])
+cells <- unique(px$cell)
+P <- as.matrix(prec[cells])
+TN <- as.matrix(read_monthly("tmin")[cells])
+TX <- as.matrix(read_monthly("tmax")[cells])
+lat <- yFromCell(prec, cells)
+days <- c(31, 28.25, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+ra <- extraterrestrial_radiation(lat)
+pet <- pmax(0.0023 * ra * ((TN + TX) / 2 + 17.8) * sqrt(pmax(TX - TN, 0)), 0) *
+  matrix(days, length(cells), 12, byrow = TRUE)
+deficit <- data.table(cell = cells, deficit_months = rowSums(P < pet))
+px <- merge(px, deficit, by = "cell")
+med <- px[, .(deficit_months = median(deficit_months, na.rm = TRUE)), by = pool_key]
+sp <- merge(sp, med, by = "pool_key")
+write_table(sp, file.path(dir_data_intermediate, "species_drought_balance.csv"))
+print(sp[, .(species = .N, dry_months = median(dry_months), deficit_months = median(deficit_months)),
+         by = interaction_type])
+cat("Correlation of dry months and water-deficit months:",
+    round(cor(sp$dry_months, sp$deficit_months, use = "complete.obs"), 2), "\n")
+```
+
+```{r clear_water_balance, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+## Effects, leave-one-genus-out, genus-balanced and phylogenetic
+
+*Inputs:* s28/species_drought_balance.csv; s04/grafted_trees.rds
+*Outputs:* drought_robustness.csv, drought_logo.csv, drought_genus_balanced.csv
+
+```{r drought_robustness}
+sp <- fread(file.path(dir_data_intermediate, "species_drought_balance.csv"),
+            colClasses = c(pool_key = "character"))
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+prep <- function(ct, v) {
+  d <- copy(sp[interaction_type %in% contrasts[[ct]]$rows & is.finite(get(v))])
+  d[, `:=`(y = as.integer(interaction_type %in% contrasts[[ct]]$success),
+           z = as.numeric(scale(get(v))), region = factor(region), genus = factor(genus),
+           subfamily = factor(subfamily))]
+  d
+}
+effect <- function(d) {
+  m <- gam(as.formula(paste("y ~ region + z +", lineage)), data = d, family = binomial,
+           method = "REML")
+  cf <- summary(m)$p.table["z", ]
+  c(estimate = cf[[1]], se = cf[[2]], p = cf[[4]])
+}
+within_slope <- function(d) {
+  mixed <- d[, .(both = uniqueN(y) == 2), by = genus][both == TRUE]$genus
+  dm <- droplevels(d[genus %in% mixed])
+  fit <- suppressWarnings(glm.fit(cbind(dm$z, model.matrix(~ genus - 1, dm)), dm$y,
+                                  family = binomial()))
+  fit$coefficients[1]
+}
+
+# --- Main effects with both measures, all contrasts ---
+props <- c(dry_months = "Dry months (P < 2T)", deficit_months = "Water-deficit months (P < PET)")
+res <- rbindlist(lapply(c("obligate", "mutualist", "parasite"), function(ct)
+  rbindlist(lapply(names(props), function(v) {
+    e <- effect(prep(ct, v))
+    data.table(contrast = ct, property = v, analysis = "Given region and lineage",
+               estimate = e[["estimate"]], se = e[["se"]], p = e[["p"]])
+  }))))
+
+# --- Phylogenetic logistic regressions with region, on both grafted trees ---
+trees <- readRDS(file.path(dir_s04, "grafted_trees.rds"))
+phylo <- rbindlist(lapply(names(trees), function(study) rbindlist(lapply(
+  c("obligate", "mutualist"), function(ct) rbindlist(lapply(names(props), function(v) {
+    d <- as.data.frame(prep(ct, v)[species %in% trees[[study]]$tip.label])
+    rownames(d) <- d$species
+    tr <- keep.tip(trees[[study]], d$species)
+    m <- tryCatch(phyloglm(y ~ z + region, data = d, phy = tr, method = "logistic_MPLE",
+                           btol = phyloglm_btol), error = function(e) NULL)
+    if (is.null(m)) return(NULL)
+    cf <- summary(m)$coefficients["z", ]
+    data.table(contrast = ct, property = v, analysis = paste("Phylogenetic,", study),
+               estimate = cf[[1]], se = cf[[2]], p = cf[[4]])
+  }))))))
+res <- rbind(res, phylo)
+write_table(res, file.path(dir_data_intermediate, "drought_robustness.csv"))
+print(res, digits = 3)
+
+# --- Leave one genus out: every genus with obligate species, for the effect given region and
+# lineage; every mixed genus, for the within-genus slope ---
+d <- prep("mutualist", "dry_months")
+ob_genera <- d[, .(ob = sum(y)), by = genus][ob > 0]$genus
+logo <- rbindlist(lapply(as.character(ob_genera), function(g) {
+  e <- tryCatch(effect(droplevels(d[genus != g])), error = function(e) c(estimate = NA, se = NA, p = NA))
+  data.table(left_out = g, analysis = "Given region and lineage", estimate = e[["estimate"]],
+             p = e[["p"]])
+}))
+mixed <- d[, .(both = uniqueN(y) == 2), by = genus][both == TRUE]$genus
+logo <- rbind(logo, rbindlist(lapply(as.character(mixed), function(g)
+  data.table(left_out = g, analysis = "Within mixed genera",
+             estimate = within_slope(droplevels(d[genus != g])), p = NA_real_))))
+write_table(logo, file.path(dir_data_intermediate, "drought_logo.csv"))
+print(logo[, .(fits = .N, min = min(estimate, na.rm = TRUE), max = max(estimate, na.rm = TRUE),
+               max_p = max(p, na.rm = TRUE)), by = analysis], digits = 3)
+
+# --- Genus-balanced: in every mixed genus, the mean standardised dry months of its obligate
+# mutualists minus that of its facultative species; every genus weighted equally ---
+gb <- d[genus %in% mixed, .(difference = mean(z[y == 1]) - mean(z[y == 0]),
+                            mutualists = sum(y), facultative = sum(1 - y)), by = genus]
+set.seed(20261029)
+bt <- replicate(10000, mean(sample(gb$difference, replace = TRUE)))
+genus_balanced <- data.table(genera = nrow(gb), positive = sum(gb$difference > 0),
+                             mean_difference = mean(gb$difference),
+                             low = quantile(bt, 0.025), high = quantile(bt, 0.975),
+                             sign_test_p = binom.test(sum(gb$difference > 0), nrow(gb))$p.value,
+                             wilcoxon_p = wilcox.test(gb$difference)$p.value)
+write_table(gb, file.path(dir_data_intermediate, "drought_genera.csv"))
+write_table(genus_balanced, file.path(dir_data_intermediate, "drought_genus_balanced.csv"))
+print(gb[order(-difference)], digits = 2)
+print(genus_balanced, digits = 3)
+```
+
+```{r clear_drought_robustness, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) Pooled held-out deviance explained of the linear and flexible climate models and of lineage, for held-out realms and subfamilies, with all classified species and with species-specific evidence only (95% intervals from resampling genera). (b) Standardised difference in obligate share within shared climates, with all classified species and with species-specific evidence only. (c) Effect of dry months and of water-deficit months on obligate mutualism given region and lineage, and in phylogenetic logistic regressions; grey: range when each genus with obligate species is left out. (d) Mean standardised dry months of the obligate mutualists minus the facultative species of each mixed genus.
+
+*Inputs:* s28/ flexible_climate.csv, shared_climates_specific.csv, drought_robustness.csv, drought_logo.csv, drought_genera.csv
+*Outputs:* plot_robustness.png
+
+```{r plot_robustness}
+fc <- fread(file.path(dir_data_intermediate, "flexible_climate.csv"))
+sc <- fread(file.path(dir_data_intermediate, "shared_climates_specific.csv"))
+dr <- fread(file.path(dir_data_intermediate, "drought_robustness.csv"))
+logo <- fread(file.path(dir_data_intermediate, "drought_logo.csv"))
+gb <- fread(file.path(dir_data_intermediate, "drought_genera.csv"))
+
+fc[, `:=`(contrast = factor(sapply(contrasts, `[[`, "label")[contrast],
+                            sapply(contrasts, `[[`, "label")),
+          evidence = factor(c(all = "All classified", specific = "Species-specific")[evidence]),
+          model = factor(model, rev(names(model_colours))))]
+panel_a <- ggplot(fc, aes(100 * d2, model, colour = model, shape = evidence)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = 100 * d2_low, xmax = 100 * d2_high), width = 0, linewidth = 0.45,
+                orientation = "y", position = position_dodge(width = 0.6)) +
+  geom_point(size = 2, fill = "white", position = position_dodge(width = 0.6)) +
+  facet_grid(scheme ~ contrast, scales = "free_x") +
+  scale_colour_manual(values = model_colours, guide = "none") +
+  scale_shape_manual(values = c(16, 21), name = NULL) +
+  labs(x = "Held-out deviance explained (%)", y = NULL,
+       title = "A flexible climate model and species-specific evidence") +
+  theme_figure() + theme(strip.text.y = element_text(angle = 0, hjust = 0))
+
+sc[, `:=`(pair = factor(pair, rev(unique(pair))),
+          evidence = factor(c(all = "All classified", specific = "Species-specific")[evidence]))]
+panel_b <- ggplot(sc, aes(100 * difference, pair, shape = evidence)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = 100 * difference_low, xmax = 100 * difference_high), width = 0,
+                linewidth = 0.45, orientation = "y", position = position_dodge(width = 0.6),
+                colour = "#E69F00") +
+  geom_point(size = 2, fill = "white", colour = "#E69F00", position = position_dodge(width = 0.6)) +
+  scale_shape_manual(values = c(16, 21), name = NULL) +
+  labs(x = "Difference in obligate share within shared climates (points)", y = NULL,
+       title = "Shared climates, species-specific evidence") +
+  theme_figure()
+
+dm <- dr[contrast == "mutualist"]
+dm[, label := paste(c(dry_months = "Dry months", deficit_months = "Water-deficit months")[property],
+                    "-", analysis)]
+lg <- logo[analysis == "Given region and lineage", .(low = min(estimate, na.rm = TRUE),
+                                                     high = max(estimate, na.rm = TRUE))]
+panel_c <- ggplot(dm, aes(estimate, label)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  annotate("rect", xmin = lg$low, xmax = lg$high, ymin = -Inf, ymax = Inf, fill = "grey88") +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), width = 0,
+                linewidth = 0.5, orientation = "y") +
+  geom_point(aes(fill = p < 0.05), shape = 21, size = 2.2) +
+  scale_fill_manual(values = c(`TRUE` = "black", `FALSE` = "white"), guide = "none") +
+  labs(x = "Effect on obligate mutualism (log odds per SD)", y = NULL,
+       title = "Dry seasons and obligate mutualism",
+       subtitle = "Grey: range of the estimate when each genus is left out") +
+  theme_figure()
+
+gb[, genus := factor(genus, genus[order(difference)])]
+panel_d <- ggplot(gb, aes(difference, genus)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_segment(aes(x = 0, xend = difference, yend = genus), colour = "grey55") +
+  geom_point(aes(size = mutualists), colour = "#E69F00") +
+  scale_size_area(max_size = 4, name = "Obligate mutualists") +
+  labs(x = "Dry months, obligate mutualists minus facultative (SD)", y = NULL,
+       title = "Each mixed genus weighted equally") +
+  theme_figure() + theme(axis.text.y = element_text(face = "italic"))
+
+fig <- panel_a / (panel_b | panel_c) / panel_d + plot_layout(heights = c(1.2, 1, 1)) +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")")
+save_figure(fig, "plot_robustness", 10, 12)
+fig
+```
+
+```{r clear_plot_robustness, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

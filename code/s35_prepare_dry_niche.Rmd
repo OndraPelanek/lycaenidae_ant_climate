@@ -1,0 +1,373 @@
+---
+title: "Lycaenidae ant-interaction climate 35 - butterfly background, accessible areas and water predictors for the dry-niche test"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+This notebook prepares the data for `s36_test_dry_niche`, which tests whether obligate mutualists occupy seasonally drier environments than their facultative congeners once climatic availability and recording effort are accounted for (research proposal of 30 October 2026). It builds three things at the 10-arc-minute resolution of the climate layers:
+
+1. **A target-group background of all butterflies.** The georeferenced GBIF records of the six butterfly families (Hesperiidae, Lycaenidae, Nymphalidae, Papilionidae, Pieridae and Riodinidae), with the same bases of record and years as the cleaned lycaenid records, counted per pixel from GBIF's public occurrence-density maps (Phillips et al. 2009; Barber et al. 2022). The records of each focal species are counted separately, so that `s36` can remove them from that species' background. Both are cached in `data/raw/butterflies_gbif_density/`, so later runs do not query GBIF.
+2. **Accessible areas, defined before any modelling.** Simple biogeographic areas (Barve et al. 2011): the land of each realm on each landmass of the Last Glacial Maximum shelf (land above -120 m, ETOPO1), so that islands on a shelf (Borneo, Sumatra, Java, Tasmania) join their continent and deep-water barriers (Wallace's line) separate areas; continental Africa is divided from the Palaearctic by the realm boundary in the Sahara, and the Sahul shelf is split into Australia and New Guinea at 10° S, the boundary of the study's regions. Two alternatives: realms on present-day landmasses, and the study's eight regions.
+3. **Water and temperature predictors.** Dry months (precipitation in mm below twice the mean temperature, as in `s19`); the annual climatic water deficit (the sum of monthly Hargreaves potential evapotranspiration in excess of precipitation, mm); months of water deficit; months with less than 50 mm of rain (a dry-season length that does not depend on temperature); precipitation seasonality; driest-month precipitation; and annual mean temperature.
+
+The first run queries about 2,000 GBIF map tiles (about 30 min); later runs take about 3 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(sf)
+library(jsonlite)
+library(ggplot2)
+```
+
+## Variables
+
+```{r setup_variables}
+# GBIF backbone keys of the butterfly families (Hedylidae, a few hundred records, are left out)
+families <- c(Hesperiidae = 6953, Lycaenidae = 5473, Nymphalidae = 7017, Papilionidae = 9417,
+              Pieridae = 5481, Riodinidae = 1933999)
+# Bases of record and years of the cleaned lycaenid records (records_final.rds, in_strict_plus)
+bases <- c("HUMAN_OBSERVATION", "PRESERVED_SPECIMEN", "OCCURRENCE", "MACHINE_OBSERVATION",
+           "MATERIAL_CITATION", "MATERIAL_SAMPLE", "OBSERVATION")
+years <- "1900,2026"
+# Map tiles: zoom 4 in EPSG:4326 (tiles of 11.25 degrees, points every 1.3 arc-minutes), covering
+# the Old World from 34 degrees W to 180 degrees E and 90 degrees N to 56 degrees S
+zoom <- 4
+tiles_x <- 13:31
+tiles_y <- 0:12
+# Margin around a focal species' records within which its own GBIF records are counted (degrees)
+focal_margin <- 5
+# Sea level of the Last Glacial Maximum shelf (m)
+shelf_depth <- -120
+predictors <- c(dry_months = "Dry months", cwd = "Climatic water deficit (mm)",
+                deficit_months = "Water-deficit months", dry50 = "Months below 50 mm",
+                bio15 = "Precipitation seasonality", log_bio14 = "Driest-month precipitation (log)",
+                bio01 = "Annual mean temperature")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_gbif <- file.path(dir_data_raw, "butterflies_gbif_density")
+dir_etopo <- file.path(dir_data_raw, "etopo1")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s13 <- path_resrepo("data/intermediate/s13_compare_matched_climates")
+dir_s19 <- path_resrepo("data/intermediate/s19_test_mixed_genera")
+dir_data_intermediate <- path_resrepo("data/intermediate/s35_prepare_dry_niche")
+for (d in c(dir_gbif, dir_etopo, dir_data_intermediate)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+source(here::here("code", "R", "climate.R"))
+```
+
+```{r define_helpers}
+read_monthly <- function(variable) {
+  zip <- file.path(dir_data_raw, "worldclim_2.1", paste0("wc2.1_10m_", variable, ".zip"))
+  files <- sort(grep("\\.tif$", unzip(zip, list = TRUE)$Name, value = TRUE))
+  rast(file.path("/vsizip", zip, files))
+}
+# One GBIF occurrence-density tile (precomputed maps; only georeferenced records without
+# geospatial issues): the points of the tile with their record counts, in longitude and latitude.
+# Points lie on a 512 x 512 grid; GDAL returns the tile's y axis pointing up. Points on the far
+# edges belong to the neighbouring tiles and are dropped.
+fetch_tile <- function(x, y, taxon_key) {
+  query <- paste0("srs=EPSG:4326&taxonKey=", taxon_key, "&",
+                  paste0("basisOfRecord=", bases, collapse = "&"), "&year=", years)
+  url <- sprintf("https://api.gbif.org/v2/map/occurrence/density/%d/%d/%d.mvt?%s", zoom, x, y, query)
+  f <- tempfile(fileext = ".mvt")
+  on.exit(unlink(f))
+  ok <- FALSE
+  for (attempt in 1:5) {
+    ok <- tryCatch({ download.file(url, f, mode = "wb", quiet = TRUE); TRUE },
+                   error = function(e) FALSE)
+    if (ok) break
+    Sys.sleep(10 * attempt)
+  }
+  if (!ok) stop("GBIF tile failed: ", url)
+  if (!file.exists(f) || file.size(f) == 0) return(NULL)
+  p <- tryCatch(st_read(f, quiet = TRUE), error = function(e) NULL)
+  if (is.null(p) || !nrow(p)) return(NULL)
+  xy <- st_coordinates(p)
+  keep <- xy[, 1] >= 0 & xy[, 1] < 512 & xy[, 2] >= 0 & xy[, 2] < 512
+  size <- 180 / 2^zoom
+  data.table(lon = -180 + (x + (xy[keep, 1] + 0.5) / 512) * size,
+             lat = 90 - (y + 1) * size + (xy[keep, 2] + 0.5) / 512 * size,
+             records = p$total[keep])
+}
+# Records of a set of tiles summed per 10-arc-minute pixel
+fetch_cells <- function(tiles, taxon_key, template) {
+  pts <- rbindlist(lapply(seq_len(nrow(tiles)), function(i) {
+    Sys.sleep(0.2)
+    fetch_tile(tiles$x[i], tiles$y[i], taxon_key)
+  }))
+  if (!nrow(pts)) return(data.table(cell = integer(), records = numeric()))
+  pts[, cell := cellFromXY(template, cbind(lon, lat))]
+  pts[!is.na(cell), .(records = sum(records)), by = cell]
+}
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom")
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Focal species
+
+The facultative species and obligate mutualists of the genera that contain both (classified species, `s19`), with the extent of their cleaned records.
+
+*Inputs:* s19/species_drought.csv; s02/species_records.rds
+*Outputs:* focal_species.csv
+
+```{r focal}
+sp <- fread(file.path(dir_s19, "species_drought.csv"), colClasses = c(pool_key = "character"))[
+  interaction_type %in% c("f", "m")]
+mixed <- sp[, .(both = uniqueN(interaction_type) == 2), by = genus][both == TRUE]$genus
+sp <- sp[genus %in% mixed, .(pool_key, species, genus, subfamily, region, interaction_type,
+                             evidence = interaction_type_basis)]
+rec <- readRDS(file.path(dir_s02, "species_records.rds"))
+rec[, pool_key := as.character(pool_key)]
+ext <- rec[pool_key %in% sp$pool_key, .(lon_min = min(decimalLongitude), lon_max = max(decimalLongitude),
+                                        lat_min = min(decimalLatitude), lat_max = max(decimalLatitude),
+                                        records = .N), by = pool_key]
+sp <- merge(sp, ext, by = "pool_key")
+write_table(sp, file.path(dir_data_intermediate, "focal_species.csv"))
+print(sp[, .(species = .N), by = .(genus, interaction_type)][order(genus, interaction_type)])
+```
+
+```{r clear_focal, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Butterfly records from GBIF
+
+The records of the six butterfly families per 10-arc-minute pixel (`background_counts_10m.csv.gz`), and the records of each focal species within its extent plus a margin (`focal_counts_10m.csv.gz`). Both are fetched only when the cached files are missing; `fetch_log.csv` records the query and date.
+
+*Inputs:* GBIF occurrence-density maps (fetched once); s01/climate_present_10m.tif; s35/focal_species.csv
+*Outputs:* raw/butterflies_gbif_density/ background_counts_10m.csv.gz, focal_counts_10m.csv.gz, fetch_log.csv
+
+```{r gbif}
+template <- rast(file.path(dir_s01, "climate_present_10m.tif"))[[1]]
+f_bg <- file.path(dir_gbif, "background_counts_10m.csv.gz")
+f_focal <- file.path(dir_gbif, "focal_counts_10m.csv.gz")
+tiles <- CJ(x = tiles_x, y = tiles_y)
+if (!file.exists(f_bg)) {
+  bg <- rbindlist(lapply(names(families), function(fam) {
+    message("Fetching ", fam)
+    fetch_cells(tiles, families[[fam]], template)[, family := fam]
+  }))
+  fwrite(bg, f_bg)
+}
+if (!file.exists(f_focal)) {
+  sp <- fread(file.path(dir_data_intermediate, "focal_species.csv"), colClasses = c(pool_key = "character"))
+  size <- 180 / 2^zoom
+  focal <- rbindlist(lapply(seq_len(nrow(sp)), function(i) {
+    s <- sp[i]
+    tx <- floor((c(s$lon_min, s$lon_max) + c(-1, 1) * focal_margin + 180) / size)
+    ty <- floor((90 - c(s$lat_max, s$lat_min) + c(-1, 1) * focal_margin) / size)
+    t <- CJ(x = intersect(tx[1]:tx[2], tiles_x), y = intersect(ty[1]:ty[2], tiles_y))
+    fetch_cells(t, s$pool_key, template)[, pool_key := s$pool_key]
+  }))
+  fwrite(focal, f_focal)
+}
+if (!file.exists(file.path(dir_gbif, "fetch_log.csv"))) {
+  fwrite(data.table(fetched = format(Sys.Date()), source = "https://api.gbif.org/v2/map/occurrence/density",
+                    zoom = zoom, srs = "EPSG:4326", tiles_x = paste(range(tiles_x), collapse = "-"),
+                    tiles_y = paste(range(tiles_y), collapse = "-"), families = paste(names(families), collapse = ", "),
+                    basis_of_record = paste(bases, collapse = ", "), years = years,
+                    focal_margin_degrees = focal_margin),
+         file.path(dir_gbif, "fetch_log.csv"))
+}
+bg <- as.data.table(read.csv(gzfile(f_bg)))
+focal <- as.data.table(read.csv(gzfile(f_focal), colClasses = c(pool_key = "character")))
+print(bg[, .(pixels = .N, records = sum(records)), by = family])
+cat("Focal species with GBIF records:", uniqueN(focal$pool_key), "; records:", sum(focal$records), "\n")
+# Check: share of the records that fall on land pixels of the climate layers
+land <- !is.na(values(template, mat = FALSE))
+cat("Share of butterfly records on land pixels:", round(sum(bg$records[land[bg$cell]]) / sum(bg$records), 4), "\n")
+```
+
+```{r clear_gbif, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Accessible areas
+
+ETOPO1 elevation and bathymetry (NOAA National Geophysical Data Center 2009), fetched once at 10 arc-minutes from the NOAA ERDDAP server. Land at the Last Glacial Maximum is land above -120 m; its connected landmasses (eight-neighbour patches), crossed with the realms, give the primary accessible areas. Realms are the study's regions with southern and tropical Africa merged (Afrotropic) and Australia and New Guinea kept apart (Sahul split at 10° S).
+
+*Inputs:* raw/etopo1/etopo1_10m.nc (fetched once); s01/climate_present_10m.tif; s13/pixel_strata.rds
+*Outputs:* accessible_areas.csv
+
+```{r areas}
+template <- rast(file.path(dir_s01, "climate_present_10m.tif"))[[1]]
+f_etopo <- file.path(dir_etopo, "etopo1_10m.nc")
+if (!file.exists(f_etopo)) {
+  url <- paste0("https://coastwatch.pfeg.noaa.gov/erddap/griddap/etopo180.nc?",
+                "altitude%5B(-90.0):10:(90.0)%5D%5B(-180.0):10:(180.0)%5D")
+  download.file(url, f_etopo, mode = "wb", quiet = TRUE)
+}
+etopo <- rast(f_etopo)
+etopo <- resample(etopo, template, method = "bilinear")
+present <- !is.na(template)
+shelf <- (etopo > shelf_depth) | present
+shelf <- classify(shelf, cbind(0, NA))
+present_land <- classify(present, cbind(0, NA))
+r_shelf <- patches(shelf, directions = 8)
+r_present <- patches(present_land, directions = 8)
+
+pix <- readRDS(file.path(dir_s13, "pixel_strata.rds"))[!is.na(region), .(cell, region = as.character(region))]
+pix[, `:=`(comp_shelf = r_shelf[cell][, 1], comp_present = r_present[cell][, 1])]
+pix[, realm := fcase(region %in% c("Southern Africa", "Tropical Africa"), "Afrotropic",
+                     default = region)]
+# Names of the main landmasses, from reference points
+ref <- data.table(name = c("Afro-Eurasia", "Madagascar", "Australia", "New Guinea", "Sulawesi",
+                           "Luzon", "Mindanao", "Japan", "Sri Lanka", "Borneo", "Sumatra", "Java",
+                           "Tasmania", "Taiwan", "New Britain", "Timor", "Halmahera"),
+                  lon = c(20, 47, 135, 140, 121, 121, 125, 138, 80.7, 114, 101, 110, 146.5, 121, 150.5, 125.5, 128),
+                  lat = c(5, -19, -25, -5, -2, 16, 7.5, 36, 7.8, 1, 0, -7.4, -42, 23.7, -5.7, -9, 1))
+name_comp <- function(comp, layer) {
+  ids <- layer[cellFromXY(template, cbind(ref$lon, ref$lat))][, 1]
+  nm <- tapply(ref$name, ids, function(x) x[1])
+  out <- nm[as.character(comp)]
+  ifelse(is.na(out), paste("landmass", comp), out)
+}
+pix[, `:=`(landmass_shelf = name_comp(comp_shelf, r_shelf), landmass_present = name_comp(comp_present, r_present))]
+pix[, `:=`(area_shelf = paste0(realm, ": ", landmass_shelf),
+           area_present = paste0(realm, ": ", landmass_present),
+           area_region = region)]
+# Sahul: Australia and New Guinea apart (the study's regions split it at 10 degrees S)
+pix[realm %in% c("Australia", "New Guinea and islands") & landmass_shelf == "Australia",
+    area_shelf := paste0(realm, ": Sahul")]
+write_table(pix[, .(cell, region, realm, area_shelf, area_present, area_region)],
+            file.path(dir_data_intermediate, "accessible_areas.csv"))
+print(pix[, .(pixels = .N), by = area_shelf][order(-pixels)][1:20])
+```
+
+```{r clear_areas, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Predictors and background weights per pixel
+
+For every land pixel of the eight regions: its accessible area under each definition, its water and temperature predictors, the area of the pixel (for a geographically uniform background) and its butterfly records.
+
+*Inputs:* raw/worldclim_2.1/ monthly prec, tmin, tmax; s01/climate_present_10m.tif; s19/drought_10m.tif; s35/accessible_areas.csv; raw/butterflies_gbif_density/background_counts_10m.csv.gz
+*Outputs:* dry_niche_pixels.rds
+
+```{r pixels}
+cl <- rast(file.path(dir_s01, "climate_present_10m.tif"))
+dr <- rast(file.path(dir_s19, "drought_10m.tif"))
+pix <- fread(file.path(dir_data_intermediate, "accessible_areas.csv"))
+P <- as.matrix(read_monthly("prec")[pix$cell])
+TN <- as.matrix(read_monthly("tmin")[pix$cell])
+TX <- as.matrix(read_monthly("tmax")[pix$cell])
+lat <- yFromCell(cl, pix$cell)
+days <- c(31, 28.25, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+pet <- pmax(0.0023 * extraterrestrial_radiation(lat) * ((TN + TX) / 2 + 17.8) *
+              sqrt(pmax(TX - TN, 0)), 0) * matrix(days, nrow(pix), 12, byrow = TRUE)
+pix[, `:=`(lon = xFromCell(cl, cell), lat = lat,
+           area = cos(lat * pi / 180),
+           dry_months = dr[["dry_months"]][cell][, 1],
+           cwd = rowSums(pmax(pet - P, 0)),
+           deficit_months = rowSums(P < pet),
+           dry50 = rowSums(P < 50),
+           bio15 = cl[["bio15"]][cell][, 1],
+           log_bio14 = log10(cl[["bio14"]][cell][, 1] + 1),
+           bio01 = cl[["bio01"]][cell][, 1])]
+pix <- pix[complete.cases(pix[, names(predictors), with = FALSE])]
+bg <- as.data.table(read.csv(gzfile(file.path(dir_gbif, "background_counts_10m.csv.gz"))))[, .(butterfly_records = sum(records)), by = cell]
+pix <- merge(pix, bg, by = "cell", all.x = TRUE)
+pix[is.na(butterfly_records), butterfly_records := 0]
+saveRDS(pix, file.path(dir_data_intermediate, "dry_niche_pixels.rds"))
+print(pix[, .(pixels = .N, with_records = mean(butterfly_records > 0), records = sum(butterfly_records)),
+          by = region])
+print(round(cor(pix[, names(predictors), with = FALSE]), 2))
+```
+
+```{r clear_pixels, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Coverage of the butterfly records
+
+How completely the butterfly records cover each accessible area, and each part of its range of dry months: the share of land pixels with at least one record. Under the record-weighted backgrounds of `s36`, pixels without records carry no weight, so poorly recorded conditions are not treated as absences; under the uniform background they are.
+
+*Inputs:* s35/dry_niche_pixels.rds
+*Outputs:* coverage.csv, plot_coverage.png
+
+```{r plot_coverage}
+pix <- readRDS(file.path(dir_data_intermediate, "dry_niche_pixels.rds"))
+cov <- pix[, .(pixels = .N, recorded = mean(butterfly_records > 0), records = sum(butterfly_records)),
+           by = .(area_shelf, dry_months)]
+write_table(cov, file.path(dir_data_intermediate, "coverage.csv"))
+# Old World areas only: the GBIF tiles do not cover the Americas, which hold no contrasts
+main_areas <- pix[!realm %in% c("Nearctic", "Neotropic"), .N, by = area_shelf][N >= 2000]$area_shelf
+fig_a <- ggplot(pix[butterfly_records > 0], aes(lon, lat, fill = log10(butterfly_records))) +
+  geom_raster() +
+  scale_fill_viridis_c(option = "magma", direction = -1, name = "Butterfly records per pixel (log10)") +
+  coord_equal(xlim = c(-20, 180), ylim = c(-48, 75)) +
+  labs(x = NULL, y = NULL, title = "(a) Records of all butterflies (GBIF), 10-arc-minute pixels") +
+  theme_figure() + theme(panel.grid.major = element_blank())
+fig_b <- ggplot(cov[area_shelf %in% main_areas & pixels >= 20],
+                aes(dry_months, recorded, colour = area_shelf)) +
+  geom_line(linewidth = 0.5) + geom_point(aes(size = pixels)) +
+  scale_size_area(max_size = 3, guide = "none") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = 0:12) +
+  labs(x = "Dry months of the pixel", y = "Land pixels with butterfly records", colour = NULL,
+       title = "(b) Coverage of the records along the dry season, by accessible area") +
+  guides(colour = guide_legend(ncol = 2)) +
+  theme_figure()
+fig <- patchwork::wrap_plots(fig_a, fig_b, ncol = 1, heights = c(1.1, 1))
+save_figure(fig, "plot_coverage", 8, 9)
+fig
+```
+
+```{r clear_plot_coverage, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

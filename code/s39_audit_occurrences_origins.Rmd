@@ -1,0 +1,411 @@
+---
+title: "Lycaenidae ant-interaction climate 39 - audit of the GBIF supplementation and the real number of independent origins"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+Two diagnostics asked by the sixth external review (`writing/research_roadmap.md`, ranks 2 and 3), run before any further model:
+
+1. **Occurrence audit.** In `s37`, adding each species' own GBIF records within 100 km of its cleaned records weakened the dry-month contrast between mutualists and facultative relatives. For every species: the pixels added and the climates they add; whether the parent study had records in those pixels that its cleaning removed, and by which rule; how much the species moved the pooled estimate; and, for the most influential species, the data providers, bases of record, years and GBIF issue flags of the added records. Pixels in which the parent cleaning removed records are not trustworthy additions (roadmap decision rule).
+2. **Independent origins.** For each contrast: how many separate clades of obligate mutualists the published trees show (the matched tips of the dated Yumnam tree for species; the tree of genera and the Kawahara tree of genera for the multi-genus contrast), and how balanced the contrast is.
+
+It also writes empty data-entry templates for the natural-history and partner-ant compilations (`data/raw/natural_history/`), to be filled from the original literature; nothing in them is inferred.
+
+The first run queries GBIF for the most influential species (about 10 min); later runs take about 3 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(jsonlite)
+library(metafor)
+library(ape)
+library(ggplot2)
+```
+
+## Variables
+
+```{r setup_variables}
+n_influential <- 6                   # species whose added records are traced in GBIF
+max_pixels_query <- 120              # added pixels queried per species
+flag_order <- c(flag_taxonomic_exclusion = "Taxonomic exclusion", flag_introduced = "Introduced",
+                remove_native_strict = "Outside the native range (strict)", outlier_strict = "Spatial outlier (strict)",
+                base_main = "Basic filters (coordinates, basis, duplicates)")
+step_cleaned <- "Version 1 data (within genera, cleaned records)"
+step_supplemented <- "Adding GBIF supplementation"
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_nh <- file.path(dir_data_raw, "natural_history")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s21 <- path_resrepo("data/intermediate/s21_test_ant_partners")
+dir_s25 <- path_resrepo("data/intermediate/s25_test_convergence")
+dir_s30 <- path_resrepo("data/intermediate/s30_test_ant_traits")
+dir_s37 <- path_resrepo("data/intermediate/s37_test_dry_niche_v2")
+dir_s38 <- path_resrepo("data/intermediate/s38_diagnose_identifiability")
+dir_data_intermediate <- path_resrepo("data/intermediate/s39_audit_occurrences_origins")
+for (d in c(dir_nh, dir_data_intermediate)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Two-stage pooled difference (as in s37): per contrast, inverse-variance means of each strategy
+# with the between-species variance; contrasts of one origin combined; random effects over origins
+pooled_difference <- function(e) {
+  e <- copy(e)[is.finite(estimate) & is.finite(se)]
+  e[, m := as.integer(strategy == "m")]
+  h <- tryCatch(rma.mv(estimate, se^2, mods = ~ m, random = list(~ 1 | contrast, ~ 1 | species),
+                       data = e, method = "REML"), error = function(err) NULL)
+  tau2 <- if (is.null(h)) 0 else h$sigma2[2]
+  u <- e[, { w <- 1 / (se^2 + tau2)
+    .(difference = sum((w * estimate)[m == 1]) / sum(w[m == 1]) - sum((w * estimate)[m == 0]) / sum(w[m == 0]),
+      se = sqrt(1 / sum(w[m == 1]) + 1 / sum(w[m == 0]))) }, by = .(origin, contrast)]
+  o <- u[, .(difference = sum(difference / se^2) / sum(1 / se^2), se = sqrt(1 / sum(1 / se^2))), by = origin]
+  rma(o$difference, sei = o$se, method = "REML")$b[1]
+}
+# Maximal clades of tips in `target` on a tree pruned to `tips` (each a separate origin if no reversals)
+count_clades <- function(tree, tips, target) {
+  tips <- intersect(tips, tree$tip.label)
+  if (length(intersect(target, tips)) == 0) return(0L)
+  if (length(tips) < 2) return(1L)
+  t <- keep.tip(tree, tips)
+  n <- Ntip(t)
+  all_target <- vapply(seq_len(n + t$Nnode), function(v)
+    all(if (v <= n) t$tip.label[v] %in% target else extract.clade(t, v)$tip.label %in% target), logical(1))
+  parent <- c(setNames(t$edge[, 1], t$edge[, 2]))
+  roots <- which(all_target & vapply(seq_along(all_target), function(v) {
+    p <- parent[as.character(v)]
+    is.na(p) || !all_target[p]
+  }, logical(1)))
+  length(roots)
+}
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom")
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# What the supplementation added, species by species
+
+For every species of the `s37` contrasts: cleaned and added pixels, the climates of each (H1–H3 variables), and whether the parent study had records in the added pixels that its cleaning removed (the first applicable rule, in the order: taxonomic exclusion, introduced, outside the native range, spatial outlier, basic filters).
+
+*Inputs:* s37/ presences.csv, contrasts.csv; s38/mechanism_pixels.rds; raw/butterfly_ant_interactions/records_final.rds; s01/climate_present_10m.tif
+*Outputs:* supplement_species.csv, supplement_pixels.csv
+
+```{r supplement}
+ct <- fread(file.path(dir_s37, "contrasts.csv"), colClasses = c(pool_key = "character"))[occurrences == "supplemented"]
+pres <- fread(file.path(dir_s37, "presences.csv"), colClasses = c(pool_key = "character"))[pool_key %in% ct$pool_key]
+pix <- readRDS(file.path(dir_s38, "mechanism_pixels.rds"))
+template <- rast(file.path(dir_s01, "climate_present_10m.tif"))[[1]]
+rf <- readRDS(file.path(dir_data_raw, "butterfly_ant_interactions", "records_final.rds"))
+rf[, pool_key := as.character(pool_key)]
+rf <- rf[pool_key %in% ct$pool_key & in_strict_plus == FALSE]
+rf[, cell := cellFromXY(template, cbind(decimalLongitude, decimalLatitude))]
+rf[, reason := fcase(flag_taxonomic_exclusion == TRUE, flag_order[["flag_taxonomic_exclusion"]],
+                     flag_introduced == TRUE, flag_order[["flag_introduced"]],
+                     remove_native_strict == TRUE, flag_order[["remove_native_strict"]],
+                     outlier_strict == TRUE, flag_order[["outlier_strict"]],
+                     default = flag_order[["base_main"]])]
+removed <- rf[!is.na(cell), .(reason = names(sort(table(reason), decreasing = TRUE))[1], removed_records = .N),
+              by = .(pool_key, cell)]
+added <- merge(pres[source == "GBIF", .(pool_key, cell, area)], removed, by = c("pool_key", "cell"), all.x = TRUE)
+added[is.na(reason), reason := "No record in the parent download"]
+added <- merge(added, pix[, .(cell, bio01, dry_run50, cwd)], by = "cell")
+write_table(added, file.path(dir_data_intermediate, "supplement_pixels.csv"))
+cl <- merge(pres[source == "cleaned", .(pool_key, cell, area)], pix[, .(cell, bio01, dry_run50, cwd)], by = "cell")
+sp <- unique(ct[, .(pool_key, species, genus, strategy)])
+summ <- merge(sp, cl[, .(cleaned_pixels = .N, cleaned_temp = mean(bio01), cleaned_run = mean(dry_run50),
+                         cleaned_cwd = mean(cwd)), by = pool_key], by = "pool_key", all.x = TRUE)
+summ <- merge(summ, added[, .(added_pixels = .N, added_temp = mean(bio01), added_run = mean(dry_run50),
+                              added_cwd = mean(cwd),
+                              added_removed_by_cleaning = sum(reason != "No record in the parent download")),
+                          by = pool_key], by = "pool_key", all.x = TRUE)
+summ[is.na(added_pixels), `:=`(added_pixels = 0L, added_removed_by_cleaning = 0L)]
+summ[, `:=`(added_share = added_pixels / (cleaned_pixels + added_pixels),
+            run_shift = (cleaned_pixels * cleaned_run + added_pixels * fifelse(is.na(added_run), 0, added_run)) /
+              (cleaned_pixels + added_pixels) - cleaned_run)]
+write_table(summ, file.path(dir_data_intermediate, "supplement_species.csv"))
+print(added[, .N, by = reason][order(-N)])
+print(summ[order(-added_pixels)][1:15, .(species, strategy, cleaned_pixels, added_pixels, added_removed_by_cleaning,
+                                        run_shift = round(run_shift, 2))])
+```
+
+```{r clear_supplement, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Which species moved the estimate
+
+The two-stage pooled difference in the association with dry months (all-butterfly background, within-genus contrasts of version 1) with cleaned records and with supplemented records, and the change when each species alone is reverted to its cleaned-record estimate.
+
+*Inputs:* s37/ species_estimates.csv, contrasts.csv; s39/supplement_species.csv
+*Outputs:* supplement_influence.csv
+
+```{r influence}
+est <- fread(file.path(dir_s37, "species_estimates.csv"), colClasses = c(pool_key = "character"))[
+  model == "primary" & background == "record"]
+ct <- fread(file.path(dir_s37, "contrasts.csv"), colClasses = c(pool_key = "character"))[scheme == "within"]
+e_cl <- merge(est[occurrences == "cleaned"], ct[occurrences == "cleaned"], by = c("pool_key", "area", "occurrences"))
+e_su <- merge(est[occurrences == "supplemented"], ct[occurrences == "supplemented"], by = c("pool_key", "area", "occurrences"))
+e_cl[, unit := paste(pool_key, area)]
+e_su[, unit := paste(pool_key, area)]
+p_cl <- pooled_difference(e_cl)
+p_su <- pooled_difference(e_su)
+# Decomposition: units eligible with cleaned records, re-estimated with supplemented records; and
+# units that became eligible only through the supplementation
+p_existing <- pooled_difference(e_su[unit %in% e_cl$unit])
+decomp <- data.table(step = c("Cleaned records", "Same units, supplemented records", "Adding newly eligible units"),
+                     pooled = c(p_cl, p_existing, p_su),
+                     units = c(nrow(e_cl), e_su[unit %in% e_cl$unit, .N], nrow(e_su)))
+write_table(decomp, file.path(dir_data_intermediate, "supplement_decomposition.csv"))
+print(decomp, digits = 2)
+# Influence of each unit: reverted to its cleaned estimate (re-estimated units) or dropped (new units)
+infl <- rbindlist(lapply(e_su$unit, function(u) {
+  e <- copy(e_su)
+  if (u %in% e_cl$unit) {
+    e[unit == u, `:=`(estimate = e_cl[unit == u]$estimate, se = e_cl[unit == u]$se)]
+    type <- "Re-estimated with supplemented records"
+  } else {
+    e <- e[unit != u]
+    type <- "Newly eligible through supplementation"
+  }
+  data.table(unit = u, type = type, pooled_reverted = pooled_difference(e))
+}))
+infl <- merge(infl, e_su[, .(unit, pool_key, area, species, genus, strategy, estimate_supplemented = estimate)], by = "unit")
+infl <- merge(infl, e_cl[, .(unit, estimate_cleaned = estimate)], by = "unit", all.x = TRUE)
+infl[, `:=`(pooled_cleaned = p_cl, pooled_supplemented = p_su, influence = pooled_reverted - p_su)]
+setorder(infl, -influence)
+write_table(infl, file.path(dir_data_intermediate, "supplement_influence.csv"))
+print(infl[order(-abs(influence))][1:12, .(species, area = sub(": .*$", "", area), strategy, type = substr(type, 1, 14),
+                                           est_cleaned = round(estimate_cleaned, 2), est_supplemented = round(estimate_supplemented, 2),
+                                           influence = round(influence, 2))])
+```
+
+```{r clear_influence, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Provenance of the added records of the most influential species
+
+For the species whose supplementation moved the pooled estimate most (either direction), the GBIF records in their added pixels (up to `r max_pixels_query` pixels per species): data providers, bases of record, years and issue flags, from the GBIF occurrence API (facet counts; cached).
+
+*Inputs:* s39/ supplement_influence.csv, supplement_pixels.csv; s01/climate_present_10m.tif
+*Outputs:* gbif_added_facets.csv, provenance_summary.csv
+
+```{r provenance}
+infl <- fread(file.path(dir_data_intermediate, "supplement_influence.csv"), colClasses = c(pool_key = "character"))
+added <- fread(file.path(dir_data_intermediate, "supplement_pixels.csv"), colClasses = c(pool_key = "character"))
+template <- rast(file.path(dir_s01, "climate_present_10m.tif"))[[1]]
+f_cache <- file.path(dir_data_intermediate, "gbif_added_facets.csv")
+top <- unique(infl[order(-abs(influence))]$pool_key)[1:n_influential]
+if (!file.exists(f_cache)) {
+  set.seed(39)
+  facets <- rbindlist(lapply(top, function(k) {
+    cells <- added[pool_key == k]$cell
+    if (length(cells) > max_pixels_query) cells <- sample(cells, max_pixels_query)
+    rbindlist(lapply(cells, function(c) {
+      xy <- xyFromCell(template, c)
+      url <- sprintf(paste0("https://api.gbif.org/v1/occurrence/search?taxonKey=%s&decimalLatitude=%.4f,%.4f",
+                            "&decimalLongitude=%.4f,%.4f&hasGeospatialIssue=false&limit=0&facet=datasetKey",
+                            "&facet=basisOfRecord&facet=year&facet=issue&facetLimit=200"),
+                     k, xy[2] - 1 / 12, xy[2] + 1 / 12, xy[1] - 1 / 12, xy[1] + 1 / 12)
+      Sys.sleep(0.2)
+      r <- tryCatch(fromJSON(url), error = function(e) NULL)
+      if (is.null(r) || !length(r$facets)) return(NULL)
+      out <- rbindlist(lapply(seq_len(nrow(r$facets)), function(i) {
+        cnt <- r$facets$counts[[i]]
+        if (!NROW(cnt)) return(NULL)
+        data.table(field = r$facets$field[i], value = as.character(cnt$name), records = cnt$count)
+      }))
+      if (!nrow(out)) return(NULL)
+      out[, `:=`(pool_key = k, cell = c)]
+    }))
+  }))
+  fwrite(facets, f_cache)
+}
+facets <- fread(f_cache, colClasses = c(pool_key = "character"))
+# Dataset titles of the main providers
+keys <- facets[field == "DATASET_KEY", .(records = sum(records)), by = value][order(-records)][1:min(.N, 15)]$value
+titles <- rbindlist(lapply(keys, function(k) {
+  r <- tryCatch(fromJSON(paste0("https://api.gbif.org/v1/dataset/", k)), error = function(e) NULL)
+  data.table(value = k, title = if (is.null(r)) NA_character_ else r$title)
+}))
+prov <- facets[, .(records = sum(records)), by = .(pool_key, field, value)]
+prov <- merge(prov, titles, by = "value", all.x = TRUE)
+prov[, share := records / sum(records), by = .(pool_key, field)]
+prov <- merge(prov, infl[, .(influence = influence[which.max(abs(influence))]), by = .(pool_key, species)], by = "pool_key")
+write_table(prov[order(species, field, -records)], file.path(dir_data_intermediate, "provenance_summary.csv"))
+print(prov[field %in% c("BASIS_OF_RECORD", "DATASET_KEY") & share > 0.1,
+           .(species, field, value = fifelse(is.na(title), value, substr(title, 1, 50)), share = round(share, 2))])
+```
+
+```{r clear_provenance, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Independent origins
+
+For each contrast of `s37` (cleaned records, origin scheme): the balance of mutualists and facultative species; the species of the contrast on the matched dated Yumnam tree and the separate clades of mutualists among them; and, for contrasts of several genera, the separate clades of mutualist genera on the tree of genera and the Kawahara tree of genera.
+
+*Inputs:* s37/contrasts.csv; s25/convergence_trees.rds
+*Outputs:* origins.csv
+
+```{r origins}
+ct <- fread(file.path(dir_s37, "contrasts.csv"), colClasses = c(pool_key = "character"))[
+  occurrences == "cleaned" & scheme == "origins"]
+trees <- readRDS(file.path(dir_s25, "convergence_trees.rds"))
+sp_tree <- trees[["Species tree (Yumnam, matched)"]]$tree
+gen_trees <- list(`Tree of genera` = trees[["Tree of genera"]]$tree, Kawahara = trees[["Tree of genera (Kawahara)"]]$tree)
+og <- ct[, {
+  m_sp <- unique(species[strategy == "m"]); f_sp <- unique(species[strategy == "f"])
+  m_gen <- unique(genus[strategy == "m"]); f_gen <- unique(genus[strategy == "f"])
+  on <- intersect(c(m_sp, f_sp), sp_tree$tip.label)
+  out <- list(mutualists = length(m_sp), facultative = length(f_sp), balance = min(length(m_sp), length(f_sp)) /
+                max(length(m_sp), length(f_sp)), mutualist_genera = length(m_gen), facultative_genera = length(f_gen),
+              on_species_tree_m = length(intersect(m_sp, on)), on_species_tree_f = length(intersect(f_sp, on)),
+              mutualist_clades_species_tree = if (length(intersect(f_sp, on))) count_clades(sp_tree, on, m_sp) else NA_integer_)
+  for (tn in names(gen_trees)) out[[paste0("mutualist_genus_clades_", gsub(" ", "_", tolower(tn)))]] <-
+    if (length(m_gen) > 1 || !identical(m_gen, f_gen)) count_clades(gen_trees[[tn]], union(m_gen, f_gen), setdiff(m_gen, f_gen)) else NA_integer_
+  out
+}, by = .(origin, contrast)]
+write_table(og, file.path(dir_data_intermediate, "origins.csv"))
+print(og)
+cat("Contrasts:", nrow(og), "; with at least two species of each strategy:", og[mutualists >= 2 & facultative >= 2, .N],
+    "; separate mutualist clades on the species tree (where resolvable):", og[, sum(mutualist_clades_species_tree, na.rm = TRUE)], "\n")
+```
+
+```{r clear_origins, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Data-entry templates for the natural-history compilation
+
+Empty templates, one row per species of the contrasts and one per recorded ant partner of their obligate species, with the fields asked for by the review. They are to be filled only from the original literature, with a source and a reliability code for every value; empty cells mean unknown, and obligate mutualism must not be read as nest dwelling.
+
+*Inputs:* s37/contrasts.csv; s21/partner_records.csv; s30/partner_ants.csv
+*Outputs:* raw/natural_history/ larval_natural_history_template.csv, partner_ants_template.csv, README.md
+
+```{r templates}
+ct <- fread(file.path(dir_s37, "contrasts.csv"), colClasses = c(pool_key = "character"))[
+  occurrences == "cleaned" & scheme == "origins"]
+lar <- unique(ct[, .(pool_key, species, genus, strategy, contrast)])
+for (v in c("host_plant_species", "host_plant_family", "habitat", "larval_months", "dry_season_dormancy",
+            "larval_location", "attended_throughout_development", "ant_partners", "evidence_of_ant_benefit",
+            "source", "reliability", "notes")) set(lar, j = v, value = NA_character_)
+f_lar <- file.path(dir_nh, "larval_natural_history_template.csv")
+if (!file.exists(f_lar)) fwrite(lar, f_lar)
+pr <- fread(file.path(dir_s21, "partner_records.csv"), colClasses = c(pool_key = "character"))[pool_key %in% ct$pool_key]
+pa <- fread(file.path(dir_s30, "partner_ants.csv"))
+ants <- unique(pr[, .(ant_taxon, ant_genus)])
+ants <- merge(ants, pr[, .(lycaenids = uniqueN(pool_key), obligate_lycaenids = uniqueN(pool_key[interaction_type == "m"])),
+                       by = ant_taxon], by = "ant_taxon")
+ants <- merge(ants, pa[, .(ant_taxon, colony_size_database = colony_size)], by = "ant_taxon", all.x = TRUE)
+for (v in c("colony_size", "colony_persistence", "nest_site", "polydomy", "queen_number", "local_dominance",
+            "seasonal_activity", "recruitment", "partner_specificity", "source", "reliability", "notes"))
+  set(ants, j = v, value = NA_character_)
+f_ant <- file.path(dir_nh, "partner_ants_template.csv")
+if (!file.exists(f_ant)) fwrite(ants[order(-obligate_lycaenids)], f_ant)
+if (!file.exists(file.path(dir_nh, "README.md"))) writeLines(c(
+  "# Natural-history compilation (in progress)", "",
+  "Data-entry templates written by `s39_audit_occurrences_origins` for the species of the dry-niche contrasts and the ant partners of their obligate species. Every value must come from the original literature, with its source and a reliability code (A: direct observation of the species; B: secondary account; C: inferred from congeners). Empty cells mean unknown. Obligate mutualism must not be read as nest dwelling.", "",
+  "- `larval_natural_history_template.csv`: host plants, habitat, larval months, dry-season dormancy, larval location (on the host plant, in ant nests, both), attendance through development, ant partners, evidence of benefit.",
+  "- `partner_ants_template.csv`: colony size, persistence, nest site, polydomy, queen number, local dominance, seasonal activity, recruitment, partner specificity; `colony_size_database` is the value of Bell-Roberts et al. (2024) where available."),
+  file.path(dir_nh, "README.md"))
+cat("Template rows: species", nrow(lar), "; ant partners", nrow(ants), "\n")
+```
+
+```{r clear_templates, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) The pixels added by the supplementation, by species and by whether the parent cleaning had removed records there. (b) The change in the pooled difference when each species is reverted to its cleaned records.
+
+*Inputs:* s39/ supplement_pixels.csv, supplement_influence.csv, supplement_species.csv
+*Outputs:* plot_supplement_audit.png
+
+```{r plot_supplement_audit}
+added <- fread(file.path(dir_data_intermediate, "supplement_pixels.csv"), colClasses = c(pool_key = "character"))
+summ <- fread(file.path(dir_data_intermediate, "supplement_species.csv"), colClasses = c(pool_key = "character"))
+infl <- fread(file.path(dir_data_intermediate, "supplement_influence.csv"), colClasses = c(pool_key = "character"))
+a <- merge(added[, .N, by = .(pool_key, reason)], summ[, .(pool_key, species, strategy, cleaned_pixels)], by = "pool_key")
+top <- summ[order(-added_pixels)][1:min(.N, 25)]$species
+a <- a[species %in% top]
+a[, species := factor(species, rev(top))]
+fig_a <- ggplot(a, aes(N, species, fill = reason)) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = c("#3B3B3B", "#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#999999"), name = NULL) +
+  labs(x = "Pixels added from GBIF", y = NULL, title = "(a) Pixels added, by what the parent cleaning did there") +
+  guides(fill = guide_legend(ncol = 2)) +
+  theme_figure(8) + theme(axis.text.y = element_text(face = "italic"))
+i <- infl[order(-abs(influence))][1:min(.N, 15)][, species := paste0(species, " (", sub(": .*$", "", area), ")")]
+i[, species := factor(species, rev(species))]
+fig_b <- ggplot(i, aes(influence, species, colour = strategy)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_segment(aes(x = 0, xend = influence, yend = species), linewidth = 0.6) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c(f = "#56B4E9", m = "#D55E00"), labels = c(f = "Facultative", m = "Obligate mutualist"),
+                      name = NULL) +
+  labs(x = "Change in the pooled difference when the species is reverted to cleaned records", y = NULL,
+       title = "(b) Species that moved the estimate",
+       subtitle = sprintf("Pooled difference: %.2f with cleaned records, %.2f with supplementation",
+                          infl$pooled_cleaned[1], infl$pooled_supplemented[1])) +
+  theme_figure(8) + theme(axis.text.y = element_text(face = "italic"))
+fig <- patchwork::wrap_plots(fig_a, fig_b, ncol = 2, widths = c(1.1, 1))
+save_figure(fig, "plot_supplement_audit", 11, 6)
+fig
+```
+
+```{r clear_plot_supplement_audit, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

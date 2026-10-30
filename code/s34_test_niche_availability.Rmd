@@ -1,0 +1,253 @@
+---
+title: "Lycaenidae ant-interaction climate 34 - water availability used and accessible in the mixed genera"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+`s29` and `s31` compared the climate of each species' records with the mean of the hexagons holding them. The fifth external review (29 October 2026) pointed out that those hexagons are defined by the species' own records, which makes the baseline partly circular and dependent on the grain, and asked for accessible areas defined independently of the hexagon grid, a background adjusted for sampling, and several measures of water availability. This notebook is that pilot, restricted to the genera that contain both obligate mutualists and facultative species:
+
+1. **Accessible area.** For each species, all land within 250 km, or 500 km, of its records (geodesic buffers around its occupied 10-arc-minute pixels).
+2. **Background.** Either every land pixel of the accessible area, or only the pixels in which any lycaenid has been recorded (a target-group background, which carries the same sampling effort as the records).
+3. **Water availability.** Dry months (`s19`); precipitation of the driest month (log10 of 1 + mm); months of water deficit (precipitation below Hargreaves potential evapotranspiration, as in `s28`); the aridity index (log10, `s01`, high = wetter); and precipitation seasonality.
+4. **Use beyond availability.** The species' mean over its record pixels minus the mean of its background; for each measure, radius and background, the mutualists of each genus against its facultative species (conditional logistic regression on genus; and genus by genus, sign test).
+
+The direction expected if mutualists sit in drier places than accessible to them: more dry months and water-deficit months, less rain in the driest month, lower aridity index (drier), higher seasonality.
+
+A full run takes about 10 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(survival)
+library(ggplot2)
+```
+
+## Variables
+
+```{r setup_variables}
+radii_km <- c(250, 500)
+measures <- c(dry_months = "Dry months", log_bio14 = "Driest-month precipitation (log)",
+              deficit_months = "Water-deficit months", log_aridity = "Aridity index (log; high = wetter)",
+              bio15 = "Precipitation seasonality")
+# Sign of "drier" for each measure
+drier_sign <- c(dry_months = 1, log_bio14 = -1, deficit_months = 1, log_aridity = -1, bio15 = 1)
+backgrounds <- c(all = "All land in the accessible area", sampled = "Pixels with lycaenid records")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s19 <- path_resrepo("data/intermediate/s19_test_mixed_genera")
+dir_s29 <- path_resrepo("data/intermediate/s29_test_dry_availability")
+dir_data_intermediate <- path_resrepo("data/intermediate/s34_test_niche_availability")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+source(here::here("code", "R", "climate.R"))
+```
+
+```{r define_helpers}
+read_monthly <- function(variable) {
+  zip <- file.path(dir_data_raw, "worldclim_2.1", paste0("wc2.1_10m_", variable, ".zip"))
+  files <- sort(grep("\\.tif$", unzip(zip, list = TRUE)$Name, value = TRUE))
+  rast(file.path("/vsizip", zip, files))
+}
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom")
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Layers
+
+Water measures at 10 arc-minutes, and the pixels in which any lycaenid has been recorded.
+
+*Inputs:* s19/drought_10m.tif; s01/climate_present_10m.tif; raw/worldclim_2.1/ monthly prec, tmin, tmax; s02/species_records.rds
+*Outputs:* water_10m.tif
+
+```{r layers}
+dr <- rast(file.path(dir_s19, "drought_10m.tif"))
+cl <- rast(file.path(dir_s01, "climate_present_10m.tif"))
+prec <- read_monthly("prec")
+tmin <- read_monthly("tmin")
+tmax <- read_monthly("tmax")
+land <- which(!is.na(values(dr[["dry_months"]], mat = FALSE)))
+lat <- yFromCell(dr, land)
+P <- as.matrix(prec[land]); TN <- as.matrix(tmin[land]); TX <- as.matrix(tmax[land])
+days <- c(31, 28.25, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+pet <- pmax(0.0023 * extraterrestrial_radiation(lat) * ((TN + TX) / 2 + 17.8) *
+              sqrt(pmax(TX - TN, 0)), 0) * matrix(days, length(land), 12, byrow = TRUE)
+deficit <- rast(dr[["dry_months"]])
+deficit[land] <- rowSums(P < pet)
+rec <- readRDS(file.path(dir_s02, "species_records.rds"))
+sampled <- rast(dr[["dry_months"]])
+sampled[unique(cellFromXY(dr, cbind(rec$decimalLongitude, rec$decimalLatitude)))] <- 1
+water <- c(dr[["dry_months"]], log10(dr[["bio14"]] + 1), deficit, log10(cl[["aridity_index"]]),
+           cl[["bio15"]], sampled)
+names(water) <- c(names(measures), "sampled")
+writeRaster(water, file.path(dir_data_intermediate, "water_10m.tif"), overwrite = TRUE)
+print(global(water, "mean", na.rm = TRUE))
+```
+
+```{r clear_layers, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Used and accessible water availability
+
+For the associated species of the genera with both obligate mutualists and facultative species (`s29`): the mean of each measure over the species' record pixels, and over each background within each radius.
+
+*Inputs:* s34/water_10m.tif; s29/species_availability.csv; s02/species_records.rds
+*Outputs:* species_niche.csv
+
+```{r niche}
+water <- rast(file.path(dir_data_intermediate, "water_10m.tif"))
+sp <- fread(file.path(dir_s29, "species_availability.csv"), colClasses = c(pool_key = "character"))[
+  grain == "hex5" & interaction_type %in% c("f", "m")]
+mixed <- sp[, .(both = uniqueN(interaction_type) == 2), by = genus][both == TRUE]$genus
+sp <- sp[genus %in% mixed]
+rec <- readRDS(file.path(dir_s02, "species_records.rds"))
+rec[, pool_key := as.character(pool_key)]
+rec <- rec[pool_key %in% sp$pool_key]
+rec[, cell := cellFromXY(water, cbind(decimalLongitude, decimalLatitude))]
+cells <- unique(rec[!is.na(cell), .(pool_key, cell)])
+vals <- as.data.table(water[cells$cell])
+used <- cbind(cells, vals)[, lapply(.SD, mean, na.rm = TRUE), by = pool_key, .SDcols = names(measures)]
+setnames(used, names(measures), paste0(names(measures), "_used"))
+res <- rbindlist(lapply(radii_km, function(r) rbindlist(lapply(sp$pool_key, function(k) {
+  xy <- xyFromCell(water, cells[pool_key == k]$cell)
+  buf <- aggregate(buffer(vect(xy, crs = "EPSG:4326"), width = r * 1000))
+  e <- as.data.table(extract(water, buf, ID = FALSE))
+  e <- e[is.finite(dry_months)]
+  rbind(e[, c(list(background = "all"), lapply(.SD, mean, na.rm = TRUE)), .SDcols = names(measures)],
+        e[sampled == 1, c(list(background = "sampled"), lapply(.SD, mean, na.rm = TRUE)),
+          .SDcols = names(measures)])[, `:=`(pool_key = k, radius_km = r)]
+}))))
+setnames(res, names(measures), paste0(names(measures), "_available"))
+res <- merge(merge(res, used, by = "pool_key"),
+             sp[, .(pool_key, species, genus, subfamily, region, interaction_type)], by = "pool_key")
+for (v in names(measures)) set(res, j = paste0(v, "_beyond"),
+                                value = res[[paste0(v, "_used")]] - res[[paste0(v, "_available")]])
+write_table(res, file.path(dir_data_intermediate, "species_niche.csv"))
+print(res[, .(species = .N, genera = uniqueN(genus)), by = .(radius_km, background, interaction_type)])
+```
+
+```{r clear_niche, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Mutualists against facultative congeners
+
+For each measure, radius and background: the conditional logistic regression of obligate mutualism on the standardised use beyond availability, stratified by genus; and the genera in which the mutualists' mean use beyond availability is on the drier side of that of their facultative congeners (sign test). Estimates are reported on the "drier" scale (the sign flipped for measures where lower is drier), so positive values mean mutualists in drier places than accessible to them.
+
+*Inputs:* s34/species_niche.csv
+*Outputs:* niche_tests.csv, niche_genera.csv
+
+```{r tests}
+res <- fread(file.path(dir_data_intermediate, "species_niche.csv"), colClasses = c(pool_key = "character"))
+res[, y := as.integer(interaction_type == "m")]
+tests <- list()
+genera <- list()
+for (r in radii_km) for (b in names(backgrounds)) for (v in names(measures)) {
+  d <- res[radius_km == r & background == b & is.finite(get(paste0(v, "_beyond")))]
+  d <- d[genus %in% d[, .(both = uniqueN(y) == 2), by = genus][both == TRUE]$genus]
+  x <- drier_sign[[v]] * as.numeric(scale(d[[paste0(v, "_beyond")]]))
+  cf <- summary(clogit(y ~ x + strata(genus), data = data.frame(y = d$y, x = x, genus = d$genus)))$coefficients
+  g <- d[, .(difference = drier_sign[[v]] * (mean(get(paste0(v, "_beyond"))[y == 1]) -
+                                               mean(get(paste0(v, "_beyond"))[y == 0])),
+             mutualists = sum(y), facultative = sum(1 - y)), by = genus]
+  tests[[length(tests) + 1]] <- data.table(
+    radius_km = r, background = b, measure = v, genera = nrow(g), species = nrow(d),
+    estimate = cf[1, "coef"], se = cf[1, "se(coef)"], p = cf[1, "Pr(>|z|)"],
+    drier_genera = sum(g$difference > 0), sign_test_p = binom.test(sum(g$difference > 0), nrow(g))$p.value)
+  genera[[length(genera) + 1]] <- g[, `:=`(radius_km = r, background = b, measure = v)]
+}
+tests <- rbindlist(tests)
+genera <- rbindlist(genera)
+write_table(tests, file.path(dir_data_intermediate, "niche_tests.csv"))
+write_table(genera, file.path(dir_data_intermediate, "niche_genera.csv"))
+print(tests, digits = 2)
+```
+
+```{r clear_tests, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+Effect of use beyond availability (on the "drier" scale) on obligate mutualism against facultative congeners, within genera (conditional logistic regression; log odds per SD, 95% intervals), for each measure of water availability, accessible-area radius and background; labels: genera in which the mutualists are on the drier side.
+
+*Inputs:* s34/niche_tests.csv
+*Outputs:* plot_niche_availability.png
+
+```{r plot_niche_availability}
+tests <- fread(file.path(dir_data_intermediate, "niche_tests.csv"))
+tests[, `:=`(measure = factor(measures[measure], rev(measures)),
+             setting = factor(paste0(radius_km, " km, ", backgrounds[background])))]
+fig <- ggplot(tests, aes(estimate, measure, colour = setting)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), width = 0,
+                linewidth = 0.5, orientation = "y", position = position_dodge(width = 0.7)) +
+  geom_point(size = 2, position = position_dodge(width = 0.7)) +
+  geom_text(aes(x = max(estimate + 1.96 * se) + 0.15, label = paste0(drier_genera, "/", genera)),
+            position = position_dodge(width = 0.7), size = 2.4, hjust = 0, show.legend = FALSE) +
+  scale_colour_manual(values = c("#3B3B3B", "#9A9A9A", "#E69F00", "#F3C979"), name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.2))) +
+  labs(x = "Mutualists in drier places than accessible (log odds per SD, within genera)", y = NULL,
+       title = "Water availability used and accessible in the mixed genera") +
+  guides(colour = guide_legend(nrow = 2)) +
+  theme_figure()
+save_figure(fig, "plot_niche_availability", 8, 6)
+fig
+```
+
+```{r clear_plot_niche_availability, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

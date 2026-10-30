@@ -1,0 +1,352 @@
+---
+title: "Lycaenidae ant-interaction climate 30 - colony traits of the partner ants"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+`s21` and `s27` tested ants at the level of genera and communities: the partner genera of obligate lycaenids are present, rich in species and as prevalent in the north as in the south. Obligate associations are thought to need ants with large, long-lived colonies (Fiedler 2021), and species within a genus differ widely in colony size. This notebook asks whether the ant **species** recorded with obligate lycaenids have larger or more polygynous colonies than those recorded with facultative ones (big-picture follow-up 7), using the ant trait database of Bell-Roberts et al. (2024; Supplementary Table 20: colony size, the number of workers in mature colonies, for 541 species; queen number) and their list of supercolonial species (Supplementary Table 21):
+
+1. **Ant species.** For every partner ant species with a colony size, whether it was recorded with an obligate mutualist, an obligate parasite or only with facultative lycaenids; colony size (log10) compared among these, with random intercepts of ant genus; queen number and supercoloniality compared likewise.
+2. **Ant genera.** The median colony size of each partner genus (over all its species in the database) against the share of its lycaenid partners that are obligate.
+3. **Lycaenid species.** For every associated lycaenid with a recorded partner, the median colony size of its partners (species values where known, otherwise the median of the partner genus); obligacy related to it given lineage, and given region and lineage.
+4. **Regions.** The colony size of the partners recorded with the facultative and obligate lycaenids of each region.
+
+The database leans towards well-studied, mostly Holarctic species, and supercolonial species have no colony size; both limit the tests.
+
+A full run takes under a minute.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(readxl)
+library(mgcv)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+partner_levels <- c("facultative only", "obligate mutualist", "obligate parasite")
+partner_colours <- c(`facultative only` = "#0072B2", `obligate mutualist` = "#E69F00",
+                     `obligate parasite` = "#CC79A7")
+type_colours <- c(f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+contrasts <- list(obligate = list(rows = c("f", "m", "p"), success = c("m", "p"),
+                                  label = "Obligate vs facultative"),
+                  mutualist = list(rows = c("f", "m"), success = "m",
+                                   label = "Obligate mutualist vs facultative"),
+                  parasite = list(rows = c("m", "p"), success = "p",
+                                  label = "Parasite vs mutualist"))
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s21 <- path_resrepo("data/intermediate/s21_test_ant_partners")
+dir_data_intermediate <- path_resrepo("data/intermediate/s30_test_ant_traits")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom", plot.tag = element_text(face = "bold", size = 11))
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Partner ants and their traits
+
+*Inputs:* raw/ants_bellroberts2024/Supplementary_Tables.xlsx (Supplementary Tables 20 and 21); s21/partner_records.csv
+*Outputs:* ant_traits.csv, partner_ants.csv
+
+```{r partner_traits}
+xl <- file.path(dir_data_raw, "ants_bellroberts2024", "Supplementary_Tables.xlsx")
+tr <- as.data.table(suppressMessages(read_excel(xl, sheet = "Supplementary Table 20", skip = 1)))
+ex <- as.data.table(suppressMessages(read_excel(xl, sheet = "Supplementary Table 21", skip = 1)))
+tr <- tr[, .(ant_taxon = gsub("_", " ", species),
+             colony_size = suppressWarnings(as.numeric(colony.size)),
+             # 0: one queen per colony; 1: facultatively several; 2: obligately several
+             queen_number = suppressWarnings(as.integer(queen.number.categorical)))]
+tr[, ant_genus := sub(" .*", "", ant_taxon)]
+ex <- ex[, .(ant_taxon = gsub("_", " ", species), supercolonial)]
+traits <- merge(tr, ex, by = "ant_taxon", all = TRUE)
+traits[, ant_genus := sub(" .*", "", ant_taxon)]
+traits[is.na(supercolonial), supercolonial := 0]
+write_table(traits, file.path(dir_data_intermediate, "ant_traits.csv"))
+
+# Partner records with a species-level ant name
+rec <- fread(file.path(dir_s21, "partner_records.csv"), colClasses = c(pool_key = "character"))
+rec[, species_level := grepl("^[A-Z][a-z]+ [a-z]+$", ant_taxon)]
+ants <- rec[species_level == TRUE, .(ant_genus = ant_genus[1],
+                                     with_m = any(interaction_type == "m"),
+                                     with_p = any(interaction_type == "p"),
+                                     with_f = any(interaction_type == "f"),
+                                     lycaenids = uniqueN(pool_key)), by = ant_taxon]
+ants[, partner := factor(fifelse(with_p, "obligate parasite",
+                                 fifelse(with_m, "obligate mutualist", "facultative only")),
+                         partner_levels)]
+ants <- merge(ants, traits[, .(ant_taxon, colony_size, queen_number, supercolonial)],
+              by = "ant_taxon", all.x = TRUE)
+ants[is.na(supercolonial), supercolonial := 0]
+write_table(ants, file.path(dir_data_intermediate, "partner_ants.csv"))
+print(ants[, .(ant_species = .N, with_colony_size = sum(!is.na(colony_size)),
+               with_queen_number = sum(!is.na(queen_number)), supercolonial = sum(supercolonial),
+               median_colony_size = median(colony_size, na.rm = TRUE)), by = partner])
+```
+
+```{r clear_partner_traits, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# 1. Ant species
+
+Colony size (log10) of the partner species by the strategies of their lycaenid partners, with random intercepts of ant genus (`mgcv`); a species recorded with both a parasite and a mutualist counts as a parasite partner. Queen number (any polygyny) and supercoloniality by Fisher's exact test of obligate against facultative-only partners.
+
+*Inputs:* s30/partner_ants.csv
+*Outputs:* ant_species_tests.csv
+
+```{r ant_species}
+ants <- fread(file.path(dir_data_intermediate, "partner_ants.csv"))
+ants[, `:=`(partner = factor(partner, partner_levels), ant_genus = factor(ant_genus))]
+d <- ants[is.finite(colony_size)]
+d[, `:=`(log_cs = log10(colony_size), obligate = partner != "facultative only")]
+m1 <- gam(log_cs ~ obligate + s(ant_genus, bs = "re"), data = d, method = "REML")
+m2 <- gam(log_cs ~ partner + s(ant_genus, bs = "re"), data = d, method = "REML")
+pt1 <- summary(m1)$p.table
+pt2 <- summary(m2)$p.table
+q <- ants[!is.na(queen_number)]
+ft_q <- fisher.test(table(q$partner != "facultative only", q$queen_number > 0))
+ft_s <- fisher.test(table(ants$partner != "facultative only", ants$supercolonial == 1))
+tests <- rbind(
+  data.table(test = "log10 colony size, obligate partners vs facultative only (genus RE)",
+             species = nrow(d), estimate = pt1["obligateTRUE", 1], se = pt1["obligateTRUE", 2],
+             p = pt1["obligateTRUE", 4]),
+  data.table(test = paste0("log10 colony size, ", c("obligate mutualist", "obligate parasite"),
+                           " partners vs facultative only (genus RE)"),
+             species = nrow(d), estimate = pt2[-1, 1], se = pt2[-1, 2], p = pt2[-1, 4]),
+  data.table(test = "log10 colony size, obligate partners vs facultative only (no genus RE, Wilcoxon)",
+             species = nrow(d),
+             estimate = median(d[obligate == TRUE]$log_cs) - median(d[obligate == FALSE]$log_cs),
+             se = NA_real_, p = wilcox.test(log_cs ~ obligate, data = d)$p.value),
+  data.table(test = "Polygyny (odds ratio), obligate partners vs facultative only", species = nrow(q),
+             estimate = unname(ft_q$estimate), se = NA_real_, p = ft_q$p.value),
+  data.table(test = "Supercoloniality (odds ratio), obligate partners vs facultative only",
+             species = nrow(ants), estimate = unname(ft_s$estimate), se = NA_real_, p = ft_s$p.value))
+write_table(tests, file.path(dir_data_intermediate, "ant_species_tests.csv"))
+print(tests, digits = 3)
+print(d[, .(species = .N, median = median(colony_size), q25 = quantile(colony_size, 0.25),
+            q75 = quantile(colony_size, 0.75)), by = partner])
+print(ants[, .(species = .N, supercolonial = sum(supercolonial)), by = partner])
+```
+
+```{r clear_ant_species, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# 2. Ant genera
+
+For every partner genus: the median colony size of its species in the database (all species, not only partners), the lycaenid species recorded with it, and the share of them that are obligate (mutualist or parasite); Spearman correlation and a binomial regression of the obligate share on log10 genus colony size, weighted by the lycaenid species.
+
+*Inputs:* s30/ant_traits.csv; s21/partner_records.csv
+*Outputs:* partner_genera_traits.csv, genus_tests.csv
+
+```{r ant_genera}
+traits <- fread(file.path(dir_data_intermediate, "ant_traits.csv"))
+rec <- fread(file.path(dir_s21, "partner_records.csv"), colClasses = c(pool_key = "character"))
+gen_cs <- traits[is.finite(colony_size), .(genus_colony_size = median(colony_size),
+                                           species_with_size = .N), by = ant_genus]
+pg <- unique(rec[, .(ant_genus, pool_key, interaction_type)])[
+  , .(lycaenids = .N, obligate = sum(interaction_type %in% c("m", "p")),
+      mutualists = sum(interaction_type == "m"), parasites = sum(interaction_type == "p")),
+  by = ant_genus]
+pg <- merge(pg, gen_cs, by = "ant_genus", all.x = TRUE)
+write_table(pg, file.path(dir_data_intermediate, "partner_genera_traits.csv"))
+g <- pg[is.finite(genus_colony_size)]
+st <- cor.test(log10(g$genus_colony_size), g$obligate / g$lycaenids, method = "spearman", exact = FALSE)
+bm <- summary(glm(cbind(obligate, lycaenids - obligate) ~ log10(genus_colony_size), data = g,
+                  family = quasibinomial))$coefficients
+genus_tests <- data.table(
+  test = c("Spearman, obligate share vs log10 genus colony size",
+           "Quasi-binomial slope, obligate share on log10 genus colony size"),
+  genera = nrow(g), estimate = c(unname(st$estimate), bm[2, 1]), se = c(NA, bm[2, 2]),
+  p = c(st$p.value, bm[2, 4]))
+write_table(genus_tests, file.path(dir_data_intermediate, "genus_tests.csv"))
+print(genus_tests, digits = 3)
+print(g[order(-obligate)][1:20], digits = 3)
+```
+
+```{r clear_ant_genera, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# 3. Lycaenid species
+
+Each associated lycaenid species with a recorded partner gets the median log10 colony size of its partners: the species value for partners named to species and in the database, otherwise the median of the partner's genus. Obligacy and obligate mutualism related to it given lineage (random intercepts of subfamily and genus), and given region and lineage; also with species-level values only. (Parasites against mutualists are not tested: with few parasites per genus, the models separate.) Because most values are genus medians, these tests largely ask which ant genera a lycaenid is recorded with; and a genus median depends on which of its species are in the database (for example, *Crematogaster*, the main partner in southern Africa, has a median of about 700 workers).
+
+*Inputs:* s30/ant_traits.csv; s21/partner_records.csv
+*Outputs:* lycaenid_partner_size.csv, lycaenid_tests.csv
+
+```{r lycaenids}
+traits <- fread(file.path(dir_data_intermediate, "ant_traits.csv"))
+rec <- fread(file.path(dir_s21, "partner_records.csv"), colClasses = c(pool_key = "character"))
+sp_cs <- traits[is.finite(colony_size), .(ant_taxon, sp_cs = log10(colony_size))]
+gen_cs <- traits[is.finite(colony_size), .(gen_cs = median(log10(colony_size))), by = ant_genus]
+r <- merge(merge(rec, sp_cs, by = "ant_taxon", all.x = TRUE), gen_cs, by = "ant_genus", all.x = TRUE)
+r[, cs := fifelse(is.finite(sp_cs), sp_cs, gen_cs)]
+ly <- r[, .(partner_cs = median(cs, na.rm = TRUE), partner_cs_species = median(sp_cs, na.rm = TRUE),
+            partners = .N), by = .(pool_key, species, genus, subfamily, interaction_type, region)]
+ly <- ly[is.finite(partner_cs)]
+write_table(ly, file.path(dir_data_intermediate, "lycaenid_partner_size.csv"))
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+# Parasites are left out: with few parasites per genus the models separate
+tests <- rbindlist(lapply(c("obligate", "mutualist"), function(ct) {
+  rbindlist(lapply(c("partner_cs", "partner_cs_species"), function(v) {
+    d <- copy(ly[interaction_type %in% contrasts[[ct]]$rows & is.finite(get(v))])
+    d[, `:=`(y = as.integer(interaction_type %in% contrasts[[ct]]$success),
+             x = as.numeric(scale(get(v))), genus = factor(genus),
+             subfamily = factor(subfamily), region = factor(region))]
+    rbindlist(lapply(c("lineage", "region and lineage"), function(given) {
+      f <- if (given == "lineage") paste("y ~ x +", lineage) else paste("y ~ region + x +", lineage)
+      m <- gam(as.formula(f), data = d, family = binomial, method = "REML")
+      pt <- summary(m)$p.table
+      data.table(contrast = ct, measure = v, given = given, species = nrow(d), events = sum(d$y),
+                 estimate = pt["x", 1], se = pt["x", 2], p = pt["x", 4])
+    }))
+  }))
+}))
+write_table(tests, file.path(dir_data_intermediate, "lycaenid_tests.csv"))
+print(tests, digits = 3)
+```
+
+```{r clear_lycaenids, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# 4. Regions
+
+The colony size (log10; species values, otherwise genus medians) of the partners recorded with the facultative and the obligate lycaenids of each region: median over records with an interval from resampling lycaenid species.
+
+*Inputs:* s30/ant_traits.csv; s21/partner_records.csv
+*Outputs:* region_partner_size.csv
+
+```{r regions}
+traits <- fread(file.path(dir_data_intermediate, "ant_traits.csv"))
+rec <- fread(file.path(dir_s21, "partner_records.csv"), colClasses = c(pool_key = "character"))
+sp_cs <- traits[is.finite(colony_size), .(ant_taxon, sp_cs = log10(colony_size))]
+gen_cs <- traits[is.finite(colony_size), .(gen_cs = median(log10(colony_size))), by = ant_genus]
+r <- merge(merge(rec, sp_cs, by = "ant_taxon", all.x = TRUE), gen_cs, by = "ant_genus", all.x = TRUE)
+r[, cs := fifelse(is.finite(sp_cs), sp_cs, gen_cs)]
+r <- r[is.finite(cs) & !is.na(region) & region != ""]
+r[, group := fifelse(interaction_type == "f", "facultative", "obligate")]
+set.seed(20261029)
+reg <- r[, {
+  ids <- split(cs, pool_key)
+  b <- replicate(1000, median(unlist(ids[sample.int(length(ids), replace = TRUE)])))
+  .(records = .N, lycaenids = length(ids), median_cs = median(cs),
+    low = quantile(b, 0.025), high = quantile(b, 0.975))
+}, by = .(region, group)]
+write_table(reg, file.path(dir_data_intermediate, "region_partner_size.csv"))
+print(reg[order(region, group)], digits = 3)
+```
+
+```{r clear_regions, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) Colony size (workers in mature colonies; Bell-Roberts et al. 2024) of the partner ant species recorded only with facultative lycaenids, with obligate mutualists and with obligate parasites; points: species. (b) Median colony size of each partner genus (all its species in the database) against the share of its lycaenid partners that are obligate; point size: lycaenid species. (c) Median colony size of the partners recorded with the facultative and obligate lycaenids of each region (species values, otherwise genus medians; 95% intervals from resampling lycaenid species).
+
+*Inputs:* s30/ partner_ants.csv, partner_genera_traits.csv, region_partner_size.csv
+*Outputs:* plot_ant_traits.png
+
+```{r plot_ant_traits}
+ants <- fread(file.path(dir_data_intermediate, "partner_ants.csv"))[is.finite(colony_size)]
+pg <- fread(file.path(dir_data_intermediate, "partner_genera_traits.csv"))[is.finite(genus_colony_size)]
+reg <- fread(file.path(dir_data_intermediate, "region_partner_size.csv"))
+ants[, partner := factor(partner, partner_levels)]
+panel_a <- ggplot(ants, aes(colony_size, partner, colour = partner)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, colour = "grey60") +
+  geom_point(position = position_jitter(height = 0.15, width = 0, seed = 1), size = 1.4, alpha = 0.8) +
+  scale_x_log10(labels = scales::label_comma()) +
+  scale_colour_manual(values = partner_colours, guide = "none") +
+  labs(x = "Colony size (workers)", y = NULL, title = "Partner ant species") +
+  theme_figure()
+panel_b <- ggplot(pg, aes(genus_colony_size, obligate / lycaenids)) +
+  geom_point(aes(size = lycaenids), colour = "#3B3B3B", alpha = 0.6) +
+  geom_text(data = pg[lycaenids >= 15], aes(label = ant_genus), size = 2.4, vjust = -1.1,
+            fontface = "italic", colour = "grey30") +
+  scale_x_log10(labels = scales::label_comma()) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  scale_size_area(max_size = 6, name = "Lycaenid species") +
+  labs(x = "Median colony size of the genus (workers)", y = "Obligate share of lycaenid partners",
+       title = "Partner genera") +
+  theme_figure()
+reg[, region := factor(region, rev(region_levels))]
+panel_c <- ggplot(reg, aes(10^median_cs, region, colour = group)) +
+  geom_errorbar(aes(xmin = 10^low, xmax = 10^high), width = 0, linewidth = 0.5, orientation = "y",
+                position = position_dodge(width = 0.6)) +
+  geom_point(size = 2, position = position_dodge(width = 0.6)) +
+  scale_x_log10(labels = scales::label_comma()) +
+  scale_colour_manual(values = c(facultative = "#0072B2", obligate = "#E69F00"), name = NULL) +
+  labs(x = "Median colony size of partners (workers)", y = NULL, title = "Regions") +
+  theme_figure()
+fig <- (panel_a | panel_b) / panel_c + plot_layout(heights = c(1, 1)) +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")")
+save_figure(fig, "plot_ant_traits", 9, 8)
+fig
+```
+
+```{r clear_plot_ant_traits, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

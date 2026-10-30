@@ -1,0 +1,218 @@
+---
+title: "Lycaenidae ant-interaction climate 42 - the four strategies in one framework: association, obligacy and parasitism against warmth, dry-season length and water stress"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+The paper increasingly compared obligate with facultative species, but the data hold four strategies: non-associated, facultative, obligate mutualist and obligate parasite. An association of climate with obligacy could hide opposite relationships for mutualism and parasitism, and the step from no association to facultative association differs biologically from the evolution of dependence. Following the sixth external review (`writing/research_roadmap.md`, rank 6), this notebook relates the strategies to the same three variables as `s38` and `s41` (H1 warmth, annual mean temperature; H2 dry-season duration, the longest run of months below 50 mm; H3 water stress, the climatic water deficit), with one framework for all four:
+
+- the four strategies are decomposed into nested conditional contrasts, a continuation-ratio form of the multinomial model: **any association** (facultative, mutualist and parasite against non-associated); **obligacy** (mutualist and parasite against facultative); **parasitism** (parasite against mutualist); and, because the dry-season idea concerns tended larvae, **mutualism** (mutualist against facultative);
+- each contrast is related to each variable alone and to the three together, given region (fixed effect) and lineage (random intercepts of subfamily and genus), and within genera (conditional logistic regression on genus);
+- to follow the European result (facultative richness falling northwards with non-associated richness constant), any association is related to temperature within genera in the Palaearctic and the Nearctic separately.
+
+Species climates are medians over the 10-arc-minute pixels of their cleaned records. This is a deliberately small set of contrasts and variables, not a predictor screen.
+
+A full run takes about 3 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(mgcv)
+library(survival)
+library(ggplot2)
+```
+
+## Variables
+
+```{r setup_variables}
+contrasts <- list(associated = list(rows = c("n", "f", "m", "p"), success = c("f", "m", "p")),
+                  obligate = list(rows = c("f", "m", "p"), success = c("m", "p")),
+                  mutualist = list(rows = c("f", "m"), success = "m"),
+                  parasite = list(rows = c("m", "p"), success = "p"))
+contrast_names <- c(associated = "Any association (vs non-associated)", obligate = "Obligacy (vs facultative)",
+                    mutualist = "Mutualism (vs facultative)", parasite = "Parasitism (vs mutualism)")
+variables <- c(bio01 = "H1 warmth", dry_run50 = "H2 dry-season length", cwd = "H3 water stress")
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_s38 <- path_resrepo("data/intermediate/s38_diagnose_identifiability")
+dir_data_intermediate <- path_resrepo("data/intermediate/s42_test_four_strategies")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+contrast_data <- function(sp, ct) {
+  d <- copy(sp[interaction_type %in% contrasts[[ct]]$rows])
+  d[, `:=`(y = as.integer(interaction_type %in% contrasts[[ct]]$success), region = factor(region),
+           genus = factor(genus), subfamily = factor(subfamily))]
+  for (v in names(variables)) set(d, j = paste0(v, "_s"), value = as.numeric(scale(d[[v]])))
+  d
+}
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom")
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Species climates
+
+*Inputs:* s05/species_regions.csv; s02/species_records.rds; s38/mechanism_pixels.rds; s01/climate_present_10m.tif
+*Outputs:* species_mechanisms.csv
+
+```{r species}
+# All classified species with their region (s05; the s19 table holds associated species only)
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))[
+  interaction_type %in% c("n", "f", "m", "p") & !is.na(region) & subfamily != "",
+  .(pool_key, species, genus, subfamily, region, interaction_type)]
+pix <- readRDS(file.path(dir_s38, "mechanism_pixels.rds"))[, .(cell, bio01, dry_run50, cwd)]
+template <- rast(file.path(dir_s01, "climate_present_10m.tif"))[[1]]
+rec <- readRDS(file.path(dir_s02, "species_records.rds"))
+rec[, pool_key := as.character(pool_key)]
+rec <- rec[pool_key %in% sp$pool_key]
+rec[, cell := cellFromXY(template, cbind(decimalLongitude, decimalLatitude))]
+med <- merge(unique(rec[!is.na(cell), .(pool_key, cell)]), pix, by = "cell")[
+  , .(bio01 = median(bio01), dry_run50 = median(dry_run50), cwd = median(cwd), pixels = .N), by = pool_key]
+sp <- merge(sp, med, by = "pool_key")
+write_table(sp, file.path(dir_data_intermediate, "species_mechanisms.csv"))
+print(sp[, .(species = .N, temperature = median(bio01), dry_run50 = median(dry_run50), cwd = median(cwd)),
+         by = interaction_type])
+print(round(cor(sp[, .(bio01, dry_run50, cwd)]), 2))
+```
+
+```{r clear_species, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Effects of each variable on each contrast
+
+*Inputs:* s42/species_mechanisms.csv
+*Outputs:* strategy_effects.csv
+
+```{r effects}
+sp <- fread(file.path(dir_data_intermediate, "species_mechanisms.csv"), colClasses = c(pool_key = "character"))
+res <- list()
+for (ct in names(contrasts)) {
+  d <- contrast_data(sp, ct)
+  for (set in c(names(variables), "joint")) {
+    vs <- if (set == "joint") names(variables) else set
+    terms <- paste0(vs, "_s")
+    m <- tryCatch(gam(as.formula(paste("y ~ region +", paste(terms, collapse = " + "), "+", lineage)),
+                      data = d, family = binomial(), method = "REML"), error = function(e) NULL)
+    if (!is.null(m)) {
+      pt <- summary(m)$p.table
+      res[[length(res) + 1]] <- data.table(contrast = ct, model = if (set == "joint") "Together" else "Alone",
+                                           analysis = "Given region and lineage", variable = vs,
+                                           estimate = pt[terms, 1], se = pt[terms, 2], p = pt[terms, 4],
+                                           species = nrow(d), events = sum(d$y))
+    }
+    dg <- d[genus %in% d[, .(both = uniqueN(y) == 2), by = genus][both == TRUE]$genus]
+    cl <- tryCatch(summary(clogit(as.formula(paste("y ~", paste(terms, collapse = " + "), "+ strata(genus)")),
+                                  data = dg))$coefficients, error = function(e) NULL)
+    if (!is.null(cl)) res[[length(res) + 1]] <- data.table(contrast = ct, model = if (set == "joint") "Together" else "Alone",
+                                                           analysis = "Within genera", variable = vs,
+                                                           estimate = cl[terms, "coef"], se = cl[terms, "se(coef)"],
+                                                           p = cl[terms, "Pr(>|z|)"], species = nrow(dg),
+                                                           events = sum(dg$y))
+  }
+}
+# Any association against temperature within genera, Palaearctic and Nearctic separately
+for (rg in c("Palearctic", "Nearctic")) {
+  d <- contrast_data(sp[region == rg], "associated")
+  dg <- d[genus %in% d[, .(both = uniqueN(y) == 2), by = genus][both == TRUE]$genus]
+  cl <- tryCatch(summary(clogit(y ~ bio01_s + strata(genus), data = dg))$coefficients, error = function(e) NULL)
+  if (!is.null(cl)) res[[length(res) + 1]] <- data.table(contrast = "associated", model = "Alone",
+                                                         analysis = paste("Within genera,", rg), variable = "bio01",
+                                                         estimate = cl[1, "coef"], se = cl[1, "se(coef)"],
+                                                         p = cl[1, "Pr(>|z|)"], species = nrow(dg), events = sum(dg$y))
+}
+res <- rbindlist(res)
+write_table(res, file.path(dir_data_intermediate, "strategy_effects.csv"))
+print(res[, .(contrast, model, analysis = substr(analysis, 1, 26), variable, estimate = round(estimate, 2),
+              se = round(se, 2), p = round(p, 3), species)], nrows = 100)
+```
+
+```{r clear_effects, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+Effect of each variable (per SD) on each conditional contrast, alone, given region and lineage and within genera (95% intervals; filled: p < 0.05).
+
+*Inputs:* s42/strategy_effects.csv
+*Outputs:* plot_four_strategies.png
+
+```{r plot_four_strategies}
+res <- fread(file.path(dir_data_intermediate, "strategy_effects.csv"))[model == "Alone" & analysis %in%
+                                                                         c("Given region and lineage", "Within genera")]
+res[, `:=`(contrast = factor(contrast_names[contrast], contrast_names),
+           variable = factor(variables[variable], rev(variables)), significant = p < 0.05)]
+fig <- ggplot(res, aes(estimate, variable, colour = analysis, shape = significant)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), width = 0, linewidth = 0.5,
+                orientation = "y", position = position_dodge(width = 0.5)) +
+  geom_point(size = 2.2, fill = "white", position = position_dodge(width = 0.5)) +
+  facet_wrap(~ contrast, ncol = 2) +
+  scale_shape_manual(values = c(`FALSE` = 21, `TRUE` = 16), guide = "none") +
+  scale_colour_manual(values = c("#3B3B3B", "#E69F00"), name = NULL) +
+  labs(x = "Effect on the contrast (log odds per SD, 95% interval)", y = NULL,
+       title = "Four strategies, three climatic variables") +
+  theme_figure()
+save_figure(fig, "plot_four_strategies", 8, 5.5)
+fig
+```
+
+```{r clear_plot_four_strategies, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

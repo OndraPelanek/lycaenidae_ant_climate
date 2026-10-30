@@ -36,6 +36,7 @@ library(resrepo)
 library(data.table)
 library(terra)
 library(mgcv)
+library(survival)
 library(ggplot2)
 library(patchwork)
 ```
@@ -229,7 +230,7 @@ invisible(gc())
 
 # Within genera: permutation tests
 
-For each contrast and property, the within-genus slope (logistic regression with genus as a fixed effect, standardised property) on the genera with both outcomes, and its null distribution from `r format(n_perm, big.mark = ",")` permutations of the property among the species of each genus.
+For each contrast and property, the within-genus slope (logistic regression with genus as a fixed effect, standardised property) on the genera with both outcomes, and its null distribution from `r format(n_perm, big.mark = ",")` permutations of the property among the species of each genus. With few species per genus, a fixed-effect slope is biased away from zero (incidental parameters), so the permutation test uses it only as a test statistic; the effect itself is estimated by conditional logistic regression stratified by genus (`survival::clogit`). The property is standardised over the species of the mixed genera, so these slopes are not on the same scale as the effects given region and lineage.
 
 *Inputs:* s19/species_drought.csv
 *Outputs:* within_genus_tests.csv
@@ -251,11 +252,13 @@ tests <- rbindlist(lapply(names(contrasts), function(ct) {
       for (i in idx) xp[i] <- x[i][sample.int(length(i))]
       within_slope(d$y, xp, d$genus)
     }, numeric(1))
+    cl <- summary(clogit(y ~ x + strata(genus), data = data.frame(y = d$y, x = x, genus = d$genus)))$coefficients
     data.table(contrast = ct, property = v, genera = length(mixed), species = nrow(d),
                events = sum(d$y), slope = obs,
                null_low = quantile(null, 0.025), null_high = quantile(null, 0.975),
-               p_upper = (1 + sum(null >= obs)) / (n_perm + 1),
-               p_two_sided = (1 + sum(abs(null) >= abs(obs))) / (n_perm + 1))
+               p_two_sided = (1 + sum(abs(null) >= abs(obs))) / (n_perm + 1),
+               conditional_estimate = cl[1, "coef"], conditional_se = cl[1, "se(coef)"],
+               conditional_p = cl[1, "Pr(>|z|)"])
   }))
 }))
 write_table(tests, file.path(dir_data_intermediate, "within_genus_tests.csv"))

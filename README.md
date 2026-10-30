@@ -28,8 +28,30 @@ R Markdown notebooks in `code/` are run in numerical order:
 20. [`s20_predict_held_out.Rmd`](code/s20_predict_held_out.Rmd) predicts held-out realms and subfamilies, with calibration, discrimination and climatic novelty.
 21. [`s21_test_ant_partners.Rmd`](code/s21_test_ant_partners.Rmd) adds ant richness and the partner genera of obligate species.
 22. [`s22_make_paper_figures.Rmd`](code/s22_make_paper_figures.Rmd) combines the outputs into the main figures of the paper.
+23. [`s23_test_dispersal.Rmd`](code/s23_test_dispersal.Rmd) tests whether obligate lineages spread less than other lineages of the same age and size.
+24. [`s24_compare_all_climates.Rmd`](code/s24_compare_all_climates.Rmd) compares every pair of regions within the climates they share, with southern Africa and Australia against all others.
+25. [`s25_test_convergence.Rmd`](code/s25_test_convergence.Rmd) estimates how often obligacy arose per million years of lineage history in each group of regions.
+26. [`s26_test_knowledge.Rmd`](code/s26_test_knowledge.Rmd) tests whether knowledge of life histories could explain the regional ordering of obligacy.
+27. [`s27_test_ant_communities.Rmd`](code/s27_test_ant_communities.Rmd) relates obligacy to the dominance of partner ant genera in sampled local ant communities.
+28. [`s28_test_robustness.Rmd`](code/s28_test_robustness.Rmd) checks the main results against a flexible climate model, species-specific evidence and genus-level analyses of dry seasons.
+29. [`s29_test_dry_availability.Rmd`](code/s29_test_dry_availability.Rmd) separates the dry months available where each species occurs from its use of drier places within them.
+30. [`s30_test_ant_traits.Rmd`](code/s30_test_ant_traits.Rmd) tests the colony size, queen number and supercoloniality of the ant species recorded with obligate and facultative lycaenids.
+31. [`s31_test_dry_habitat.Rmd`](code/s31_test_dry_habitat.Rmd) asks whether the drier places of obligate mutualists differ in rain, warmth, elevation or vegetation, or only in the length of the dry season.
+32. [`s32_test_flight_timing.Rmd`](code/s32_test_flight_timing.Rmd) asks whether obligate mutualists fly in or just after the dry season more than facultative relatives (an indirect guide to larval timing).
+33. [`s33_test_confinement.Rmd`](code/s33_test_confinement.Rmd) tests how robust the confinement of obligate genera is (definitions, completeness, grain, sampling, clades, sister contrasts).
+34. [`s34_test_niche_availability.Rmd`](code/s34_test_niche_availability.Rmd) compares water availability used and accessible (independent buffers, sampling-adjusted background, five measures) in the mixed genera.
+35. [`s35_prepare_dry_niche.Rmd`](code/s35_prepare_dry_niche.Rmd) prepares the dry-niche test: an all-butterfly GBIF background, accessible areas defined in advance, and water and temperature predictors.
+36. [`s36_test_dry_niche.Rmd`](code/s36_test_dry_niche.Rmd) tests whether obligate mutualists repeatedly occupy drier environments than their facultative congeners after accounting for availability, recording effort and relatedness (one estimate per genus, pooled).
+37. [`s37_test_dry_niche_v2.Rmd`](code/s37_test_dry_niche_v2.Rmd) is version 2 of that test, declared in advance in `writing/dry_niche_v2_plan.md`: supplemented occurrences, one contrast per origin of obligate mutualism and a joint model.
+38. [`s38_diagnose_identifiability.Rmd`](code/s38_diagnose_identifiability.Rmd) checks whether drought can be told apart from warmth within each contrast.
+39. [`s39_audit_occurrences_origins.Rmd`](code/s39_audit_occurrences_origins.Rmd) audits the GBIF supplementation and counts independent origins.
+40. [`s40_simulate_power.Rmd`](code/s40_simulate_power.Rmd) simulates which data additions would resolve the dry-niche contrast.
+41. [`s41_test_matched_case_case.Rmd`](code/s41_test_matched_case_case.Rmd) compares mutualists and facultative relatives at matched temperature (and biome).
+42. [`s42_test_four_strategies.Rmd`](code/s42_test_four_strategies.Rmd) relates the four strategies to warmth, dry-season length and water stress.
+43. [`s43_decompose_southern_faunas.Rmd`](code/s43_decompose_southern_faunas.Rmd) decomposes the obligate faunas and tests them against a lineage-conserving null.
+44. [`s44_test_confinement_contrasts.Rmd`](code/s44_test_confinement_contrasts.Rmd) tests whether confinement replicates across independent origins.
 
-The current findings are shown in the working manuscript [`writing/climate_manuscript.Rmd`](writing/climate_manuscript.Rmd), and the paper for Global Ecology and Biogeography, with its Supporting Information, is drafted in [`writing/paper_draft.Rmd`](writing/paper_draft.Rmd); both are rendered by `Rscript code/render_manuscript.R`.
+The full record of the findings, with the ideas and projects the paper has no space for, is the working document [`writing/climate_manuscript.Rmd`](writing/climate_manuscript.Rmd), and the focused paper for Global Ecology and Biogeography, with its Supporting Information, is drafted in [`writing/paper_draft.Rmd`](writing/paper_draft.Rmd); both are rendered by `Rscript code/render_manuscript.R`.
 
 Each notebook reads the raw data and the outputs of earlier notebooks and writes its outputs to its own folder in `data/intermediate`. The [code README](code/README.md) describes the notebooks and the shared functions, and the [data README](data/README.md) the raw and generated data.
 

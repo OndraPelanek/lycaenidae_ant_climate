@@ -13,6 +13,15 @@ notebooks <- c("s01_prepare_climate", "s02_build_assemblages", "s03_explore_clim
                "s13_compare_matched_climates", "s14_test_null_models", "s15_test_association",
                "s16_make_maps", "s17_make_figures", "s18_audit_shared_climates",
                "s19_test_mixed_genera", "s20_predict_held_out", "s21_test_ant_partners",
+               "s23_test_dispersal", "s24_compare_all_climates",
+               "s25_test_convergence", "s26_test_knowledge", "s27_test_ant_communities",
+               "s28_test_robustness", "s29_test_dry_availability", "s30_test_ant_traits",
+               "s31_test_dry_habitat", "s32_test_flight_timing", "s33_test_confinement",
+               "s34_test_niche_availability", "s35_prepare_dry_niche", "s36_test_dry_niche",
+               "s37_test_dry_niche_v2", "s38_diagnose_identifiability", "s39_audit_occurrences_origins",
+               "s40_simulate_power", "s41_test_matched_case_case", "s42_test_four_strategies",
+               "s43_decompose_southern_faunas", "s44_test_confinement_contrasts",
+               # The paper figures combine the outputs of s06-s44, so they come last
                "s22_make_paper_figures")
 steps <- substr(notebooks, 1, 3)
 

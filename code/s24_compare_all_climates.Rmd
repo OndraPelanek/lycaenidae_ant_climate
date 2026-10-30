@@ -1,0 +1,318 @@
+---
+title: "Lycaenidae ant-interaction climate 24 - the same climates in every pair of regions"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+`s13` and `s18` compared the Mediterranean-climate regions within the climate strata they share; the Cape against the Mediterranean Basin is a single pair. This notebook applies the same design to every climate on land (big-picture plan, test C): for each pair of biogeographic regions, the strata of 2 °C annual mean temperature, 3 °C minimum temperature, 0.15 log10 aridity and 15% precipitation seasonality (`s13`) that both regions occupy, and the share of obligate species (and of each strategy) in each region, standardised over the shared strata as in `s18`.
+
+- **Southern pairs.** Southern Africa and Australia, the obligate-rich regions, each against the six other regions. If the obligate excess of the south were climatic, it should vanish within shared climates.
+- **Control pairs.** The other six regions against each other, where no large difference is expected.
+- **Southern Africa against Australia.**
+
+A region occupies a stratum with at least 5 pixels; a shared stratum enters the estimate when both regions have at least three classified species recorded in it. Every species recorded in a stratum counts there (a species of several strata counts in each, so the estimate describes the composition of the species assemblage of each stratum, in which widespread species weigh more), and the stratum weights are the mean of the two regions' area shares over the shared strata. Intervals come from resampling genera (500 replicates). For each pair the share of each region's area and classified species in the shared strata is reported, because a pair can share only a small corner of its climates.
+
+A full run takes about 15 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+min_pixels <- 5
+min_species_stratum <- 3
+n_boot <- 500
+
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+region_short <- c(Nearctic = "Nearctic", Neotropic = "Neotropics", Palearctic = "Palaearctic",
+                  `Tropical Africa` = "Tropical Africa", `Southern Africa` = "Southern Africa",
+                  Indomalayan = "Indomalaya", Australia = "Australia",
+                  `New Guinea and islands` = "New Guinea")
+southern_regions <- c("Southern Africa", "Australia")
+types <- c("n", "f", "m", "p")
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s13 <- path_resrepo("data/intermediate/s13_compare_matched_climates")
+dir_data_intermediate <- path_resrepo("data/intermediate/s24_compare_all_climates")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Shared strata of a pair: occupied by both regions (pixels) and with enough classified species
+# in both; weights are the mean of the two regions' area shares over these strata
+shared_strata <- function(area, sp_n, pr) {
+  occ <- area[region %in% pr & pixels >= min_pixels]
+  ok <- merge(occ, sp_n[region %in% pr], by = c("region", "s"))[n >= min_species_stratum]
+  s_ok <- ok[, .N, by = s][N == 2]$s
+  a <- area[region %in% pr & s %in% s_ok]
+  a[, share := pixels / sum(pixels), by = region]
+  a[, .(w = mean(share)), by = s]
+}
+
+# Standardised share of each strategy in each region of a pair over the weighted strata, with
+# genus multiplicities `gw` (NULL: the data)
+standardised <- function(sp, w, pr, gw = NULL) {
+  d <- sp[region %in% pr & s %in% w$s]
+  d[, g := if (is.null(gw)) 1 else gw[genus]]
+  d[is.na(g), g := 0]
+  cnt <- d[, .(n = sum(g * (type == "n")), f = sum(g * (type == "f")), m = sum(g * (type == "m")),
+               p = sum(g * (type == "p")), tot = sum(g)), by = .(region, s)]
+  keep <- cnt[tot > 0, .N, by = s][N == 2]$s
+  cnt <- merge(cnt[s %in% keep], w[s %in% keep], by = "s")
+  cnt[, w := w / sum(w), by = region]
+  cnt[, .(n = sum(w * n / tot), f = sum(w * f / tot), m = sum(w * m / tot),
+          p = sum(w * p / tot), obligate = sum(w * (m + p) / tot), strata = .N), by = region]
+}
+
+# Genus bootstrap of the difference in obligate share (first minus second region)
+boot_difference <- function(sp, w, pr, reps = n_boot) {
+  genera <- unique(sp[region %in% pr & s %in% w$s]$genus)
+  vapply(seq_len(reps), function(b) {
+    gw <- setNames(tabulate(sample.int(length(genera), replace = TRUE), length(genera)), genera)
+    out <- standardised(sp, w, pr, gw)
+    if (nrow(out) < 2) return(NA_real_)
+    out[region == pr[1]]$obligate - out[region == pr[2]]$obligate
+  }, numeric(1))
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          panel.grid.major.y = element_blank(),
+          plot.title = element_text(face = "bold", size = base_size + 0.5),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom", plot.tag = element_text(face = "bold", size = 11))
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Every pair of regions within shared climates
+
+*Inputs:* s13/ pixel_strata.rds, record_pixels.rds, taxa.csv
+*Outputs:* all_pairs.csv, all_pairs_shares.csv
+
+```{r all_pairs}
+pix <- readRDS(file.path(dir_s13, "pixel_strata.rds"))[!is.na(region),
+                                                        .(cell, region = as.character(region),
+                                                          s = stratum)]
+rec <- readRDS(file.path(dir_s13, "record_pixels.rds"))
+rec[, pool_key := as.character(pool_key)]
+taxa <- fread(file.path(dir_s13, "taxa.csv"), colClasses = c(pool_key = "character"))
+
+# --- Area of every region in every stratum, and the classified species recorded there ---
+area <- pix[, .(pixels = .N), by = .(region, s)]
+sp <- unique(merge(rec, pix, by = "cell")[, .(region, s, pool_key)])
+sp <- merge(sp, taxa[classified == TRUE, .(pool_key, genus, type = interaction_type)],
+            by = "pool_key")
+sp_n <- sp[, .(n = uniqueN(pool_key)), by = .(region, s)]
+species_region <- sp[, .(classified = uniqueN(pool_key)), by = region]
+rm(rec)
+
+# --- Pairs: each southern region against every other region, and the other regions among
+# themselves ---
+others <- setdiff(region_levels, southern_regions)
+pairs <- c(lapply(southern_regions, function(a) lapply(others, function(b) c(a, b))),
+           list(list(southern_regions)),
+           list(combn(others, 2, simplify = FALSE)))
+pairs <- unlist(pairs, recursive = FALSE)
+pair_group <- function(pr) {
+  if (all(pr %in% southern_regions)) "Southern Africa vs Australia" else
+    if (any(pr %in% southern_regions)) paste(pr[1], "vs other regions") else "Control pairs"
+}
+
+set.seed(20261029)
+res <- list()
+shares <- list()
+for (pr in pairs) {
+  key <- paste(pr, collapse = " vs ")
+  w <- shared_strata(area, sp_n, pr)
+  if (nrow(w) == 0) {
+    res[[key]] <- data.table(pair = key, region_1 = pr[1], region_2 = pr[2],
+                             group = pair_group(pr), strata = 0L)
+    next
+  }
+  obs <- standardised(sp, w, pr)
+  if (nrow(obs) < 2) next
+  bt <- boot_difference(sp, w, pr)
+  # Share of each region's area and classified species in the shared strata
+  area_kept <- area[region %in% pr, .(area_share = sum(pixels[s %in% w$s]) / sum(pixels)),
+                    by = region]
+  sp_kept <- sp[region %in% pr & s %in% w$s, .(kept = uniqueN(pool_key)), by = region]
+  sp_kept <- merge(sp_kept, species_region, by = "region")
+  res[[key]] <- data.table(
+    pair = key, region_1 = pr[1], region_2 = pr[2], group = pair_group(pr),
+    strata = obs$strata[1],
+    obligate_1 = obs[region == pr[1]]$obligate, obligate_2 = obs[region == pr[2]]$obligate,
+    difference = obs[region == pr[1]]$obligate - obs[region == pr[2]]$obligate,
+    difference_low = quantile(bt, 0.025, na.rm = TRUE),
+    difference_high = quantile(bt, 0.975, na.rm = TRUE),
+    area_share_1 = area_kept[region == pr[1]]$area_share,
+    area_share_2 = area_kept[region == pr[2]]$area_share,
+    species_1 = sp_kept[region == pr[1]]$kept, species_2 = sp_kept[region == pr[2]]$kept,
+    species_share_1 = sp_kept[region == pr[1]]$kept / sp_kept[region == pr[1]]$classified,
+    species_share_2 = sp_kept[region == pr[2]]$kept / sp_kept[region == pr[2]]$classified)
+  shares[[key]] <- melt(obs, id.vars = c("region", "strata"), variable.name = "type",
+                        value.name = "share")[, pair := key]
+}
+res <- rbindlist(res, fill = TRUE)
+write_table(res, file.path(dir_data_intermediate, "all_pairs.csv"))
+write_table(rbindlist(shares), file.path(dir_data_intermediate, "all_pairs_shares.csv"))
+print(res[, .(pair, strata, ob1 = round(obligate_1, 2), ob2 = round(obligate_2, 2),
+              diff = round(difference, 2), low = round(difference_low, 2),
+              high = round(difference_high, 2), area1 = round(area_share_1, 2),
+              area2 = round(area_share_2, 2), sp1 = species_1, sp2 = species_2)])
+```
+
+```{r clear_all_pairs, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Summary
+
+For the southern pairs, the number with an obligate excess of the southern region whose 95% interval lies above zero; for the control pairs, the distribution of absolute differences. Pairs sharing fewer than 5 strata (such as southern Africa and New Guinea, 2 strata with about 1% of either region's area) are reported but left out of the summary, and an interval counts as excluding zero only when at least one region of the pair has obligate species in the shared strata (with none on either side, the genus bootstrap gives a degenerate interval of zero width).
+
+*Inputs:* s24/all_pairs.csv
+*Outputs:* all_pairs_summary.csv
+
+```{r summary}
+min_strata_summary <- 5
+res <- fread(file.path(dir_data_intermediate, "all_pairs.csv"))
+res[, informative := strata >= min_strata_summary & (obligate_1 > 0 | obligate_2 > 0)]
+summ <- res[strata >= min_strata_summary,
+            .(pairs = .N, median_difference = median(difference),
+              min_difference = min(difference), max_difference = max(difference),
+              intervals_above_zero = sum(informative & difference_low > 0),
+              intervals_below_zero = sum(informative & difference_high < 0),
+              no_obligate_species = sum(!informative),
+              median_abs_difference = median(abs(difference))), by = group]
+write_table(summ, file.path(dir_data_intermediate, "all_pairs_summary.csv"))
+print(summ, digits = 2)
+print(res[strata < min_strata_summary, .(pair, strata)])
+```
+
+```{r clear_summary, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) Difference in the standardised obligate share between southern Africa or Australia and each other region, within the climate strata they share (95% intervals from resampling genera); labels: shared strata and the share of the other region's area in them. (b) The same for the pairs of the other regions (controls), and southern Africa against Australia. (c) Standardised share of each strategy in both regions of each southern pair.
+
+*Inputs:* s24/ all_pairs.csv, all_pairs_shares.csv
+*Outputs:* plot_all_climates.png
+
+```{r plot_all_climates}
+res <- fread(file.path(dir_data_intermediate, "all_pairs.csv"))[strata > 0]
+shares <- fread(file.path(dir_data_intermediate, "all_pairs_shares.csv"))
+
+south <- res[group %in% paste(southern_regions, "vs other regions")]
+south[, `:=`(other = factor(region_short[region_2], rev(region_short[region_levels])),
+             group = factor(region_short[region_1], region_short[southern_regions]))]
+panel_a <- ggplot(south, aes(100 * difference, other)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = 100 * difference_low, xmax = 100 * difference_high), width = 0,
+                linewidth = 0.6, orientation = "y", colour = "#E69F00") +
+  geom_point(size = 2.4, colour = "#E69F00") +
+  geom_text(aes(x = 102, label = sprintf("%d strata, %.0f%%", strata, 100 * area_share_2)),
+            hjust = 0, size = 2.5, colour = "grey35") +
+  facet_wrap(~ group, ncol = 1) +
+  scale_x_continuous(limits = c(-40, 130), breaks = seq(-25, 100, 25)) +
+  labs(x = "Obligate share of the southern region minus the other (points)", y = NULL,
+       title = "Within shared climates, the south is more obligate") +
+  theme_figure()
+
+ctrl <- res[!group %in% paste(southern_regions, "vs other regions")]
+ctrl[, label := paste(region_short[region_1], "vs", region_short[region_2])]
+ctrl[, label := factor(label, label[order(difference)])]
+panel_b <- ggplot(ctrl, aes(100 * difference, label,
+                            colour = group == "Southern Africa vs Australia")) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = 100 * difference_low, xmax = 100 * difference_high), width = 0,
+                linewidth = 0.5, orientation = "y") +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c(`TRUE` = "#E69F00", `FALSE` = "#3B3B3B"), guide = "none") +
+  scale_x_continuous(limits = c(-40, 100), breaks = seq(-25, 100, 25)) +
+  labs(x = "Obligate share, first minus second region (points)", y = NULL,
+       title = "Other pairs of regions") +
+  theme_figure()
+
+sh <- shares[pair %in% south$pair & type %in% types]
+sh <- merge(sh, south[, .(pair, region_1, region_2)], by = "pair")
+sh[, `:=`(which = factor(ifelse(region == region_1, "Southern region", "Other region"),
+                         c("Southern region", "Other region")),
+          other = factor(region_short[region_2], rev(region_short[region_levels])),
+          south = factor(region_short[region_1], region_short[southern_regions]),
+          type = factor(type, rev(types)))]
+panel_c <- ggplot(sh, aes(share, which, fill = type)) +
+  geom_col(width = 0.75, colour = "white", linewidth = 0.3) +
+  facet_grid(other ~ south, switch = "y") +
+  scale_fill_manual(values = type_colours, breaks = types,
+                    labels = c("Non-associated", "Facultative", "Obligate mutualist",
+                               "Obligate parasite"), name = NULL) +
+  scale_x_continuous(labels = scales::label_percent(), breaks = c(0, 0.5, 1)) +
+  labs(x = "Standardised share in the shared climates", y = NULL,
+       title = "Strategies of both regions in their shared climates") +
+  theme_figure() +
+  theme(strip.text.y.left = element_text(angle = 0, hjust = 1, face = "plain"),
+        strip.placement = "outside", axis.text.y = element_text(size = 6.5))
+
+fig <- (panel_a | panel_b) / panel_c + plot_layout(heights = c(1, 1.2)) +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")")
+save_figure(fig, "plot_all_climates", 10, 11)
+fig
+```
+
+```{r clear_plot_all_climates, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

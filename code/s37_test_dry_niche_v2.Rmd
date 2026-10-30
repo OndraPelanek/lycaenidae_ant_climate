@@ -1,0 +1,675 @@
+---
+title: "Lycaenidae ant-interaction climate 37 - dry-niche test, version 2: supplemented occurrences, one contrast per origin, a joint model"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+Version 1 of the dry-niche test (`s36`) found a positive but uncertain difference between obligate mutualists and their facultative congeners, and was underpowered: with 8 genera it could detect only differences of about 1.3 log relative intensity per SD, and most of its uncertainty came from contrasts resting on one or two species of a strategy. This notebook is version 2, declared in `writing/dry_niche_v2_plan.md` after the results of version 1 were known and before any model of version 2 was fitted. Version 1 remains the pre-specified test; version 2 is reported whatever it shows.
+
+**Changes from version 1, each with its reason (see the declaration):**
+
+1. **Primary measure for H1: dry months alone.** H1 concerns occupancy of seasonally dry environments; temperature serves H3, whether the signal is more than warmth, which is tested with dry months given temperature, months below 50 mm given temperature and temperature alone. *This choice was made after seeing version 1, in which dry months alone was the one measure whose pooled interval excluded zero; it is a post hoc change of the primary measure.*
+2. **GBIF supplementation** (allowed by the proposal): a species' occupied pixels are its cleaned-record pixels plus the pixels with its own GBIF records within 100 km of a cleaned-record pixel in the same accessible area.
+3. **One contrast per origin of obligate mutualism** (H2): within each accessible area, genera with eligible mutualists and facultative species; for genera with eligible mutualists only, the eligible facultative species of the smallest clade on the tree of genera that holds any, within the same subfamily. Contrasts sharing species are merged, and contrasts of the same mutualist genera in different areas are combined into one estimate per origin.
+4. **A joint model**: one point-process model of all species-area units, with fixed intercepts per unit, fixed slopes for facultative species and for the mutualist-minus-facultative difference, and random slopes per unit and per origin and a random difference per origin; 2,000 background pixels per unit drawn in proportion to the background weight.
+
+**Unchanged:** accessible areas, backgrounds, standardisation, resolution, eligibility threshold (20 pixels), and the comparison of obligate mutualists with facultative species only.
+
+**Outcome rules (declared before analysis).** *Strong support*: the joint estimate for the all-butterfly background has model-based and bootstrap 95% intervals above zero, the estimates under the other two backgrounds are positive, at least two thirds of origins have a positive two-stage difference, and every leave-one-origin-out joint estimate is positive. *Lineage-specific support*: at least one origin with a two-stage interval above zero, otherwise. *No convincing support*: otherwise.
+
+The first run fetches the GBIF records of about 600 species (about 40 min); a full run then takes about 1.5 h, mostly the bootstrap.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(sf)
+library(mgcv)
+library(metafor)
+library(ape)
+library(ggplot2)
+```
+
+## Variables
+
+```{r setup_variables}
+min_cells <- 20
+supplement_km <- 100
+n_background <- 2000            # background pixels per unit in the joint model
+n_boot <- 199                   # cluster bootstrap over origins
+cap_quantile <- 0.95
+block_deg <- 2
+bg_weight <- 1000
+backgrounds <- c(record = "All-butterfly records", cell = "Recorded pixels, equal weight",
+                 uniform = "Uniform over accessible land")
+background_colours <- c(record = "#3B3B3B", cell = "#E69F00", uniform = "#56B4E9")
+# Models: the measures entered, and the one whose mutualist-minus-facultative slope is estimated
+models <- list(primary = "dry_months", given_temperature = c("dry_months", "bio01"),
+               dry50 = c("dry50", "bio01"), temperature = "bio01")
+focal_term <- c(primary = "dry_months", given_temperature = "dry_months", dry50 = "dry50", temperature = "bio01")
+model_names <- c(primary = "Dry months (primary)", given_temperature = "Dry months, given temperature",
+                 dry50 = "Months below 50 mm, given temperature", temperature = "Temperature alone")
+predictors <- c("dry_months", "cwd", "deficit_months", "dry50", "bio15", "log_bio14", "bio01")
+# GBIF map tiles, as in s35
+bases <- c("HUMAN_OBSERVATION", "PRESERVED_SPECIMEN", "OCCURRENCE", "MACHINE_OBSERVATION",
+           "MATERIAL_CITATION", "MATERIAL_SAMPLE", "OBSERVATION")
+years <- "1900,2026"
+zoom <- 4
+tiles_x <- 13:31
+tiles_y <- 0:12
+focal_margin <- 5
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_gbif <- file.path(dir_data_raw, "butterflies_gbif_density")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s10 <- path_resrepo("data/intermediate/s10_test_diversification")
+dir_s19 <- path_resrepo("data/intermediate/s19_test_mixed_genera")
+dir_s35 <- path_resrepo("data/intermediate/s35_prepare_dry_niche")
+dir_data_intermediate <- path_resrepo("data/intermediate/s37_test_dry_niche_v2")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# --- GBIF occurrence-density tiles (as in s35) ---
+fetch_tile <- function(x, y, taxon_key) {
+  query <- paste0("srs=EPSG:4326&taxonKey=", taxon_key, "&",
+                  paste0("basisOfRecord=", bases, collapse = "&"), "&year=", years)
+  url <- sprintf("https://api.gbif.org/v2/map/occurrence/density/%d/%d/%d.mvt?%s", zoom, x, y, query)
+  f <- tempfile(fileext = ".mvt")
+  on.exit(unlink(f))
+  ok <- FALSE
+  for (attempt in 1:5) {
+    ok <- tryCatch({ download.file(url, f, mode = "wb", quiet = TRUE); TRUE }, error = function(e) FALSE)
+    if (ok) break
+    Sys.sleep(10 * attempt)
+  }
+  if (!ok) stop("GBIF tile failed: ", url)
+  if (!file.exists(f) || file.size(f) == 0) return(NULL)
+  p <- tryCatch(st_read(f, quiet = TRUE), error = function(e) NULL)
+  if (is.null(p) || !nrow(p)) return(NULL)
+  xy <- st_coordinates(p)
+  keep <- xy[, 1] >= 0 & xy[, 1] < 512 & xy[, 2] >= 0 & xy[, 2] < 512
+  size <- 180 / 2^zoom
+  data.table(lon = -180 + (x + (xy[keep, 1] + 0.5) / 512) * size,
+             lat = 90 - (y + 1) * size + (xy[keep, 2] + 0.5) / 512 * size, records = p$total[keep])
+}
+fetch_cells <- function(tiles, taxon_key, template) {
+  pts <- rbindlist(lapply(seq_len(nrow(tiles)), function(i) {
+    Sys.sleep(0.2)
+    fetch_tile(tiles$x[i], tiles$y[i], taxon_key)
+  }))
+  if (!nrow(pts)) return(data.table(cell = integer(), records = numeric()))
+  pts[, cell := cellFromXY(template, cbind(lon, lat))]
+  pts[!is.na(cell), .(records = sum(records)), by = cell]
+}
+read_gz <- function(f) as.data.table(read.csv(gzfile(f), colClasses = c(pool_key = "character")))
+
+# --- Pixels with standardised predictors and blocks ---
+load_pixels <- function() {
+  pix <- readRDS(file.path(dir_s35, "dry_niche_pixels.rds"))
+  for (v in predictors) set(pix, j = paste0(v, "_z"), value = (pix[[v]] - mean(pix[[v]])) / sd(pix[[v]]))
+  pix[, block := paste(floor(lon / block_deg), floor(lat / block_deg))]
+  pix
+}
+
+# Background weights of one species in its area (its own GBIF records removed)
+background_weights <- function(b, background, own) {
+  n <- b$butterfly_records
+  if (!is.null(own) && nrow(own)) {
+    o <- own$records[match(b$cell, own$cell)]
+    n <- pmax(n - fifelse(is.na(o), 0, o), 0)
+  }
+  switch(background, record = pmin(n, quantile(n[n > 0], cap_quantile)), cell = as.numeric(n > 0),
+         uniform = b$area)
+}
+
+# Infinitely weighted logistic regression with cluster-robust SE (as in s36)
+fit_ipp <- function(xp, xb, wb, blocks_p, blocks_b) {
+  X <- cbind(1, rbind(xp, xb))
+  y <- c(rep(1, nrow(xp)), rep(0, nrow(xb)))
+  w <- c(rep(1, nrow(xp)), wb / sum(wb) * bg_weight * nrow(xp))
+  fit <- suppressWarnings(glm.fit(X, y, weights = w, family = binomial(), control = list(maxit = 100)))
+  p <- fit$fitted.values
+  bread <- tryCatch(solve(crossprod(X * sqrt(w * p * (1 - p)))), error = function(e) NULL)
+  if (is.null(bread)) return(NULL)
+  g <- c(blocks_p, blocks_b)
+  G <- uniqueN(g[y == 1])
+  robust <- G / max(G - 1, 1) * bread %*% crossprod(rowsum(X * (w * (y - p)), g)) %*% bread
+  out <- data.table(term = colnames(xp), estimate = fit$coefficients[-1],
+                    se_naive = sqrt(diag(bread))[-1], se_robust = sqrt(diag(robust))[-1], converged = fit$converged)
+  out[, se := pmax(se_naive, se_robust)]
+  out
+}
+
+# Contrasts within one accessible area: genera with both strategies; then, for genera with eligible
+# mutualists only, the eligible facultative species of the smallest clade of the tree of genera that
+# holds any (within one subfamily). Contrasts sharing species are merged.
+build_contrasts <- function(el, scheme, tree, subfam) {
+  out <- list()
+  for (a in unique(el$area)) {
+    e <- el[area == a]
+    gm <- e[, .(m = sum(strategy == "m"), f = sum(strategy == "f")), by = genus]
+    cs <- lapply(gm[m > 0 & f > 0]$genus, function(g)
+      list(m = e[genus == g & strategy == "m"]$pool_key, f = e[genus == g & strategy == "f"]$pool_key,
+           mg = g, fg = g))
+    if (scheme == "origins") {
+      used <- unlist(lapply(cs, function(x) c(x$m, x$f)))
+      for (g in gm[m > 0 & f == 0]$genus) {
+        if (all(e[genus == g & strategy == "m"]$pool_key %in% used)) next
+        i <- match(g, tree$tip.label)
+        if (is.na(i) || !g %in% names(subfam)) next
+        node <- tree$edge[tree$edge[, 2] == i, 1]
+        repeat {
+          tips <- extract.clade(tree, node)$tip.label
+          if (any(subfam[tips] != subfam[[g]], na.rm = TRUE)) break
+          fc <- e[genus %in% setdiff(tips, g) & strategy == "f" & !pool_key %in% used]
+          if (nrow(fc)) {
+            mc <- e[genus %in% tips & strategy == "m" & !pool_key %in% used]
+            cs[[length(cs) + 1]] <- list(m = mc$pool_key, f = fc$pool_key, mg = sort(unique(mc$genus)),
+                                         fg = sort(unique(fc$genus)))
+            used <- c(used, mc$pool_key, fc$pool_key)
+            break
+          }
+          if (node == Ntip(tree) + 1) break
+          node <- tree$edge[tree$edge[, 2] == node, 1]
+        }
+      }
+      repeat {
+        merged <- FALSE
+        for (i in seq_along(cs)) for (j in seq_along(cs)) if (i < j && !merged &&
+            length(intersect(c(cs[[i]]$m, cs[[i]]$f), c(cs[[j]]$m, cs[[j]]$f)))) {
+          cs[[i]] <- list(m = union(cs[[i]]$m, cs[[j]]$m), f = union(cs[[i]]$f, cs[[j]]$f),
+                          mg = sort(union(cs[[i]]$mg, cs[[j]]$mg)), fg = sort(union(cs[[i]]$fg, cs[[j]]$fg)))
+          cs[[j]] <- NULL
+          merged <- TRUE
+        }
+        if (!merged) break
+      }
+    }
+    for (x in cs) {
+      origin <- paste(x$mg, collapse = " + ")
+      label <- if (identical(x$mg, x$fg)) origin else paste(origin, "vs", paste(x$fg, collapse = " + "))
+      out[[length(out) + 1]] <- data.table(pool_key = c(x$m, x$f), strategy = rep(c("m", "f"), c(length(x$m), length(x$f))),
+                                           area = a, origin = origin, contrast = paste0(label, " (", sub(": .*$", "", a), ")"))
+    }
+  }
+  rbindlist(out)
+}
+
+# Two-stage comparison: per contrast, mutualists minus facultative (inverse-variance means with the
+# between-species variance of a hierarchical meta-analysis); contrasts of one origin combined; pooled
+# over origins by random-effects meta-analysis
+compare_origins <- function(e) {
+  e <- copy(e)[is.finite(estimate) & is.finite(se)]
+  e <- e[contrast %in% e[, .(both = uniqueN(strategy) == 2), by = contrast][both == TRUE]$contrast]
+  if (uniqueN(e$origin) < 2) return(NULL)
+  e[, m := as.integer(strategy == "m")]
+  h <- tryCatch(rma.mv(estimate, se^2, mods = ~ m, random = list(~ 1 | contrast, ~ 1 | species),
+                       data = e, method = "REML"), error = function(err) NULL)
+  tau2 <- if (is.null(h)) 0 else h$sigma2[2]
+  u <- e[, {
+    w <- 1 / (se^2 + tau2)
+    .(difference = sum((w * estimate)[m == 1]) / sum(w[m == 1]) - sum((w * estimate)[m == 0]) / sum(w[m == 0]),
+      se = sqrt(1 / sum(w[m == 1]) + 1 / sum(w[m == 0])), mutualists = sum(m), facultative = sum(1 - m))
+  }, by = .(origin, contrast)]
+  o <- u[, .(difference = sum(difference / se^2) / sum(1 / se^2), se = sqrt(1 / sum(1 / se^2)),
+             mutualists = sum(mutualists), facultative = sum(facultative),
+             contrasts = paste(contrast, collapse = "; ")), by = origin]
+  p <- rma(o$difference, sei = o$se, method = "REML")
+  list(origins = o, summary = data.table(origins = nrow(o), positive = sum(o$difference > 0),
+                                         sign_test_p = binom.test(sum(o$difference > 0), nrow(o))$p.value,
+                                         pooled = p$b[1], pooled_se = p$se, pooled_low = p$ci.lb,
+                                         pooled_high = p$ci.ub, pooled_p = p$pval, species = nrow(e)))
+}
+
+# Joint-model data: every unit's presences and n_background background pixels drawn with probability
+# proportional to its background weight
+joint_data <- function(units, pres, pix, own_counts, background, seed = 37) {
+  set.seed(seed)
+  rbindlist(lapply(seq_len(nrow(units)), function(i) {
+    u <- units[i]
+    b <- pix[area_shelf == u$area]
+    wb <- background_weights(b, background, own_counts[pool_key == u$pool_key])
+    pr <- b[match(pres[pool_key == u$pool_key & area == u$area]$cell, cell)]
+    pr <- pr[!is.na(cell)]
+    s <- sample.int(nrow(b), n_background, replace = TRUE, prob = wb)
+    rbind(pr[, c(list(y = 1, w = 1), .SD), .SDcols = paste0(predictors, "_z")],
+          b[s, c(list(y = 0, w = bg_weight * nrow(pr) / n_background), .SD), .SDcols = paste0(predictors, "_z")])[
+      , `:=`(unit = paste(u$pool_key, u$area), origin = u$origin, m = as.integer(u$strategy == "m"))]
+  }))
+}
+
+# Joint point-process model: unit intercepts; facultative slope and mutualist-minus-facultative
+# difference of the focal measure; random slopes per unit and per origin; random difference per origin
+fit_joint <- function(d, model) {
+  d <- copy(d)
+  focal <- paste0(focal_term[[model]], "_z")
+  d[, `:=`(fx = get(focal), unit = factor(unit), origin = factor(origin))]
+  d[, dm := fx * m]
+  other <- setdiff(paste0(models[[model]], "_z"), focal)
+  rhs <- c("unit", "fx", "dm", other, "s(fx, unit, bs = 're')", "s(fx, origin, bs = 're')",
+           "s(dm, origin, bs = 're')", if (length(other)) paste0("s(", other, ", unit, bs = 're')"))
+  fit <- tryCatch(suppressWarnings(bam(as.formula(paste("y ~", paste(rhs, collapse = " + "))), family = binomial(),
+                                       weights = w, data = d, discrete = TRUE, nthreads = 4)),
+                  error = function(e) NULL)
+  if (is.null(fit)) return(data.table(estimate = NA_real_, se = NA_real_))
+  pt <- summary(fit)$p.table
+  data.table(estimate = pt["dm", 1], se = pt["dm", 2], facultative_slope = pt["fx", 1])
+}
+
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom")
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# GBIF records of every candidate species
+
+The facultative species and obligate mutualists of the subfamilies that hold obligate mutualists, with cleaned records in the Old World. Their own GBIF records per pixel are fetched once (species already fetched by `s35` are reused) and cached.
+
+*Inputs:* s19/species_drought.csv; s02/species_records.rds; s01/climate_present_10m.tif; raw/butterflies_gbif_density/focal_counts_10m.csv.gz
+*Outputs:* candidate_species.csv; raw/butterflies_gbif_density/species_counts_10m.csv.gz
+
+```{r gbif_species}
+spd <- fread(file.path(dir_s19, "species_drought.csv"), colClasses = c(pool_key = "character"))[
+  interaction_type %in% c("f", "m")]
+cand <- spd[subfamily %in% spd[interaction_type == "m", unique(subfamily)],
+            .(pool_key, species, genus, subfamily, strategy = interaction_type, evidence = interaction_type_basis)]
+rec <- readRDS(file.path(dir_s02, "species_records.rds"))
+rec[, pool_key := as.character(pool_key)]
+ext <- rec[pool_key %in% cand$pool_key & decimalLongitude > -180 + min(tiles_x) * 180 / 2^zoom,
+           .(lon_min = min(decimalLongitude), lon_max = max(decimalLongitude),
+             lat_min = min(decimalLatitude), lat_max = max(decimalLatitude)), by = pool_key]
+cand <- merge(cand, ext, by = "pool_key")
+write_table(cand, file.path(dir_data_intermediate, "candidate_species.csv"))
+template <- rast(file.path(dir_s01, "climate_present_10m.tif"))[[1]]
+f_sp <- file.path(dir_gbif, "species_counts_10m.csv.gz")
+if (!file.exists(f_sp)) {
+  done <- read_gz(file.path(dir_gbif, "focal_counts_10m.csv.gz"))
+  todo <- cand[!pool_key %in% done$pool_key]
+  size <- 180 / 2^zoom
+  new <- rbindlist(lapply(seq_len(nrow(todo)), function(i) {
+    s <- todo[i]
+    tx <- floor((c(s$lon_min, s$lon_max) + c(-1, 1) * focal_margin + 180) / size)
+    ty <- floor((90 - c(s$lat_max, s$lat_min) + c(-1, 1) * focal_margin) / size)
+    t <- CJ(x = intersect(tx[1]:tx[2], tiles_x), y = intersect(ty[1]:ty[2], tiles_y))
+    fetch_cells(t, s$pool_key, template)[, pool_key := s$pool_key]
+  }))
+  fwrite(rbind(done[pool_key %in% cand$pool_key], new), f_sp)
+}
+own <- read_gz(f_sp)
+print(cand[, .N, by = strategy])
+cat("Species with GBIF records:", uniqueN(own$pool_key), "of", nrow(cand), "\n")
+```
+
+```{r clear_gbif_species, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Occupied pixels, cleaned and supplemented
+
+Cleaned-record pixels of every candidate species, and its GBIF pixels within 100 km of a cleaned-record pixel in the same accessible area.
+
+*Inputs:* s37/candidate_species.csv; s35/dry_niche_pixels.rds; s02/species_records.rds; raw/butterflies_gbif_density/species_counts_10m.csv.gz
+*Outputs:* presences.csv
+
+```{r presences}
+cand <- fread(file.path(dir_data_intermediate, "candidate_species.csv"), colClasses = c(pool_key = "character"))
+pix <- readRDS(file.path(dir_s35, "dry_niche_pixels.rds"))[, .(cell, lon, lat, area = area_shelf)]
+template <- rast(file.path(dir_s01, "climate_present_10m.tif"))[[1]]
+rec <- readRDS(file.path(dir_s02, "species_records.rds"))
+rec[, pool_key := as.character(pool_key)]
+rec <- rec[pool_key %in% cand$pool_key]
+rec[, cell := cellFromXY(template, cbind(decimalLongitude, decimalLatitude))]
+cleaned <- merge(unique(rec[!is.na(cell), .(pool_key, cell)]), pix, by = "cell")
+own <- read_gz(file.path(dir_gbif, "species_counts_10m.csv.gz"))
+gb <- merge(own[records > 0, .(pool_key, cell)], pix, by = "cell")
+gb <- gb[!paste(pool_key, cell) %in% paste(cleaned$pool_key, cleaned$cell)]
+sf_use_s2(TRUE)
+added <- rbindlist(lapply(split(gb, by = c("pool_key", "area")), function(g) {
+  cl <- cleaned[pool_key == g$pool_key[1] & area == g$area[1]]
+  if (!nrow(cl)) return(NULL)
+  near <- lengths(st_is_within_distance(st_as_sf(g, coords = c("lon", "lat"), crs = 4326),
+                                        st_as_sf(cl, coords = c("lon", "lat"), crs = 4326),
+                                        dist = supplement_km * 1000)) > 0
+  g[near]
+}))
+pres <- rbind(cleaned[, .(pool_key, cell, area, source = "cleaned")],
+              added[, .(pool_key, cell, area, source = "GBIF")])
+write_table(pres, file.path(dir_data_intermediate, "presences.csv"))
+print(pres[, .(pixels = .N), by = source])
+```
+
+```{r clear_presences, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Contrasts
+
+Eligible species-area units (at least 20 occupied pixels) with cleaned records only and with supplemented records, and the contrasts under two schemes: within genera (version 1) and one per origin (version 2).
+
+*Inputs:* s37/ candidate_species.csv, presences.csv; s10/ genus_tree.rds, genus_table.csv
+*Outputs:* contrasts.csv
+
+```{r contrasts}
+cand <- fread(file.path(dir_data_intermediate, "candidate_species.csv"), colClasses = c(pool_key = "character"))
+pres <- fread(file.path(dir_data_intermediate, "presences.csv"), colClasses = c(pool_key = "character"))
+tree <- readRDS(file.path(dir_s10, "genus_tree.rds"))
+gt <- fread(file.path(dir_s10, "genus_table.csv"))
+subfam <- setNames(gt$subfamily, gt$genus)
+ct <- rbindlist(lapply(c("cleaned", "supplemented"), function(v) {
+  p <- if (v == "cleaned") pres[source == "cleaned"] else pres
+  el <- p[, .(cells = .N), by = .(pool_key, area)][cells >= min_cells]
+  el <- merge(el, cand[, .(pool_key, species, genus, subfamily, strategy, evidence)], by = "pool_key")
+  rbindlist(lapply(c("within", "origins"), function(s)
+    merge(build_contrasts(el, s, tree, subfam), el[, .(pool_key, area, species, genus, subfamily, evidence, cells)],
+          by = c("pool_key", "area"))[, `:=`(occurrences = v, scheme = s)]))
+}))
+write_table(ct, file.path(dir_data_intermediate, "contrasts.csv"))
+print(ct[, .(units = .N, mutualists = sum(strategy == "m"), facultative = sum(strategy == "f"),
+             contrasts = uniqueN(contrast), origins = uniqueN(origin)), by = .(occurrences, scheme)])
+print(ct[occurrences == "supplemented" & scheme == "origins",
+         .(mutualists = sum(strategy == "m"), facultative = sum(strategy == "f")), by = .(origin, contrast)])
+```
+
+```{r clear_contrasts, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Species estimates and two-stage comparison
+
+Point-process coefficients of every unit (as in `s36`), for the four models under the three backgrounds (version 2 data) and the primary model for the other occurrence and contrast versions; then the two-stage comparison of origins.
+
+*Inputs:* s37/ contrasts.csv, presences.csv; s35/dry_niche_pixels.rds; raw/butterflies_gbif_density/species_counts_10m.csv.gz
+*Outputs:* species_estimates.csv, two_stage_summary.csv, two_stage_origins.csv
+
+```{r two_stage}
+ct <- fread(file.path(dir_data_intermediate, "contrasts.csv"), colClasses = c(pool_key = "character"))
+pres <- fread(file.path(dir_data_intermediate, "presences.csv"), colClasses = c(pool_key = "character"))
+own <- read_gz(file.path(dir_gbif, "species_counts_10m.csv.gz"))
+pix <- load_pixels()
+units <- unique(ct[, .(pool_key, area, occurrences)])
+est <- rbindlist(lapply(seq_len(nrow(units)), function(i) {
+  u <- units[i]
+  b <- pix[area_shelf == u$area]
+  p <- if (u$occurrences == "cleaned") pres[source == "cleaned"] else pres
+  pr <- b[match(p[pool_key == u$pool_key & area == u$area]$cell, cell)]
+  pr <- pr[!is.na(cell)]
+  ms <- if (u$occurrences == "supplemented") names(models) else c("primary", "given_temperature")
+  rbindlist(lapply(names(backgrounds), function(bg) {
+    wb <- background_weights(b, bg, own[pool_key == u$pool_key])
+    keep <- wb > 0
+    rbindlist(lapply(ms, function(m) {
+      vars <- paste0(models[[m]], "_z")
+      f <- fit_ipp(as.matrix(pr[, ..vars]), as.matrix(b[keep, ..vars]), wb[keep], pr$block, b$block[keep])
+      if (is.null(f)) return(NULL)
+      f[, term := sub("_z$", "", term)][term == focal_term[[m]]][, `:=`(model = m, background = bg)]
+    }))
+  }))[, `:=`(pool_key = u$pool_key, area = u$area, occurrences = u$occurrences, cells = nrow(pr))]
+}))
+write_table(est, file.path(dir_data_intermediate, "species_estimates.csv"))
+
+steps <- data.table(step = c("Version 1 data (within genera, cleaned records)", "Adding GBIF supplementation",
+                             "Version 2 (supplementation and origins)"),
+                    occurrences = c("cleaned", "supplemented", "supplemented"),
+                    scheme = c("within", "within", "origins"))
+res <- list(); orig <- list()
+for (k in seq_len(nrow(steps))) for (bg in names(backgrounds)) {
+  ms <- if (k == 3) names(models) else c("primary", "given_temperature")
+  for (m in ms) {
+    e <- merge(est[occurrences == steps$occurrences[k] & background == bg & model == m],
+               ct[occurrences == steps$occurrences[k] & scheme == steps$scheme[k]],
+               by = c("pool_key", "area", "occurrences"))
+    out <- compare_origins(e)
+    if (is.null(out)) next
+    tag <- data.table(step = steps$step[k], background = bg, model = m)
+    res[[length(res) + 1]] <- cbind(tag, out$summary)
+    orig[[length(orig) + 1]] <- cbind(tag, out$origins)
+  }
+}
+write_table(rbindlist(res), file.path(dir_data_intermediate, "two_stage_summary.csv"))
+write_table(rbindlist(orig), file.path(dir_data_intermediate, "two_stage_origins.csv"))
+print(rbindlist(res)[background == "record"], digits = 2)
+```
+
+```{r clear_two_stage, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Joint model
+
+The primary estimate (version 2 data, dry months, all-butterfly background) and the other models, backgrounds and decomposition steps; leave one origin out.
+
+*Inputs:* s37/ contrasts.csv, presences.csv; s35/dry_niche_pixels.rds; raw/butterflies_gbif_density/species_counts_10m.csv.gz
+*Outputs:* joint_estimates.csv, joint_leave_one_out.csv, joint_data_primary.rds
+
+```{r joint}
+ct <- fread(file.path(dir_data_intermediate, "contrasts.csv"), colClasses = c(pool_key = "character"))
+pres <- fread(file.path(dir_data_intermediate, "presences.csv"), colClasses = c(pool_key = "character"))
+own <- read_gz(file.path(dir_gbif, "species_counts_10m.csv.gz"))
+pix <- load_pixels()
+steps <- data.table(step = c("Version 1 data (within genera, cleaned records)", "Adding GBIF supplementation",
+                             "Version 2 (supplementation and origins)"),
+                    occurrences = c("cleaned", "supplemented", "supplemented"),
+                    scheme = c("within", "within", "origins"))
+res <- list()
+for (k in seq_len(nrow(steps))) {
+  units <- ct[occurrences == steps$occurrences[k] & scheme == steps$scheme[k]]
+  p <- if (steps$occurrences[k] == "cleaned") pres[source == "cleaned"] else pres
+  for (bg in if (k == 3) names(backgrounds) else "record") {
+    d <- joint_data(units, p, pix, own, bg)
+    if (k == 3 && bg == "record") saveRDS(d, file.path(dir_data_intermediate, "joint_data_primary.rds"))
+    for (m in if (k == 3) names(models) else c("primary", "given_temperature")) {
+      res[[length(res) + 1]] <- cbind(data.table(step = steps$step[k], background = bg, model = m,
+                                                 units = nrow(units), origins = uniqueN(units$origin)),
+                                      fit_joint(d, m))
+    }
+  }
+}
+res <- rbindlist(res)
+res[, `:=`(low = estimate - 1.96 * se, high = estimate + 1.96 * se, p = 2 * pnorm(-abs(estimate / se)))]
+write_table(res, file.path(dir_data_intermediate, "joint_estimates.csv"))
+print(res, digits = 2)
+
+d <- readRDS(file.path(dir_data_intermediate, "joint_data_primary.rds"))
+loo <- rbindlist(lapply(unique(d$origin), function(o) fit_joint(d[origin != o], "primary")[, left_out := o]))
+write_table(loo, file.path(dir_data_intermediate, "joint_leave_one_out.csv"))
+print(loo, digits = 2)
+```
+
+```{r clear_joint, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Cluster bootstrap over origins
+
+Origins resampled with replacement (each copy relabelled), the primary joint model refitted; percentile 95% interval.
+
+*Inputs:* s37/joint_data_primary.rds
+*Outputs:* bootstrap.csv
+
+```{r bootstrap}
+d <- readRDS(file.path(dir_data_intermediate, "joint_data_primary.rds"))
+origins <- unique(d$origin)
+set.seed(3737)
+boot <- rbindlist(lapply(seq_len(n_boot), function(r) {
+  pick <- sample(origins, length(origins), replace = TRUE)
+  db <- rbindlist(lapply(seq_along(pick), function(j)
+    d[origin == pick[j]][, `:=`(origin = paste(origin, j), unit = paste(unit, j))]))
+  fit_joint(db, "primary")[, replicate := r]
+}))
+write_table(boot, file.path(dir_data_intermediate, "bootstrap.csv"))
+print(boot[, .(replicates = sum(is.finite(estimate)), low = quantile(estimate, 0.025, na.rm = TRUE),
+               median = median(estimate, na.rm = TRUE), high = quantile(estimate, 0.975, na.rm = TRUE))])
+```
+
+```{r clear_bootstrap, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Outcome
+
+The outcome under the rules declared before analysis.
+
+*Inputs:* s37/ joint_estimates.csv, joint_leave_one_out.csv, bootstrap.csv, two_stage_origins.csv
+*Outputs:* outcome.csv
+
+```{r outcome}
+j <- fread(file.path(dir_data_intermediate, "joint_estimates.csv"))[step == "Version 2 (supplementation and origins)" &
+                                                                       model == "primary"]
+loo <- fread(file.path(dir_data_intermediate, "joint_leave_one_out.csv"))
+boot <- fread(file.path(dir_data_intermediate, "bootstrap.csv"))
+o <- fread(file.path(dir_data_intermediate, "two_stage_origins.csv"))[
+  step == "Version 2 (supplementation and origins)" & model == "primary" & background == "record"]
+rec <- j[background == "record"]
+b_low <- quantile(boot$estimate, 0.025, na.rm = TRUE); b_high <- quantile(boot$estimate, 0.975, na.rm = TRUE)
+strong <- rec$low > 0 && b_low > 0 && all(j$estimate > 0) && sum(o$difference > 0) >= 2 / 3 * nrow(o) &&
+  all(loo$estimate > 0, na.rm = TRUE)
+lineage <- any(o$difference - 1.96 * o$se > 0)
+outcome <- data.table(
+  outcome = if (strong) "Strong support" else if (lineage) "Lineage-specific support" else "No convincing support",
+  estimate = rec$estimate, model_low = rec$low, model_high = rec$high, model_p = rec$p,
+  bootstrap_low = b_low, bootstrap_high = b_high,
+  cell = j[background == "cell"]$estimate, uniform = j[background == "uniform"]$estimate,
+  origins = nrow(o), positive = sum(o$difference > 0), loo_min = min(loo$estimate, na.rm = TRUE),
+  loo_max = max(loo$estimate, na.rm = TRUE), loo_min_without = loo[which.min(estimate)]$left_out,
+  origins_interval_above_zero = paste(o[difference - 1.96 * se > 0]$origin, collapse = ", "))
+write_table(outcome, file.path(dir_data_intermediate, "outcome.csv"))
+print(t(outcome))
+```
+
+```{r clear_outcome, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figures
+
+## One estimate per origin
+
+For each origin of obligate mutualism (version 2 data), the two-stage difference between its mutualists and their facultative relatives in the association with dry months, under the three backgrounds, and the joint estimate (model-based interval; the bootstrap interval as a thin line for the all-butterfly background).
+
+*Inputs:* s37/ two_stage_origins.csv, joint_estimates.csv, bootstrap.csv
+*Outputs:* plot_dry_niche_origins.png
+
+```{r plot_dry_niche_origins}
+o <- fread(file.path(dir_data_intermediate, "two_stage_origins.csv"))[
+  step == "Version 2 (supplementation and origins)" & model == "primary"]
+j <- fread(file.path(dir_data_intermediate, "joint_estimates.csv"))[
+  step == "Version 2 (supplementation and origins)" & model == "primary"]
+boot <- fread(file.path(dir_data_intermediate, "bootstrap.csv"))
+o[, label := sprintf("%s (%d/%d)", origin, mutualists, facultative)]
+ord <- o[background == "record"][order(difference)]$label
+d <- rbind(o[, .(row = label, background, difference, low = difference - 1.96 * se, high = difference + 1.96 * se,
+                 pooled = FALSE)],
+           j[, .(row = "Joint model", background, difference = estimate, low, high, pooled = TRUE)])
+d[, row := factor(row, c("Joint model", ord))]
+d[, background := factor(backgrounds[background], backgrounds)]
+bq <- data.table(row = factor("Joint model", levels(d$row)), low = quantile(boot$estimate, 0.025, na.rm = TRUE),
+                 high = quantile(boot$estimate, 0.975, na.rm = TRUE))
+fig <- ggplot(d, aes(difference, row, colour = background)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = low, xmax = high), width = 0, linewidth = 0.5, orientation = "y",
+                position = position_dodge(width = 0.6)) +
+  geom_point(aes(shape = pooled), size = 2.2, position = position_dodge(width = 0.6)) +
+  geom_errorbar(data = bq, aes(y = row, xmin = low, xmax = high), inherit.aes = FALSE, width = 0.25,
+                colour = "grey35", linewidth = 0.3, orientation = "y") +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 18), guide = "none") +
+  scale_colour_manual(values = setNames(background_colours, backgrounds), name = NULL) +
+  labs(x = "Mutualists minus facultative relatives: association with dry months (per SD)", y = NULL,
+       title = "One estimate per origin of obligate mutualism (version 2)",
+       subtitle = "In brackets: mutualist/facultative species; joint model with model-based and bootstrap (thin) intervals") +
+  theme_figure() + theme(axis.text.y = element_text(face = "italic"))
+save_figure(fig, "plot_dry_niche_origins", 8, 0.42 * uniqueN(d$row) + 1.8)
+fig
+```
+
+```{r clear_plot_dry_niche_origins, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+## From version 1 to version 2
+
+The joint and two-stage estimates at each step of the change (all-butterfly background), for dry months and for dry months given temperature, and the H3 models of version 2.
+
+*Inputs:* s37/ joint_estimates.csv, two_stage_summary.csv
+*Outputs:* plot_dry_niche_steps.png
+
+```{r plot_dry_niche_steps}
+j <- fread(file.path(dir_data_intermediate, "joint_estimates.csv"))[background == "record"]
+t2 <- fread(file.path(dir_data_intermediate, "two_stage_summary.csv"))[background == "record"]
+d <- rbind(j[, .(step, model, method = "Joint model", estimate, low, high)],
+           t2[, .(step, model, method = "Two-stage (random effects over origins)", estimate = pooled,
+                  low = pooled_low, high = pooled_high)])
+d[, `:=`(step = factor(step, rev(unique(t2$step))), model = factor(model_names[model], model_names))]
+fig <- ggplot(d, aes(estimate, step, colour = method)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = low, xmax = high), width = 0, linewidth = 0.5, orientation = "y",
+                position = position_dodge(width = 0.5)) +
+  geom_point(size = 2, position = position_dodge(width = 0.5)) +
+  facet_wrap(~ model, ncol = 1, scales = "free_y") +
+  scale_colour_manual(values = c("#3B3B3B", "#D55E00"), name = NULL) +
+  labs(x = "Mutualists minus facultative relatives (log relative intensity per SD; all-butterfly background)",
+       y = NULL, title = "From version 1 to version 2") +
+  theme_figure()
+save_figure(fig, "plot_dry_niche_steps", 8, 7)
+fig
+```
+
+```{r clear_plot_dry_niche_steps, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

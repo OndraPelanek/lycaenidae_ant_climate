@@ -1,0 +1,244 @@
+---
+title: "Lycaenidae ant-interaction climate 38 - can drought be told apart from warmth? Climatic identifiability of each contrast"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+The dry-niche tests (`s36`, `s37`) gave a positive but uncertain difference between obligate mutualists and their facultative relatives, which shrank once temperature entered the model. Before fitting further models, this notebook asks a descriptive question (sixth external review, 30 October 2026; `writing/research_roadmap.md`, rank 1): **within each contrast, does dryness vary independently of temperature among the places where the species occur and among the places available to them?** If dryness and temperature lie along one gradient, no model can separate a drought effect from a warmth effect without extrapolating into climates absent from the data.
+
+**Variables (fixed in the roadmap before this analysis):** H1 warmth, annual mean temperature; H2 dry-season duration independent of temperature, the longest run of consecutive months with less than 50 mm of rain; H3 water stress, the annual climatic water deficit.
+
+**Units:** the contrasts of `s37` built with cleaned records only (supplemented records are audited separately in `s39`): genera with eligible mutualists and facultative species, and the origin contrasts built from the tree of genera, in each accessible area.
+
+**Diagnostics per contrast:**
+
+1. correlations between temperature and each dryness variable among the occupied pixels and across the record-weighted background of the accessible area;
+2. common temperature support: the overlap of the 5–95% temperature ranges of the mutualists' and the facultative species' pixels, and the share of each strategy's pixels inside it;
+3. within 1 °C temperature bins inside the common support that hold both strategies, the pooled within-bin standard deviation of each dryness variable as a share of its total standard deviation among those pixels;
+4. a flag: a contrast is **identifiable** for a dryness variable when both strategies have at least 10 occupied pixels in at least 3 shared bins and the within-bin standard deviation is at least one third of the total. These thresholds were set before the diagnostics were computed.
+
+A full run takes about 3 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(ggplot2)
+```
+
+## Variables
+
+```{r setup_variables}
+bin_width <- 1                 # temperature bins (degrees C)
+min_pixels_shared <- 10        # occupied pixels per strategy in shared bins
+min_shared_bins <- 3
+min_sd_ratio <- 1 / 3          # within-bin SD over total SD of the dryness variable
+cap_quantile <- 0.95
+dryness <- c(dry_run50 = "Longest run of months below 50 mm", cwd = "Climatic water deficit (mm)")
+strategy_colours <- c(f = "#56B4E9", m = "#D55E00")
+strategy_names <- c(f = "Facultative", m = "Obligate mutualist")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s35 <- path_resrepo("data/intermediate/s35_prepare_dry_niche")
+dir_s37 <- path_resrepo("data/intermediate/s37_test_dry_niche_v2")
+dir_data_intermediate <- path_resrepo("data/intermediate/s38_diagnose_identifiability")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+read_monthly <- function(variable) {
+  zip <- file.path(dir_data_raw, "worldclim_2.1", paste0("wc2.1_10m_", variable, ".zip"))
+  files <- sort(grep("\\.tif$", unzip(zip, list = TRUE)$Name, value = TRUE))
+  rast(file.path("/vsizip", zip, files))
+}
+# Longest run of TRUE in a circular year of 12 months (all 12 if every month is TRUE)
+longest_circular_run <- function(x) {
+  if (all(x)) return(12L)
+  r <- rle(c(x, x))
+  min(max(c(0L, r$lengths[r$values])), 12L)
+}
+weighted_cor <- function(x, y, w) {
+  w <- w / sum(w)
+  mx <- sum(w * x); my <- sum(w * y)
+  sum(w * (x - mx) * (y - my)) / sqrt(sum(w * (x - mx)^2) * sum(w * (y - my)^2))
+}
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom")
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Mechanism variables per pixel
+
+The longest run of months below 50 mm, from monthly WorldClim precipitation, added to the pixel table of `s35` (which holds temperature and the climatic water deficit).
+
+*Inputs:* s35/dry_niche_pixels.rds; raw/worldclim_2.1/ monthly prec
+*Outputs:* mechanism_pixels.rds
+
+```{r mechanism}
+pix <- readRDS(file.path(dir_s35, "dry_niche_pixels.rds"))
+P <- as.matrix(read_monthly("prec")[pix$cell])
+pix[, dry_run50 := apply(P < 50, 1, longest_circular_run)]
+saveRDS(pix[, .(cell, lon, lat, area_shelf, area, butterfly_records, bio01, dry_run50, cwd, dry_months, dry50)],
+        file.path(dir_data_intermediate, "mechanism_pixels.rds"))
+print(pix[, .(pixels = .N, mean_run = mean(dry_run50), cor_dry50_run = cor(dry50, dry_run50),
+              cor_temp_run = cor(bio01, dry_run50), cor_temp_cwd = cor(bio01, cwd))])
+```
+
+```{r clear_mechanism, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Diagnostics per contrast
+
+*Inputs:* s38/mechanism_pixels.rds; s37/ contrasts.csv, presences.csv
+*Outputs:* identifiability.csv, contrast_pixels.rds
+
+```{r diagnostics}
+pix <- readRDS(file.path(dir_data_intermediate, "mechanism_pixels.rds"))
+ct <- fread(file.path(dir_s37, "contrasts.csv"), colClasses = c(pool_key = "character"))[occurrences == "cleaned"]
+pres <- fread(file.path(dir_s37, "presences.csv"), colClasses = c(pool_key = "character"))[source == "cleaned"]
+cp <- merge(ct[, .(pool_key, strategy, area, origin, contrast, scheme, species, genus)],
+            pres[, .(pool_key, area, cell)], by = c("pool_key", "area"))
+cp <- merge(cp, pix[, .(cell, bio01, dry_run50, cwd)], by = "cell")
+saveRDS(cp, file.path(dir_data_intermediate, "contrast_pixels.rds"))
+
+diag <- rbindlist(lapply(split(cp, by = c("scheme", "contrast")), function(d) {
+  b <- pix[area_shelf == d$area[1] & butterfly_records > 0]
+  wb <- pmin(b$butterfly_records, quantile(b$butterfly_records, cap_quantile))
+  q <- d[, .(lo = quantile(bio01, 0.05), hi = quantile(bio01, 0.95)), by = strategy]
+  lo <- max(q$lo); hi <- min(q$hi)
+  inside <- d[bio01 >= lo & bio01 <= hi]
+  inside[, tbin := floor(bio01 / bin_width)]
+  shared <- inside[, .(both = uniqueN(strategy) == 2), by = tbin][both == TRUE]$tbin
+  s <- inside[tbin %in% shared]
+  rbindlist(lapply(names(dryness), function(v) {
+    within_sd <- if (nrow(s) > 2) sqrt(s[, .(ss = sum((get(v) - mean(get(v)))^2), n = .N), by = tbin][
+      , sum(ss) / max(sum(n) - .N, 1)]) else NA_real_
+    total_sd <- if (nrow(s) > 2) sd(s[[v]]) else NA_real_
+    data.table(scheme = d$scheme[1], contrast = d$contrast[1], origin = d$origin[1], area = d$area[1],
+               variable = v, mutualists = uniqueN(d[strategy == "m"]$pool_key),
+               facultative = uniqueN(d[strategy == "f"]$pool_key),
+               pixels_m = d[strategy == "m", .N], pixels_f = d[strategy == "f", .N],
+               cor_occupied = cor(d$bio01, d[[v]]), cor_background = weighted_cor(b$bio01, b[[v]], wb),
+               support_low = lo, support_high = hi,
+               share_m_in_support = inside[strategy == "m", .N] / d[strategy == "m", .N],
+               share_f_in_support = inside[strategy == "f", .N] / d[strategy == "f", .N],
+               shared_bins = length(shared), shared_pixels_m = s[strategy == "m", .N],
+               shared_pixels_f = s[strategy == "f", .N], within_sd = within_sd, total_sd = total_sd,
+               sd_ratio = within_sd / total_sd)
+  }))
+}))
+diag[, identifiable := shared_pixels_m >= min_pixels_shared & shared_pixels_f >= min_pixels_shared &
+       shared_bins >= min_shared_bins & is.finite(sd_ratio) & sd_ratio >= min_sd_ratio]
+write_table(diag, file.path(dir_data_intermediate, "identifiability.csv"))
+print(diag[scheme == "origins", .(contrast = substr(contrast, 1, 40), variable, m = mutualists, f = facultative,
+                                   r_occ = round(cor_occupied, 2), r_bg = round(cor_background, 2),
+                                   bins = shared_bins, pm = shared_pixels_m, pf = shared_pixels_f,
+                                   sd_ratio = round(sd_ratio, 2), identifiable)])
+print(diag[, .(contrasts = .N, identifiable = sum(identifiable)), by = .(scheme, variable)])
+```
+
+```{r clear_diagnostics, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Environmental space of each contrast
+
+For each origin contrast and dryness variable: the record-weighted butterfly background of the accessible area (grey density), the occupied pixels of the mutualists and the facultative species, and the common temperature support (dashed lines).
+
+*Inputs:* s38/ mechanism_pixels.rds, contrast_pixels.rds, identifiability.csv
+*Outputs:* plot_environment_space_run.png, plot_environment_space_cwd.png
+
+```{r plot_environment_space}
+pix <- readRDS(file.path(dir_data_intermediate, "mechanism_pixels.rds"))
+cp <- readRDS(file.path(dir_data_intermediate, "contrast_pixels.rds"))[scheme == "origins"]
+diag <- fread(file.path(dir_data_intermediate, "identifiability.csv"))[scheme == "origins"]
+# Panel names: the mutualist genera (several genera named by the first) and the area
+short <- function(x) vapply(x, function(e) {
+  g <- strsplit(sub(" \\(.*$", "", strsplit(e, " vs ")[[1]][1]), " + ", fixed = TRUE)[[1]]
+  lab <- if (length(g) > 2) paste0(g[1], " + ", length(g) - 1, " genera") else paste(g, collapse = " + ")
+  paste0(lab, " (", sub("^.*\\(", "", e))
+}, character(1), USE.NAMES = FALSE)
+panels <- unique(cp[, .(contrast)])[, panel := short(contrast)]
+cp <- merge(cp, panels, by = "contrast")
+diag <- merge(diag, panels, by = "contrast")
+bg <- rbindlist(lapply(unique(cp$area), function(a) pix[area_shelf == a & butterfly_records > 0,
+                                                         .(area = a, bio01, dry_run50, cwd, w = butterfly_records)]))
+bg <- merge(bg, unique(cp[, .(area, panel)]), by = "area", allow.cartesian = TRUE)
+for (v in names(dryness)) {
+  lab <- diag[variable == v, .(panel, label = sprintf("r = %.2f; within-bin SD ratio %.2f%s", cor_occupied, sd_ratio,
+                                                      fifelse(identifiable, "; identifiable", "")))]
+  fig <- ggplot() +
+    stat_bin_2d(data = bg, aes(bio01, get(v), weight = pmin(w, quantile(w, cap_quantile))), bins = 40,
+                show.legend = FALSE) +
+    scale_fill_gradient(low = "grey95", high = "grey55") +
+    geom_vline(data = diag[variable == v], aes(xintercept = support_low), linetype = "dashed", linewidth = 0.3) +
+    geom_vline(data = diag[variable == v], aes(xintercept = support_high), linetype = "dashed", linewidth = 0.3) +
+    geom_jitter(data = cp, aes(bio01, get(v), colour = strategy), size = 0.5, alpha = 0.6,
+                width = 0.1, height = if (v == "dry_run50") 0.15 else 0) +
+    geom_text(data = lab, aes(x = -Inf, y = Inf, label = label), hjust = -0.02, vjust = 1.3, size = 2.2) +
+    facet_wrap(~ panel, scales = "free") +
+    scale_colour_manual(values = strategy_colours, labels = strategy_names, name = NULL) +
+    guides(colour = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+    labs(x = "Annual mean temperature (°C)", y = dryness[[v]],
+         title = paste("Environmental space of each contrast:", tolower(dryness[[v]])),
+         subtitle = "Grey: butterfly records of the accessible area; points: occupied pixels; dashed: common temperature support") +
+    theme_figure(8)
+  save_figure(fig, paste0("plot_environment_space_", if (v == "dry_run50") "run" else "cwd"), 10, 8)
+  print(fig)
+}
+```
+
+```{r clear_plot_environment_space, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

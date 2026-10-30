@@ -1,0 +1,744 @@
+---
+title: "Lycaenidae ant-interaction climate 36 - do obligate mutualists occupy seasonally drier environments than their facultative congeners?"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+Within genera, obligate mutualists lived in places with more dry months than their facultative congeners (`s19`), and in the drier parts of their surroundings (`s29`, `s34`), but these comparisons did not control well for the climates available or for where butterflies are recorded, and the association weakened without *Arhopala* and with other drought measures (`s28`). This notebook implements the research proposal of 30 October 2026: a comparative test of whether obligate mutualists repeatedly occupy drier environments than their facultative relatives once environmental availability, recording effort and relatedness are accounted for.
+
+**Hypotheses.** H1: obligate mutualists show stronger relative occupancy of seasonally dry environments than facultative congeners. H2: the pattern recurs across independently evolved lineages rather than reflecting a few regional radiations. H3: it reflects the length of the dry season or water stress, not temperature or the unevenness of rainfall alone. Null: differences arise from availability, sampling or lineage history.
+
+**Design.**
+
+1. **Species.** The obligate mutualists and facultative species of the genera that contain both (parasites are not part of this test). A species enters an accessible area when its cleaned records occupy at least 20 pixels of 10 arc-minutes there (10 and 30 as sensitivity); a species spanning several areas is analysed in each. A genus enters an area when it has at least one eligible mutualist and one eligible facultative species there. These criteria were set before any model was fitted; excluded species and genera are listed.
+2. **Accessible areas** (`s35`): realms on the landmasses of the glacial shelf (primary); realms on present-day landmasses; and the study's eight regions.
+3. **Backgrounds** (`s35`). Primary: the GBIF records of all butterflies in the area, per pixel, with the focal species' own records removed and counts capped at the 95th percentile of recorded pixels (so that a few intensely recorded sites do not dominate). Sensitivity: every pixel with butterfly records weighted equally; and all land of the area weighted by pixel area (the climates available, regardless of recording). The first two address recording effort in two ways (linear in records, or saturated); the third describes availability. Butterfly records reflect butterfly diversity as well as effort, so the record-weighted models estimate occupancy relative to the recorded butterfly assemblage, not physiological suitability (Phillips et al. 2009; Botella et al. 2020).
+4. **Species models.** For each species and area, a presence–background model of relative occurrence intensity: an inhomogeneous Poisson point process fitted as an infinitely weighted logistic regression (Warton & Shepherd 2010; Fithian & Hastie 2013), with the occupied pixels as presences and every pixel of the area as quadrature, weighted by the background. The primary quantity is the coefficient of dry months given temperature (log relative intensity per SD of dry months across the land of the eight regions). Standard errors are cluster-robust over 2° blocks (and never smaller than the model-based ones). Response shapes are fitted with penalised smooths.
+5. **Comparisons.** (A) For each genus and area, the difference between the mutualists' and the facultative species' coefficients (inverse-variance means, with the between-species variance from a hierarchical meta-analysis), combined over areas within a genus; then one estimate per genus, a random-effects pooled estimate over genera, and the number of genera with a positive difference (sign test). A hierarchical meta-analysis of the species coefficients (random intercepts of genus-area unit and species) gives a second pooled estimate, also with a phylogenetic correlation among species from the genus-grafted dated tree. (B) Directly, without a background: whether an occupied pixel belongs to a mutualist or a facultative congener, as a function of dry months and temperature, with genus-area units as fixed effects, each species weighted equally and standard errors clustered by species.
+6. **Robustness.** Backgrounds; seven measures (dry months alone; climatic water deficit, water-deficit months, months below 50 mm, seasonality and driest-month precipitation given temperature; temperature alone); thresholds; accessible areas; resolution (30 arc-minutes); species-specific evidence only; only species whose records overlap a congener of the other strategy; leaving out each genus; spatially blocked cross-validation (Valavi et al. 2019) of whether dry months improve the prediction of held-out blocks.
+
+**Outcomes, defined before the results.** *Strong support*: under the primary settings, the pooled genus-level difference is positive with a 95% interval above zero, it is positive under the other two backgrounds, at least two thirds of genera are positive, and every leave-one-genus-out estimate is positive. *Lineage-specific support*: at least one genus has a positive difference with an interval above zero, but the criteria of strong support are not met. *No convincing support*: otherwise. None of these would show that ant mutualism causes drought tolerance.
+
+A full run takes about 30 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(mgcv)
+library(metafor)
+library(ape)
+library(ggplot2)
+```
+
+## Variables
+
+```{r setup_variables}
+min_cells <- 20                 # primary eligibility: occupied 10-arc-minute pixels in the area
+min_cells_sensitivity <- c(10, 30)
+cap_quantile <- 0.95            # cap of butterfly records per pixel within an area
+block_deg <- 2                  # blocks for cluster-robust standard errors (degrees)
+cv_block_deg <- 5               # blocks for spatial cross-validation (degrees)
+cv_folds <- 5
+bg_weight <- 1000               # total background weight per presence (infinitely weighted logistic)
+backgrounds <- c(record = "All-butterfly records", cell = "Recorded pixels, equal weight",
+                 uniform = "Uniform over accessible land")
+models <- list(primary = c("dry_months", "bio01"), dry_alone = "dry_months", cwd = c("cwd", "bio01"),
+               deficit = c("deficit_months", "bio01"), dry50 = c("dry50", "bio01"),
+               seasonality = c("bio15", "bio01"), driest = c("log_bio14", "bio01"), temperature = "bio01")
+model_names <- c(primary = "Dry months, given temperature", dry_alone = "Dry months alone",
+                 cwd = "Climatic water deficit, given temperature",
+                 deficit = "Water-deficit months, given temperature",
+                 dry50 = "Months below 50 mm, given temperature",
+                 seasonality = "Precipitation seasonality, given temperature",
+                 driest = "Less driest-month rain, given temperature", temperature = "Temperature alone")
+focal_term <- c(primary = "dry_months", dry_alone = "dry_months", cwd = "cwd", deficit = "deficit_months",
+                dry50 = "dry50", seasonality = "bio15", driest = "log_bio14", temperature = "bio01")
+# Sign that makes positive mean "drier" (or warmer, for temperature)
+drier_sign <- c(dry_months = 1, cwd = 1, deficit_months = 1, dry50 = 1, bio15 = 1, log_bio14 = -1, bio01 = 1)
+predictors <- names(drier_sign)
+area_defs <- c(area_shelf = "Realms on glacial-shelf landmasses", area_present = "Realms on present-day landmasses",
+               area_region = "The study's eight regions")
+pilot_genera <- c("Arhopala", "Hypochrysops", "Ogyris")
+specific_evidence <- c("direct", "direct_class_inferred_subtype")
+background_colours <- c(record = "#3B3B3B", cell = "#E69F00", uniform = "#56B4E9")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_gbif <- file.path(dir_data_raw, "butterflies_gbif_density")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s35 <- path_resrepo("data/intermediate/s35_prepare_dry_niche")
+dir_data_intermediate <- path_resrepo("data/intermediate/s36_test_dry_niche")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Pixels, presences and focal-species GBIF counts at 10 arc-minutes, or aggregated to 30
+# (climate: mean of the 10-arc-minute pixels; area and records: sum). Predictors are standardised
+# with the mean and SD of all land pixels of the eight regions at 10 arc-minutes.
+load_data <- function(resolution = 10) {
+  pix <- readRDS(file.path(dir_s35, "dry_niche_pixels.rds"))
+  centre <- sapply(pix[, ..predictors], mean)
+  spread <- sapply(pix[, ..predictors], sd)
+  focal <- as.data.table(read.csv(gzfile(file.path(dir_gbif, "focal_counts_10m.csv.gz")),
+                                  colClasses = c(pool_key = "character")))
+  rec <- readRDS(file.path(dir_s02, "species_records.rds"))
+  rec[, pool_key := as.character(pool_key)]
+  template <- rast(file.path(dir_s01, "climate_present_10m.tif"))[[1]]
+  rec[, cell := cellFromXY(template, cbind(decimalLongitude, decimalLatitude))]
+  pres <- unique(rec[!is.na(cell), .(pool_key, cell)])
+  if (resolution == 30) {
+    t30 <- aggregate(template, 3)
+    pix[, cell30 := cellFromXY(t30, cbind(lon, lat))]
+    lookup <- pix[, .(cell, cell30, area_shelf)]
+    pix <- pix[, c(lapply(.SD, mean), list(lon = mean(lon), lat = mean(lat), area = sum(area),
+                                           butterfly_records = sum(butterfly_records))),
+               by = .(cell = cell30, area_shelf), .SDcols = predictors]
+    pres <- unique(merge(pres, lookup, by = "cell")[, .(pool_key, cell = cell30, area_shelf)])
+    focal <- merge(focal, lookup[, .(cell, cell30)], by = "cell")[, .(records = sum(records)),
+                                                                     by = .(pool_key, cell = cell30)]
+  } else {
+    pres <- merge(pres, pix[, .(cell, area_shelf, area_present, area_region)], by = "cell")
+  }
+  for (v in predictors) set(pix, j = paste0(v, "_z"), value = (pix[[v]] - centre[[v]]) / spread[[v]])
+  pix[, block := paste(floor(lon / block_deg), floor(lat / block_deg))]
+  pix[, cv_block := paste(floor(lon / cv_block_deg), floor(lat / cv_block_deg))]
+  list(pix = pix, pres = pres, focal = focal)
+}
+
+# Infinitely weighted logistic regression (an inhomogeneous Poisson point process): presences of
+# weight 1 against the quadrature of all pixels of the area, weighted by the background and scaled to
+# bg_weight per presence. Cluster-robust (CR1) covariance over blocks; the reported SE is the larger
+# of the robust and model-based ones.
+fit_ipp <- function(xp, xb, wb, blocks_p, blocks_b) {
+  X <- cbind(1, rbind(xp, xb))
+  y <- c(rep(1, nrow(xp)), rep(0, nrow(xb)))
+  w <- c(rep(1, nrow(xp)), wb / sum(wb) * bg_weight * nrow(xp))
+  fit <- suppressWarnings(glm.fit(X, y, weights = w, family = binomial(), control = list(maxit = 100)))
+  p <- fit$fitted.values
+  bread <- tryCatch(solve(crossprod(X * sqrt(w * p * (1 - p)))), error = function(e) NULL)
+  if (is.null(bread)) return(NULL)
+  U <- X * (w * (y - p))
+  g <- c(blocks_p, blocks_b)
+  G <- uniqueN(g[y == 1])
+  meat <- crossprod(rowsum(U, g))
+  robust <- G / max(G - 1, 1) * bread %*% meat %*% bread
+  out <- data.table(term = colnames(xp), estimate = fit$coefficients[-1],
+                    se_naive = sqrt(diag(bread))[-1], se_robust = sqrt(diag(robust))[-1],
+                    converged = fit$converged, blocks = G)
+  out[, se := pmax(se_naive, se_robust)]
+  out
+}
+
+# Background weights of one species in one area
+background_weights <- function(b, background, focal_counts) {
+  n <- b$butterfly_records
+  if (!is.null(focal_counts) && nrow(focal_counts)) {
+    own <- focal_counts$records[match(b$cell, focal_counts$cell)]
+    n <- pmax(n - fifelse(is.na(own), 0, own), 0)
+  }
+  switch(background,
+         record = pmin(n, quantile(n[n > 0], cap_quantile)),
+         cell = as.numeric(n > 0),
+         uniform = b$area)
+}
+
+# Species estimates for every unit (species x area) of one area definition, background and model set
+fit_species <- function(dat, units, area_def, bgs, model_set) {
+  pix <- dat$pix
+  rbindlist(lapply(split(units, by = "area"), function(us) {
+    a <- us$area[1]
+    b <- pix[get(area_def) == a]
+    rbindlist(lapply(seq_len(nrow(us)), function(i) {
+      k <- us$pool_key[i]
+      cells <- dat$pres[pool_key == k & get(area_def) == a]$cell
+      pr <- b[match(cells, cell)]
+      pr <- pr[!is.na(cell)]
+      fc <- dat$focal[pool_key == k]
+      rbindlist(lapply(bgs, function(bg) {
+        wb <- background_weights(b, bg, fc)
+        keep <- wb > 0
+        rbindlist(lapply(model_set, function(m) {
+          vars <- paste0(models[[m]], "_z")
+          f <- fit_ipp(as.matrix(pr[, ..vars]), as.matrix(b[keep, ..vars]), wb[keep],
+                       pr$block, b$block[keep])
+          if (is.null(f)) return(NULL)
+          f[, term := sub("_z$", "", term)][term == focal_term[[m]]][
+            , `:=`(model = m, background = bg, pool_key = k, area = a, cells = nrow(pr))]
+        }))
+      }))
+    }))
+  }))
+}
+
+# Species-area units of the mixed genera with at least `threshold` occupied pixels, keeping only
+# genus-area combinations with both strategies
+eligible_units <- function(dat, sp, area_def, threshold) {
+  u <- dat$pres[pool_key %in% sp$pool_key, .(cells = .N), by = .(pool_key, area = get(area_def))]
+  u <- merge(u[cells >= threshold], sp[, .(pool_key, species, genus, subfamily, strategy = interaction_type,
+                                           evidence)], by = "pool_key")
+  both <- u[, .(both = uniqueN(strategy) == 2), by = .(genus, area)][both == TRUE]
+  merge(u, both[, .(genus, area)], by = c("genus", "area"))
+}
+
+# Comparison A: genus-level differences between mutualists and facultative species, pooled over genera
+compare_genera <- function(e, phylo = NULL) {
+  e <- copy(e)[is.finite(estimate) & is.finite(se)]
+  e[, unit := paste(genus, area, sep = " | ")]
+  e <- e[unit %in% e[, .(both = uniqueN(strategy) == 2), by = unit][both == TRUE]$unit]
+  if (uniqueN(e$genus) < 2) return(NULL)
+  e[, m := as.integer(strategy == "m")]
+  h <- tryCatch(rma.mv(estimate, se^2, mods = ~ m, random = list(~ 1 | unit, ~ 1 | species),
+                       data = e, method = "REML"), error = function(err) NULL)
+  tau2 <- if (is.null(h)) 0 else h$sigma2[2]
+  u <- e[, {
+    w <- 1 / (se^2 + tau2)
+    .(difference = sum((w * estimate)[m == 1]) / sum(w[m == 1]) - sum((w * estimate)[m == 0]) / sum(w[m == 0]),
+      se = sqrt(1 / sum(w[m == 1]) + 1 / sum(w[m == 0])), mutualists = sum(m), facultative = sum(1 - m))
+  }, by = .(genus, area)]
+  g <- u[, .(difference = sum(difference / se^2) / sum(1 / se^2), se = sqrt(1 / sum(1 / se^2)),
+             mutualists = sum(mutualists), facultative = sum(facultative),
+             areas = paste(sub(": .*$", "", area), collapse = "; ")), by = genus]
+  p <- rma(g$difference, sei = g$se, method = "REML")
+  hp <- NULL
+  if (!is.null(phylo)) {
+    e2 <- e[species %in% rownames(phylo)]
+    e2[, phylo_species := species]
+    hp <- tryCatch(rma.mv(estimate, se^2, mods = ~ m,
+                          random = list(~ 1 | unit, ~ 1 | species, ~ 1 | phylo_species),
+                          R = list(phylo_species = phylo[unique(e2$species), unique(e2$species)]),
+                          data = e2, method = "REML"), error = function(err) NULL)
+  }
+  list(units = u, genera = g,
+       summary = data.table(genera = nrow(g), positive = sum(g$difference > 0),
+                            sign_test_p = binom.test(sum(g$difference > 0), nrow(g))$p.value,
+                            pooled = p$b[1], pooled_se = p$se, pooled_low = p$ci.lb, pooled_high = p$ci.ub,
+                            pooled_p = p$pval, tau2_genera = p$tau2, species = nrow(e),
+                            hierarchical = if (is.null(h)) NA_real_ else h$b[2],
+                            hierarchical_se = if (is.null(h)) NA_real_ else h$se[2],
+                            hierarchical_p = if (is.null(h)) NA_real_ else h$pval[2],
+                            phylogenetic = if (is.null(hp)) NA_real_ else hp$b[2],
+                            phylogenetic_se = if (is.null(hp)) NA_real_ else hp$se[2],
+                            phylogenetic_p = if (is.null(hp)) NA_real_ else hp$pval[2],
+                            phylogenetic_species = if (is.null(hp)) NA_integer_ else hp$k))
+}
+
+# Cluster-robust (CR1) logistic regression with weights, clustered by `cluster`
+robust_logit <- function(X, y, w, cluster) {
+  fit <- suppressWarnings(glm.fit(X, y, weights = w, family = binomial()))
+  p <- fit$fitted.values
+  bread <- solve(crossprod(X * sqrt(w * p * (1 - p))))
+  G <- uniqueN(cluster)
+  V <- G / (G - 1) * bread %*% crossprod(rowsum(X * (w * (y - p)), cluster)) %*% bread
+  data.table(term = colnames(X), estimate = fit$coefficients, se = sqrt(diag(V)))
+}
+
+# Weighted AUC: probability that a presence scores above a background pixel (ties count half)
+weighted_auc <- function(sp, sb, wb) {
+  o <- order(sb)
+  sb <- sb[o]; wb <- wb[o] / sum(wb)
+  cw <- c(0, cumsum(wb))
+  below <- cw[findInterval(sp, sb, left.open = TRUE) + 1]
+  at <- cw[findInterval(sp, sb) + 1] - below
+  mean(below + at / 2)
+}
+
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom")
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Eligibility
+
+Every species of the mixed genera, with its occupied pixels in each accessible area (glacial-shelf landmasses); whether it is eligible at 10, 20 and 30 pixels; and whether its genus has both strategies eligible in that area. This screen uses only the classifications and the records, not the climate.
+
+*Inputs:* s35/focal_species.csv, dry_niche_pixels.rds; s02/species_records.rds; raw/butterflies_gbif_density/focal_counts_10m.csv.gz
+*Outputs:* eligibility.csv, eligible_units.csv
+
+```{r eligibility}
+sp <- fread(file.path(dir_s35, "focal_species.csv"), colClasses = c(pool_key = "character"))
+dat <- load_data(10)
+occ <- dat$pres[pool_key %in% sp$pool_key, .(cells = .N), by = .(pool_key, area = area_shelf)]
+occ <- merge(sp[, .(pool_key, species, genus, subfamily, strategy = interaction_type, evidence)], occ,
+             by = "pool_key", all.x = TRUE)
+occ[is.na(cells), `:=`(cells = 0L, area = "none")]
+for (t in c(10, 20, 30)) {
+  ok <- occ[cells >= t, .(both = uniqueN(strategy) == 2), by = .(genus, area)][both == TRUE]
+  set(occ, j = paste0("eligible_", t), value = occ$cells >= t)
+  set(occ, j = paste0("in_contrast_", t),
+      value = occ$cells >= t & paste(occ$genus, occ$area) %in% paste(ok$genus, ok$area))
+}
+write_table(occ, file.path(dir_data_intermediate, "eligibility.csv"))
+units <- rbindlist(lapply(names(area_defs), function(d) rbindlist(lapply(c(10, 20, 30), function(t)
+  eligible_units(dat, sp, d, t)[, `:=`(area_def = d, threshold = t)]))))
+write_table(units, file.path(dir_data_intermediate, "eligible_units.csv"))
+print(occ[, .(mutualists = sum(strategy == "m"), facultative = sum(strategy == "f"),
+              in_contrast_20 = sum(in_contrast_20), in_contrast_10 = sum(in_contrast_10)),
+          by = .(genus)][order(-in_contrast_20)])
+print(units[area_def == "area_shelf" & threshold == min_cells,
+            .(mutualists = sum(strategy == "m"), facultative = sum(strategy == "f")), by = .(genus, area)])
+```
+
+```{r clear_eligibility, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Pilot: three well-sampled genera
+
+*Arhopala*, *Hypochrysops* and *Ogyris*, the genera named in the proposal, with the primary model under the three backgrounds. The check is that the models converge, that the robust standard errors are of sensible size, and that the species coefficients agree in sign with the raw difference between a species' mean dry months and that of its background.
+
+*Inputs:* s35/ focal_species.csv, dry_niche_pixels.rds; s36/eligible_units.csv
+*Outputs:* pilot_estimates.csv
+
+```{r pilot}
+sp <- fread(file.path(dir_s35, "focal_species.csv"), colClasses = c(pool_key = "character"))
+units <- fread(file.path(dir_data_intermediate, "eligible_units.csv"), colClasses = c(pool_key = "character"))[
+  area_def == "area_shelf" & threshold == min_cells & genus %in% pilot_genera]
+dat <- load_data(10)
+est <- fit_species(dat, units, "area_shelf", names(backgrounds), "primary")
+# Raw check: mean dry months of the species' pixels minus the background-weighted mean of its area
+raw <- rbindlist(lapply(seq_len(nrow(units)), function(i) {
+  b <- dat$pix[area_shelf == units$area[i]]
+  cells <- dat$pres[pool_key == units$pool_key[i] & area_shelf == units$area[i]]$cell
+  wb <- background_weights(b, "record", dat$focal[pool_key == units$pool_key[i]])
+  data.table(pool_key = units$pool_key[i], area = units$area[i],
+             raw_difference = mean(b$dry_months[match(cells, b$cell)]) - weighted.mean(b$dry_months, wb))
+}))
+est <- merge(est, units[, .(pool_key, area, species, genus, strategy)], by = c("pool_key", "area"))
+est <- merge(est, raw, by = c("pool_key", "area"))
+write_table(est, file.path(dir_data_intermediate, "pilot_estimates.csv"))
+print(est[background == "record", .(species, strategy, area, cells, estimate, se_naive, se_robust, converged,
+                                     raw_difference)], digits = 2)
+cat("Converged:", mean(est$converged), "; sign agrees with the raw difference (record background):",
+    est[background == "record", mean(sign(estimate) == sign(raw_difference))], "\n")
+print(est[, .(mutualists = mean(estimate[strategy == "m"]), facultative = mean(estimate[strategy == "f"])),
+          by = .(genus, background)], digits = 2)
+```
+
+```{r clear_pilot, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Species estimates
+
+All eligible units (at the lowest threshold, 10 pixels; higher thresholds select from these), for: every model under the three backgrounds on the glacial-shelf areas at 10 arc-minutes; and the primary model on present-day landmasses, on the study's regions, and at 30 arc-minutes.
+
+*Inputs:* s35/ focal_species.csv, dry_niche_pixels.rds; s36/eligible_units.csv; s02/species_records.rds; raw/butterflies_gbif_density/focal_counts_10m.csv.gz
+*Outputs:* species_estimates.csv
+
+```{r species}
+units <- fread(file.path(dir_data_intermediate, "eligible_units.csv"), colClasses = c(pool_key = "character"))
+info <- unique(units[, .(pool_key, species, genus, subfamily, strategy, evidence)])
+dat <- load_data(10)
+est <- list()
+for (d in names(area_defs)) {
+  u <- units[area_def == d & threshold == min(min_cells_sensitivity)]
+  m <- if (d == "area_shelf") names(models) else "primary"
+  est[[d]] <- fit_species(dat, u, d, names(backgrounds), m)[, `:=`(area_def = d, resolution = 10)]
+}
+dat30 <- load_data(30)
+u <- units[area_def == "area_shelf" & threshold == min(min_cells_sensitivity)]
+est[["r30"]] <- fit_species(dat30, u, "area_shelf", names(backgrounds), "primary")[
+  , `:=`(area_def = "area_shelf", resolution = 30)]
+est <- merge(rbindlist(est), info, by = "pool_key")
+# Positive = drier (or warmer, for temperature)
+est[, `:=`(estimate = estimate * drier_sign[term], sign_applied = drier_sign[term])]
+write_table(est, file.path(dir_data_intermediate, "species_estimates.csv"))
+print(est[model == "primary" & area_def == "area_shelf" & resolution == 10,
+          .(units = .N, converged = mean(converged), median_se = median(se),
+            robust_larger = mean(se_robust > se_naive)), by = background])
+```
+
+```{r clear_species, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Response shapes
+
+For the primary background and areas, the shape of each species' relative intensity along dry months, from a penalised smooth of dry months and of temperature (four basis functions each); the partial effect of dry months, centred.
+
+*Inputs:* s35/dry_niche_pixels.rds; s36/eligible_units.csv
+*Outputs:* response_curves.csv
+
+```{r shapes}
+units <- fread(file.path(dir_data_intermediate, "eligible_units.csv"), colClasses = c(pool_key = "character"))[
+  area_def == "area_shelf" & threshold == min_cells]
+dat <- load_data(10)
+centre <- mean(dat$pix$dry_months); spread <- sd(dat$pix$dry_months)
+curves <- rbindlist(lapply(seq_len(nrow(units)), function(i) {
+  a <- units$area[i]; k <- units$pool_key[i]
+  b <- dat$pix[area_shelf == a]
+  pr <- b[match(dat$pres[pool_key == k & area_shelf == a]$cell, cell)]
+  wb <- background_weights(b, "record", dat$focal[pool_key == k])
+  keep <- wb > 0
+  d <- rbind(data.table(y = 1, w = 1, pr[, .(dry_months_z, bio01_z)]),
+             data.table(y = 0, w = wb[keep] / sum(wb[keep]) * bg_weight * nrow(pr), b[keep, .(dry_months_z, bio01_z)]))
+  fit <- tryCatch(gam(y ~ s(dry_months_z, k = 4) + s(bio01_z, k = 4), family = binomial(), weights = w,
+                      data = d, method = "REML"), error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+  range_dry <- range(b$dry_months[keep])
+  grid <- data.table(dry_months = seq(range_dry[1], range_dry[2], by = 0.5))
+  grid[, `:=`(dry_months_z = (dry_months - centre) / spread, bio01_z = 0)]
+  pr_t <- predict(fit, grid, type = "terms", se.fit = TRUE)
+  grid[, `:=`(effect = pr_t$fit[, "s(dry_months_z)"], se = pr_t$se.fit[, "s(dry_months_z)"],
+              pool_key = k, area = a, edf = sum(fit$edf[grepl("dry_months", names(fit$edf))]))]
+  grid[, .(pool_key, area, dry_months, effect, se, edf)]
+}))
+curves <- merge(curves, units[, .(pool_key, area, species, genus, strategy)], by = c("pool_key", "area"))
+write_table(curves, file.path(dir_data_intermediate, "response_curves.csv"))
+print(curves[, .(edf = edf[1]), by = .(species, strategy)][, .(median_edf = median(edf)), by = strategy])
+```
+
+```{r clear_shapes, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Comparisons between mutualists and facultative congeners
+
+Comparison A for every setting; the phylogenetic version for the primary settings; leave-one-genus-out; and comparison B.
+
+*Inputs:* s36/ species_estimates.csv, eligible_units.csv; s35/dry_niche_pixels.rds; s02/species_records.rds; raw/butterfly_ant_interactions/grafted_trees.rds
+*Outputs:* comparison_summary.csv, comparison_genera.csv, comparison_units.csv, direct_comparison.csv
+
+```{r compare}
+est <- fread(file.path(dir_data_intermediate, "species_estimates.csv"), colClasses = c(pool_key = "character"))
+units <- fread(file.path(dir_data_intermediate, "eligible_units.csv"), colClasses = c(pool_key = "character"))
+tree <- readRDS(file.path(dir_data_raw, "butterfly_ant_interactions", "grafted_trees.rds"))$yumnam_2025
+on_tree <- intersect(tree$tip.label, unique(est$species))
+phylo <- vcv(keep.tip(tree, on_tree), corr = TRUE)
+
+# Species whose records overlap (share a 1-degree cell with) a congener of the other strategy
+dat <- load_data(10)
+pr <- merge(dat$pres, dat$pix[, .(cell, lon, lat)], by = "cell")
+pr[, deg := paste(floor(lon), floor(lat))]
+pr <- merge(pr, unique(est[, .(pool_key, genus, strategy)]), by = "pool_key")
+ov <- unique(pr[, .(pool_key, genus, strategy, area = area_shelf, deg)])
+ov <- merge(ov, ov[, .(other = strategy, deg, genus, area, k2 = pool_key)], by = c("genus", "area", "deg"),
+            allow.cartesian = TRUE)[strategy != other, .(pool_key, area)]
+overlapping <- unique(ov)
+
+# (arguments are named unlike any column, so that the data.table filter reads them correctly)
+base <- function(bg_, model_ = "primary", d_ = "area_shelf", r_ = 10, t_ = min_cells)
+  est[background == bg_ & model == model_ & area_def == d_ & resolution == r_ & cells >= t_]
+settings <- list()
+for (bg in names(backgrounds)) {
+  for (m in names(models)) settings[[length(settings) + 1]] <- list(group = "Measure", label = model_names[[m]],
+                                                                   background = bg, model = m, e = base(bg, m))
+  for (th in min_cells_sensitivity) settings[[length(settings) + 1]] <- list(
+    group = "Threshold", label = paste("At least", th, "pixels"), background = bg, model = "primary",
+    e = base(bg, t_ = th))
+  for (d in setdiff(names(area_defs), "area_shelf")) settings[[length(settings) + 1]] <- list(
+    group = "Accessible area", label = area_defs[[d]], background = bg, model = "primary", e = base(bg, d_ = d))
+  settings[[length(settings) + 1]] <- list(group = "Resolution", label = "30 arc-minutes", background = bg,
+                                           model = "primary", e = base(bg, r_ = 30))
+  settings[[length(settings) + 1]] <- list(group = "Species", label = "Species-specific evidence only",
+                                           background = bg, model = "primary",
+                                           e = base(bg)[evidence %in% specific_evidence])
+  e_ov <- merge(base(bg), overlapping, by = c("pool_key", "area"))
+  settings[[length(settings) + 1]] <- list(group = "Species", label = "Overlapping a congener of the other strategy",
+                                           background = bg, model = "primary", e = e_ov)
+  for (g in unique(base(bg)$genus)) settings[[length(settings) + 1]] <- list(
+    group = "Leave one genus out", label = paste("Without", g), background = bg, model = "primary",
+    e = base(bg)[genus != g])
+}
+res <- lapply(settings, function(s) {
+  out <- compare_genera(s$e, if (s$group == "Measure" && s$model == "primary") phylo else NULL)
+  if (is.null(out)) return(NULL)
+  tag <- data.table(group = s$group, setting = s$label, background = s$background, model = s$model)
+  list(summary = cbind(tag, out$summary), genera = cbind(tag, out$genera), units = cbind(tag, out$units))
+})
+res <- res[!vapply(res, is.null, logical(1))]
+summary_tab <- rbindlist(lapply(res, `[[`, "summary"))
+write_table(summary_tab, file.path(dir_data_intermediate, "comparison_summary.csv"))
+write_table(rbindlist(lapply(res, `[[`, "genera")), file.path(dir_data_intermediate, "comparison_genera.csv"))
+write_table(rbindlist(lapply(res, `[[`, "units")), file.path(dir_data_intermediate, "comparison_units.csv"))
+print(summary_tab[group == "Measure", .(setting, background, genera, positive, pooled, pooled_low, pooled_high,
+                                         pooled_p, hierarchical, hierarchical_p, phylogenetic_p)], digits = 2)
+
+# --- Comparison B: which strategy an occupied pixel belongs to, without a background ---
+u <- units[area_def == "area_shelf" & threshold == min_cells]
+p <- merge(dat$pres[, .(pool_key, cell, area = area_shelf)], u[, .(pool_key, area, genus, strategy)],
+           by = c("pool_key", "area"))
+p <- merge(p, dat$pix[, .(cell, dry_months_z, bio01_z, dry50_z, cwd_z)], by = "cell")
+p[, `:=`(y = as.integer(strategy == "m"), unit = paste(genus, area, sep = " | "))]
+p[, w := 1 / .N, by = .(pool_key, area)]
+direct <- function(d, var = "dry_months_z") {
+  X <- model.matrix(as.formula(paste("~", var, "+ bio01_z + factor(unit)")), d)
+  robust_logit(X, d$y, d$w, d$pool_key)[term == var][, `:=`(genera = uniqueN(d$genus), species = uniqueN(d$pool_key))]
+}
+db <- rbind(direct(p)[, setting := "All genera"],
+            direct(p, "dry50_z")[, setting := "All genera: months below 50 mm"],
+            direct(p, "cwd_z")[, setting := "All genera: climatic water deficit"],
+            rbindlist(lapply(unique(p$genus), function(g)
+              tryCatch(direct(p[genus != g])[, setting := paste("Without", g)], error = function(e) NULL))))
+by_unit <- p[, {
+  X <- cbind(1, dry_months_z, bio01_z)
+  f <- suppressWarnings(glm.fit(X, y, weights = w, family = binomial()))
+  .(estimate = f$coefficients[2], mutualists = uniqueN(pool_key[y == 1]), facultative = uniqueN(pool_key[y == 0]))
+}, by = .(genus, area)]
+db[, p_value := 2 * pnorm(-abs(estimate / se))]
+write_table(db, file.path(dir_data_intermediate, "direct_comparison.csv"))
+write_table(by_unit, file.path(dir_data_intermediate, "direct_units.csv"))
+print(db, digits = 2)
+print(by_unit, digits = 2)
+```
+
+```{r clear_compare, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Spatially blocked cross-validation
+
+For each eligible unit under the primary background: five folds of 5° blocks; models with temperature alone and with dry months and temperature fitted to the training blocks and evaluated on the held-out blocks (weighted AUC of presences against the background). The gain in AUC shows whether dry months help predict where a species occurs in blocks the model has not seen.
+
+*Inputs:* s35/dry_niche_pixels.rds; s36/eligible_units.csv
+*Outputs:* blocked_cv.csv
+
+```{r blocked_cv}
+units <- fread(file.path(dir_data_intermediate, "eligible_units.csv"), colClasses = c(pool_key = "character"))[
+  area_def == "area_shelf" & threshold == min_cells]
+dat <- load_data(10)
+set.seed(36)
+cv <- rbindlist(lapply(seq_len(nrow(units)), function(i) {
+  a <- units$area[i]; k <- units$pool_key[i]
+  b <- dat$pix[area_shelf == a]
+  wb <- background_weights(b, "record", dat$focal[pool_key == k])
+  b <- b[wb > 0]
+  set(b, j = "wb", value = wb[wb > 0])
+  pr <- dat$pix[area_shelf == a][match(dat$pres[pool_key == k & area_shelf == a]$cell, cell)]
+  blocks <- unique(c(pr$cv_block, b$cv_block))
+  fold <- setNames(sample(rep(seq_len(cv_folds), length.out = length(blocks))), blocks)
+  out <- rbindlist(lapply(seq_len(cv_folds), function(f) {
+    tr_p <- pr[fold[cv_block] != f]; te_p <- pr[fold[cv_block] == f]
+    tr_b <- b[fold[cv_block] != f]; te_b <- b[fold[cv_block] == f]
+    if (nrow(te_p) < 2 || nrow(tr_p) < 5 || !nrow(te_b)) return(NULL)
+    rbindlist(lapply(c("temperature", "primary"), function(m) {
+      vars <- paste0(models[[m]], "_z")
+      fit <- fit_ipp(as.matrix(tr_p[, ..vars]), as.matrix(tr_b[, ..vars]), tr_b$wb, tr_p$block, tr_b$block)
+      if (is.null(fit)) return(NULL)
+      beta <- fit$estimate
+      data.table(fold = f, model = m, presences = nrow(te_p),
+                 auc = weighted_auc(as.vector(as.matrix(te_p[, ..vars]) %*% beta),
+                                    as.vector(as.matrix(te_b[, ..vars]) %*% beta), te_b$wb))
+    }))
+  }))
+  if (!nrow(out)) return(NULL)
+  out[, `:=`(pool_key = k, area = a)]
+}))
+cv <- merge(cv, units[, .(pool_key, area, species, genus, strategy)], by = c("pool_key", "area"))
+cvs <- cv[, .(auc = weighted.mean(auc, presences)), by = .(pool_key, area, species, genus, strategy, model)]
+cvs <- dcast(cvs, pool_key + area + species + genus + strategy ~ model, value.var = "auc")
+cvs[, gain := primary - temperature]
+write_table(cvs, file.path(dir_data_intermediate, "blocked_cv.csv"))
+print(cvs[, .(species = .N, auc_temperature = median(temperature, na.rm = TRUE),
+              auc_dry_temperature = median(primary, na.rm = TRUE), median_gain = median(gain, na.rm = TRUE),
+              improved = mean(gain > 0, na.rm = TRUE)), by = strategy], digits = 3)
+```
+
+```{r clear_blocked_cv, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Outcome
+
+The outcome under the rules set out in the introduction.
+
+*Inputs:* s36/ comparison_summary.csv, comparison_genera.csv
+*Outputs:* outcome.csv
+
+```{r outcome}
+s <- fread(file.path(dir_data_intermediate, "comparison_summary.csv"))
+g <- fread(file.path(dir_data_intermediate, "comparison_genera.csv"))
+prim <- s[group == "Measure" & model == "primary"]
+rec <- prim[background == "record"]
+logo <- s[group == "Leave one genus out" & background == "record"]
+gp <- g[group == "Measure" & model == "primary" & background == "record"]
+strong <- rec$pooled_low > 0 && all(prim$pooled > 0) && rec$positive >= 2 / 3 * rec$genera && all(logo$pooled > 0)
+lineage <- any(gp$difference - 1.96 * gp$se > 0)
+outcome <- data.table(
+  outcome = if (strong) "Strong support" else if (lineage) "Lineage-specific support" else "No convincing support",
+  pooled_record = rec$pooled, pooled_record_low = rec$pooled_low, pooled_record_high = rec$pooled_high,
+  pooled_cell = prim[background == "cell"]$pooled, pooled_uniform = prim[background == "uniform"]$pooled,
+  genera = rec$genera, positive = rec$positive, logo_min = min(logo$pooled), logo_min_without = logo[which.min(pooled)]$setting,
+  genera_interval_above_zero = paste(gp[difference - 1.96 * se > 0]$genus, collapse = ", "))
+write_table(outcome, file.path(dir_data_intermediate, "outcome.csv"))
+print(t(outcome))
+```
+
+```{r clear_outcome, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figures
+
+## One estimate per genus
+
+The decisive figure: for each genus, the difference between its obligate mutualists and facultative species in their association with dry months (given temperature; log relative intensity per SD), under the three backgrounds, with 95% intervals, and the random-effects estimate over genera.
+
+*Inputs:* s36/ comparison_genera.csv, comparison_summary.csv
+*Outputs:* plot_dry_niche_genera.png
+
+```{r plot_dry_niche_genera}
+g <- fread(file.path(dir_data_intermediate, "comparison_genera.csv"))[group == "Measure" & model == "primary"]
+s <- fread(file.path(dir_data_intermediate, "comparison_summary.csv"))[group == "Measure" & model == "primary"]
+ord <- g[background == "record"][order(difference)]$genus
+d <- rbind(g[, .(row = genus, background, difference, low = difference - 1.96 * se, high = difference + 1.96 * se,
+                 label = paste0(mutualists, " m / ", facultative, " f; ", areas), pooled = FALSE)],
+           s[, .(row = "All genera", background, difference = pooled, low = pooled_low, high = pooled_high,
+                 label = paste0(positive, " of ", genera, " genera positive"), pooled = TRUE)])
+d[, row := factor(row, c("All genera", ord))]
+d[, background := factor(backgrounds[background], backgrounds)]
+lab <- d[background == backgrounds[["record"]]]
+fig <- ggplot(d, aes(difference, row, colour = background)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = low, xmax = high), width = 0, linewidth = 0.5, orientation = "y",
+                position = position_dodge(width = 0.6)) +
+  geom_point(aes(shape = pooled), size = 2.2, position = position_dodge(width = 0.6)) +
+  geom_text(data = lab, aes(x = max(d$high) + 0.1, label = label), colour = "grey30", size = 2.4, hjust = 0,
+            show.legend = FALSE) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 18), guide = "none") +
+  scale_colour_manual(values = setNames(background_colours, backgrounds), name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.6))) +
+  labs(x = "Mutualists minus facultative congeners: association with dry months (log relative intensity per SD)",
+       y = NULL, title = "Dry-season occupancy of obligate mutualists relative to facultative congeners") +
+  theme_figure()
+save_figure(fig, "plot_dry_niche_genera", 8, 0.45 * uniqueN(d$row) + 1.6)
+fig
+```
+
+```{r clear_plot_dry_niche_genera, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+## Robustness
+
+The pooled estimate over genera under every setting, with the number of genera with a positive difference.
+
+*Inputs:* s36/comparison_summary.csv, direct_comparison.csv
+*Outputs:* plot_dry_niche_robustness.png
+
+```{r plot_dry_niche_robustness}
+s <- fread(file.path(dir_data_intermediate, "comparison_summary.csv"))
+s[, setting := fifelse(group == "Measure" & model == "primary", "Primary: dry months, given temperature", setting)]
+lev <- unique(s$setting)
+s[, `:=`(setting = factor(setting, rev(lev)), background = factor(backgrounds[background], backgrounds),
+         group = factor(group, unique(group)))]
+fig <- ggplot(s, aes(pooled, setting, colour = background)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = pooled_low, xmax = pooled_high), width = 0, linewidth = 0.45, orientation = "y",
+                position = position_dodge(width = 0.7)) +
+  geom_point(size = 1.6, position = position_dodge(width = 0.7)) +
+  geom_text(aes(x = max(pooled_high) + 0.1, label = paste0(positive, "/", genera)), size = 2.1, hjust = 0,
+            position = position_dodge(width = 0.7), show.legend = FALSE) +
+  facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+  scale_colour_manual(values = setNames(background_colours, backgrounds), name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  labs(x = "Pooled difference over genera, mutualists minus facultative (log relative intensity per SD; drier positive)",
+       y = NULL, title = "Robustness of the dry-season contrast") +
+  theme_figure() + theme(strip.text.y = element_text(angle = 0))
+save_figure(fig, "plot_dry_niche_robustness", 9, 0.16 * nrow(s) + 2)
+fig
+```
+
+```{r clear_plot_dry_niche_robustness, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+## Species and response shapes
+
+(a) Each species' association with dry months given temperature (primary background), by genus and area. (b) The shape of relative intensity along dry months (penalised smooths, centred), by genus.
+
+*Inputs:* s36/ species_estimates.csv, response_curves.csv
+*Outputs:* plot_dry_niche_species.png
+
+```{r plot_dry_niche_species}
+e <- fread(file.path(dir_data_intermediate, "species_estimates.csv"), colClasses = c(pool_key = "character"))[
+  background == "record" & model == "primary" & area_def == "area_shelf" & resolution == 10 & cells >= min_cells]
+# Only the units that enter a contrast
+units <- fread(file.path(dir_data_intermediate, "eligible_units.csv"), colClasses = c(pool_key = "character"))[
+  area_def == "area_shelf" & threshold == min_cells]
+e <- e[paste(pool_key, area) %in% paste(units$pool_key, units$area)]
+e[, unit := paste0(genus, " (", sub(": .*$", "", area), ")")]
+e[, strategy := factor(c(f = "Facultative", m = "Obligate mutualist")[strategy], c("Facultative", "Obligate mutualist"))]
+fig_a <- ggplot(e, aes(estimate, reorder(species, estimate), colour = strategy)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), width = 0, linewidth = 0.4,
+                orientation = "y") +
+  geom_point(size = 1.4) +
+  facet_grid(unit ~ ., scales = "free_y", space = "free_y") +
+  scale_colour_manual(values = c(Facultative = "#56B4E9", `Obligate mutualist` = "#D55E00"), name = NULL) +
+  labs(x = "Association with dry months, given temperature (log relative intensity per SD)", y = NULL,
+       title = "(a) Species") +
+  theme_figure(8) + theme(strip.text.y = element_text(angle = 0), axis.text.y = element_text(size = 5.5))
+cu <- fread(file.path(dir_data_intermediate, "response_curves.csv"))
+cu[, strategy := factor(c(f = "Facultative", m = "Obligate mutualist")[strategy], c("Facultative", "Obligate mutualist"))]
+fig_b <- ggplot(cu, aes(dry_months, effect, group = paste(pool_key, area), colour = strategy)) +
+  geom_line(linewidth = 0.45) +
+  facet_wrap(~ genus, scales = "free_y") +
+  scale_colour_manual(values = c(Facultative = "#56B4E9", `Obligate mutualist` = "#D55E00"), name = NULL) +
+  labs(x = "Dry months", y = "Relative intensity (log, centred)", title = "(b) Response shapes") +
+  theme_figure(8)
+fig <- patchwork::wrap_plots(fig_a, fig_b, ncol = 2, widths = c(1, 1.1))
+save_figure(fig, "plot_dry_niche_species", 11, max(6, 0.11 * nrow(e) + 2))
+fig
+```
+
+```{r clear_plot_dry_niche_species, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

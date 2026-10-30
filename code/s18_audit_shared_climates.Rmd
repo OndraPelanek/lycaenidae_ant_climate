@@ -19,7 +19,7 @@ knitr::opts_chunk$set(echo = TRUE, error = FALSE)
 
 `s13_compare_matched_climates` compared Mediterranean-climate regions within the climate strata that both occupy, pooling the species of all shared strata. An external review (29 October 2026) pointed out that restricting two regions to common climatic support does not balance them: one region's species may sit mostly in the warmest shared strata and the other's in the coolest. This notebook audits the comparison:
 
-1. **Standardised contrasts.** The share of each strategy is estimated within each shared stratum for each region, and averaged over a common set of stratum weights: equal weights, or the mean of the two regions' area distributions over the shared strata. A species recorded in several strata counts in each, so uncertainty comes from resampling genera across all strata at once (genus bootstrap), which keeps such species and their congeners together. A second version assigns each species to the single shared stratum holding most of its records.
+1. **Standardised contrasts.** The share of each strategy is estimated within each shared stratum for each region, and averaged over a common set of stratum weights: equal weights, or the mean of the two regions' area distributions over the shared strata. A species recorded in several strata counts in each, so uncertainty comes from resampling genera across all strata at once (genus bootstrap), which keeps such species and their congeners together. Because a species counts in every stratum it was recorded in, the estimate describes the composition of the species assemblage of each stratum, in which widespread species weigh more than narrowly distributed ones. A second version therefore assigns each species to the single shared stratum holding most of its record cells (ties broken at random) and applies the minimum of three classified species per region and stratum after this assignment.
 2. **Balance.** The climates of the two regions before matching and after it (shared strata, common weights), as standardised mean differences, and the share of each region's Mediterranean-climate area and classified species retained.
 3. **Sensitivity** to the width of the strata and to the minimum number of pixels for a region to occupy a stratum.
 4. **The four strategies.** Obligacy combines mutualists and parasites; the standardised shares of all four strategies are compared.
@@ -129,6 +129,8 @@ standardised <- function(sp, w, pr, gw = NULL, weight = "w_area") {
   d <- sp[region %in% pr & s %in% w$s]
   d[, g := if (is.null(gw)) 1 else gw[genus]]
   d[is.na(g), g := 0]
+  # Species weights (genus-weighted version), if given
+  if ("sw" %in% names(d)) d[, g := g * sw]
   cnt <- d[, .(n = sum(g * (type == "n")), f = sum(g * (type == "f")), m = sum(g * (type == "m")),
                p = sum(g * (type == "p")), tot = sum(g)), by = .(region, s)]
   keep <- cnt[tot > 0, .N, by = s][N == 2]$s
@@ -170,7 +172,7 @@ setup_objects <- c(ls(), "setup_objects")
 
 # Standardised contrasts
 
-For each pair and the main grain (strata of s13, at least `r main_min_pixels` pixels), the standardised share of each strategy with area weights and with equal weights, the genus-bootstrap intervals of the shares and of the difference in obligacy, and the same with each species assigned to its main stratum.
+For each pair and the main grain (strata of s13, at least `r main_min_pixels` pixels), the standardised share of each strategy with area weights and with equal weights, the genus-bootstrap intervals of the shares and of the difference in obligacy, and the same with each species assigned to its main stratum. A third version weights genera rather than species: within each region and stratum, the species of a genus share a weight of one. Within the shared climates, the contrast then asks whether the regions' genera differ in obligacy; the difference from the species-weighted contrast is the part due to obligate genera being richer in species.
 
 *Inputs:* s13/ pixel_strata.rds, record_pixels.rds, taxa.csv
 *Outputs:* standardised_contrasts.csv, standardised_shares.csv
@@ -182,11 +184,13 @@ taxa <- fread(file.path(dir_s13, "taxa.csv"), colClasses = c(pool_key = "charact
 rec[, pool_key := as.character(pool_key)]
 tabs <- pair_tables(pix, rec, taxa, main_factor, main_min_pixels)
 
-# Each species assigned to the shared stratum holding most of its records within the region
+# Each species assigned to the shared stratum holding most of its record cells within the region
+# (ties broken at random)
 main_stratum <- function(sp_tab, w) {
   recs <- merge(rec[cell %in% tabs$cs$cell],
                 tabs$cs[s %in% w$s, .(cell, region = as.character(med_region), s)], by = "cell")
-  modal <- recs[, .N, by = .(pool_key, region, s)][order(-N)][, .SD[1], by = .(pool_key, region)]
+  modal <- recs[, .N, by = .(pool_key, region, s)][, tie := runif(.N)][order(-N, tie)][
+    , .SD[1], by = .(pool_key, region)]
   merge(sp_tab, modal[, .(pool_key, region, s)], by = c("pool_key", "region", "s"))
 }
 
@@ -195,9 +199,19 @@ shares <- list()
 contrasts <- list()
 for (pr in pairs) {
   key <- paste(pr, collapse = " vs ")
-  w <- shared_strata(tabs, pr)
-  for (version in c("all strata of each species", "main stratum of each species")) {
-    sp <- if (version == "main stratum of each species") main_stratum(tabs$sp, w) else tabs$sp
+  w_all <- shared_strata(tabs, pr)
+  for (version in c("all strata of each species", "main stratum of each species",
+                    "genus-weighted")) {
+    sp <- if (version == "main stratum of each species") main_stratum(tabs$sp, w_all) else tabs$sp
+    # Each genus counts once in each region and stratum: its species share a weight of one
+    if (version == "genus-weighted") {
+      sp <- copy(sp)[, sw := 1 / .N, by = .(region, s, genus)]
+    }
+    # The minimum of classified species per region and stratum applies after the assignment
+    n_s <- sp[region %in% pr, .(n = uniqueN(pool_key)), by = .(region, s)]
+    s_ok <- n_s[n >= min_species_stratum, .N, by = s][N == 2]$s
+    w <- w_all[s %in% s_ok]
+    if (nrow(w) == 0) next
     for (weight in c("w_area", "w_equal")) {
       obs <- standardised(sp, w, pr, weight = weight)
       bt <- boot_standardised(sp, w, pr, weight = weight)

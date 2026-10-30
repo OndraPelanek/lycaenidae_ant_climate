@@ -1,0 +1,303 @@
+---
+title: "Lycaenidae ant-interaction climate 33 - how robust is the confinement of obligate genera?"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+`s23` found that obligate genera (at least half of their classified species obligate) occupy about 2.6 times fewer hexagons than other genera of the same stem age and number of recorded species. A fifth external review (29 October 2026) asked whether this survives other definitions of an obligate genus, incomplete classification, other spatial grains, sampling effort and comparisons within clades, and whether it holds in independent evolutionary contrasts. This notebook refits the `s23` model (log hexagons on obligacy, log stem age and log recorded species) under each variant:
+
+1. **Definitions.** Any obligate species; at least half (as in `s23`); at least three quarters; all classified species obligate; and the obligate share as a continuous predictor, also redrawn 200 times from a Beta distribution given the classified species, so that sparsely classified genera carry their uncertainty (estimates combined by Rubin's rules).
+2. **Completeness.** Only genera with at least half, or three quarters, of their species classified.
+3. **Grains.** Hexagons of about 70,000, 210,000 and 630,000 km² (`s05`).
+4. **Sampling.** With the log number of occurrence records of the genus as a covariate (with log recorded species in the model, this is equivalent to log records per species).
+5. **Clades.** With subfamily as a fixed effect; with the spread of the rest of the genus's subfamily (mean log hexagons of the other genera of the subfamily) as a covariate; and within each subfamily holding at least five obligate genera.
+6. **Sister-clade contrasts.** On the tree of genera (`s10`), each obligate genus compared with the non-obligate genera of its sister clade, which share its stem age: the difference in log hexagons after removing the expected effect of the number of recorded species (residuals of log hexagons on log recorded species and log stem age among all genera). Each sister clade is used once.
+
+These test whether the association is robust, not its cause: obligacy could limit spread, restricted lineages could become obligate more often, or both could follow from a shared history.
+
+A full run takes under a minute.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(ape)
+library(phytools)
+library(ggplot2)
+```
+
+## Variables
+
+```{r setup_variables}
+min_stem_age <- 0.5
+min_species <- 2
+n_draws <- 200
+grains <- c(hex6 = "≈70,000 km²", hex5 = "≈210,000 km²", hex4 = "≈630,000 km²")
+min_obligate_genera_subfamily <- 5
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_s10 <- path_resrepo("data/intermediate/s10_test_diversification")
+dir_data_intermediate <- path_resrepo("data/intermediate/s33_test_confinement")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Effect of an obligacy predictor on log hexagons (with log stem age and log recorded species and
+# any extra terms)
+fit_one <- function(d, predictor, extra = NULL, label, group) {
+  f <- as.formula(paste("log(hexagons) ~", predictor, "+ log_age + log_species",
+                        if (length(extra)) paste("+", paste(extra, collapse = " + ")) else ""))
+  m <- lm(f, data = d)
+  cf <- summary(m)$coefficients[predictor, ]
+  data.table(group = group, variant = label, genera = nrow(d),
+             obligate_genera = if (predictor == "obligate") sum(d$obligate) else NA_integer_,
+             estimate = cf[[1]], se = cf[[2]], p = cf[[4]])
+}
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom")
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Genus table
+
+Genera with a stem age (at least `r min_stem_age` Myr) and at least `r min_species` recorded species, as in `s23`, with their hexagons at three grains and their occurrence records.
+
+*Inputs:* s10/genus_table.csv; s05/ species_regions.csv, presence_hex4.csv, presence_hex5.csv, presence_hex6.csv; s02/species_records.rds
+*Outputs:* confinement_genera.csv
+
+```{r genera}
+genera <- fread(file.path(dir_s10, "genus_table.csv"), na.strings = c("", "NA"))
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+rec <- readRDS(file.path(dir_s02, "species_records.rds"))
+rec[, pool_key := as.character(pool_key)]
+recorded <- sp[, .(recorded = .N), by = genus]
+records <- merge(rec[, .N, by = pool_key], sp[, .(pool_key, genus)], by = "pool_key")[
+  , .(records = sum(N)), by = genus]
+hex <- Reduce(function(a, b) merge(a, b, by = "genus", all = TRUE), lapply(names(grains), function(g) {
+  pres <- fread(file.path(dir_s05, paste0("presence_", g, ".csv")), colClasses = c(pool_key = "character"))
+  out <- merge(pres, sp[, .(pool_key, genus)], by = "pool_key")[, .(n = uniqueN(cell_id)), by = genus]
+  setnames(out, "n", g)
+}))
+d <- merge(genera[!is.na(strategy) & !is.na(region) & classified > 0], recorded, by = "genus")
+d <- merge(merge(d, records, by = "genus"), hex, by = "genus")
+d <- d[is.finite(stem_age) & stem_age >= min_stem_age & recorded >= min_species & is.finite(hex5)]
+d[, `:=`(hexagons = hex5, log_age = log(stem_age), log_species = log(recorded),
+         share_obligate = obligate / classified, completeness = classified / richness,
+         log_records = log(records), log_records_per_species = log(records / recorded),
+         region = factor(region), subfamily = factor(subfamily))]
+d[, obligate_half := as.integer(share_obligate >= 0.5)]
+d[, `:=`(obligate_any = as.integer(share_obligate > 0), obligate_three_quarters = as.integer(share_obligate >= 0.75),
+         obligate_all = as.integer(share_obligate == 1), obligate = as.integer(share_obligate >= 0.5))]
+# Spread of the rest of the subfamily: mean log hexagons of its other genera
+d[, subfamily_spread := (sum(log(hexagons)) - log(hexagons)) / (.N - 1), by = subfamily]
+write_table(d, file.path(dir_data_intermediate, "confinement_genera.csv"))
+print(d[, .(genera = .N, any = sum(obligate_any), half = sum(obligate_half),
+            three_quarters = sum(obligate_three_quarters), all = sum(obligate_all),
+            median_completeness = median(completeness))])
+```
+
+```{r clear_genera, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Robustness of the association
+
+*Inputs:* s33/confinement_genera.csv
+*Outputs:* confinement_robustness.csv
+
+```{r robustness}
+d <- fread(file.path(dir_data_intermediate, "confinement_genera.csv"))
+d[, `:=`(region = factor(region), subfamily = factor(subfamily))]
+res <- list()
+add <- function(x) res[[length(res) + 1]] <<- x
+
+# --- Definitions ---
+add(fit_one(d, "obligate", label = "At least half obligate (as in s23)", group = "Definition"))
+definitions <- c(obligate_any = "Any obligate species",
+                 obligate_three_quarters = "At least three quarters obligate",
+                 obligate_all = "All classified species obligate")
+for (col in names(definitions)) {
+  dd <- copy(d)
+  dd[, obligate := dd[[col]]]
+  add(fit_one(dd, "obligate", label = definitions[[col]], group = "Definition"))
+}
+add(fit_one(d, "share_obligate", label = "Obligate share (continuous)", group = "Definition"))
+# Each genus's share redrawn from Beta(obligate + 0.5, other classified + 0.5); the estimates of
+# the draws combined by Rubin's rules (within-draw sampling variance plus between-draw variance)
+set.seed(20261030)
+draws <- rbindlist(lapply(seq_len(n_draws), function(i) {
+  dd <- copy(d)[, share_draw := rbeta(.N, obligate + 0.5, classified - obligate + 0.5)]
+  cf <- summary(lm(log(hexagons) ~ share_draw + log_age + log_species, data = dd))$coefficients
+  data.table(est = cf["share_draw", 1], se = cf["share_draw", 2])
+}))
+total_var <- mean(draws$se^2) + (1 + 1 / n_draws) * var(draws$est)
+add(data.table(group = "Definition", variant = "Obligate share, redrawn for incomplete classification",
+               genera = nrow(d), obligate_genera = NA_integer_, estimate = mean(draws$est),
+               se = sqrt(total_var), p = 2 * pnorm(-abs(mean(draws$est)) / sqrt(total_var))))
+
+# --- Completeness ---
+for (th in c(0.5, 0.75)) add(fit_one(d[completeness >= th], "obligate",
+                                     label = paste0("Genera at least ", 100 * th, "% classified"),
+                                     group = "Completeness"))
+
+# --- Grains ---
+for (g in c("hex6", "hex4")) {
+  dd <- copy(d)[, hexagons := get(g)]
+  add(fit_one(dd, "obligate", label = paste("Hexagons of", grains[[g]]), group = "Grain"))
+}
+
+# --- Sampling ---
+# (With log recorded species in the model, log records and log records per species are equivalent)
+add(fit_one(d, "obligate", "log_records", label = "With log occurrence records of the genus",
+            group = "Sampling"))
+
+# --- Clades ---
+add(fit_one(d, "obligate", "region", label = "With main region (as in s23)", group = "Clade and region"))
+add(fit_one(d, "obligate", "subfamily", label = "With subfamily", group = "Clade and region"))
+add(fit_one(d, "obligate", "subfamily_spread", label = "With the spread of the rest of the subfamily",
+            group = "Clade and region"))
+for (sf in d[, .(n = sum(obligate)), by = subfamily][n >= min_obligate_genera_subfamily]$subfamily) {
+  add(fit_one(d[subfamily == sf], "obligate", label = paste("Within", sf), group = "Clade and region"))
+}
+res <- rbindlist(res)
+res[, ratio := exp(-estimate)]
+write_table(res, file.path(dir_data_intermediate, "confinement_robustness.csv"))
+print(res, digits = 3)
+```
+
+```{r clear_robustness, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Sister-clade contrasts
+
+For every obligate genus on the tree of genera, the non-obligate genera of its sister clade (the other descendants of its parent node). Residual log hexagons (after log recorded species and log stem age, fitted to all genera) of the obligate genus minus the mean of those genera. Where two obligate genera share a sister clade (they are each other's closest relatives), the pair is skipped; each sister clade is used once (the first obligate genus found keeps it).
+
+*Inputs:* s33/confinement_genera.csv; s10/genus_tree.rds
+*Outputs:* sister_contrasts.csv, sister_summary.csv
+
+```{r sisters}
+d <- fread(file.path(dir_data_intermediate, "confinement_genera.csv"))
+tree <- readRDS(file.path(dir_s10, "genus_tree.rds"))
+tree <- keep.tip(tree, intersect(tree$tip.label, d$genus))
+d <- d[genus %in% tree$tip.label]
+d[, resid := residuals(lm(log(hexagons) ~ log_species + log_age, data = d))]
+setkey(d, genus)
+used <- character()
+contrasts <- rbindlist(lapply(d[obligate == 1]$genus, function(g) {
+  tip <- match(g, tree$tip.label)
+  parent <- tree$edge[tree$edge[, 2] == tip, 1]
+  sis <- setdiff(tree$tip.label[getDescendants(tree, parent)], c(g, NA))
+  sis <- intersect(sis, d$genus)
+  others <- sis[d[sis]$obligate == 0]
+  key <- paste(sort(sis), collapse = "|")
+  if (!length(others) || key %in% used) return(NULL)
+  used <<- c(used, key)
+  data.table(genus = g, subfamily = d[g]$subfamily, region = d[g]$region,
+             sister_genera = length(others), sister = paste(head(others, 5), collapse = ", "),
+             difference = d[g]$resid - mean(d[others]$resid),
+             hexagons = d[g]$hexagons, sister_hexagons = mean(d[others]$hexagons))
+}))
+write_table(contrasts, file.path(dir_data_intermediate, "sister_contrasts.csv"))
+summ <- contrasts[, .(contrasts = .N, negative = sum(difference < 0),
+                      median_difference = median(difference),
+                      ratio = exp(-median(difference)),
+                      sign_test_p = binom.test(sum(difference < 0), .N)$p.value,
+                      wilcoxon_p = wilcox.test(difference)$p.value)]
+write_table(summ, file.path(dir_data_intermediate, "sister_summary.csv"))
+print(contrasts, digits = 2)
+print(summ, digits = 3)
+```
+
+```{r clear_sisters, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) Effect of obligacy on log hexagons occupied (given log stem age and log recorded species) under each variant, as the factor by which obligate genera occupy fewer hexagons (95% intervals; for the continuous share, the factor for an entirely obligate against an entirely facultative genus). (b) Sister-clade contrasts: residual log hexagons of each obligate genus minus the mean of the non-obligate genera of its sister clade.
+
+*Inputs:* s33/ confinement_robustness.csv, sister_contrasts.csv
+*Outputs:* plot_confinement.png
+
+```{r plot_confinement}
+res <- fread(file.path(dir_data_intermediate, "confinement_robustness.csv"))
+sc <- fread(file.path(dir_data_intermediate, "sister_contrasts.csv"))
+res[, `:=`(variant = factor(variant, rev(variant)), group = factor(group, unique(group)))]
+panel_a <- ggplot(res, aes(exp(-estimate), variant)) +
+  geom_vline(xintercept = 1, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = exp(-(estimate + 1.96 * se)), xmax = exp(-(estimate - 1.96 * se))),
+                width = 0, linewidth = 0.5, orientation = "y") +
+  geom_point(aes(fill = p < 0.05), shape = 21, size = 2.2) +
+  facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+  scale_x_log10() +
+  scale_fill_manual(values = c(`TRUE` = "black", `FALSE` = "white"), guide = "none") +
+  labs(x = "Times fewer hexagons occupied by obligate genera (log scale)", y = NULL,
+       title = "Every variant", subtitle = "Given stem age and recorded species; filled: p < 0.05") +
+  theme_figure() + theme(strip.text.y = element_text(angle = 0, hjust = 0))
+sc[, genus := factor(genus, genus[order(difference)])]
+panel_b <- ggplot(sc, aes(difference, genus)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_segment(aes(x = 0, xend = difference, yend = genus), colour = "grey60") +
+  geom_point(colour = "#E69F00", size = 2) +
+  labs(x = "Obligate minus sister genera (residual log hexagons)", y = NULL,
+       title = "Sister-clade contrasts") +
+  theme_figure() + theme(axis.text.y = element_text(face = "italic"))
+fig <- patchwork::wrap_plots(panel_a, panel_b, widths = c(1.4, 1))
+save_figure(fig, "plot_confinement", 10, 6.5)
+fig
+```
+
+```{r clear_plot_confinement, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

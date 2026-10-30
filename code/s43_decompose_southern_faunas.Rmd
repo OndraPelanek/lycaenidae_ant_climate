@@ -1,0 +1,240 @@
+---
+title: "Lycaenidae ant-interaction climate 43 - what makes the southern faunas obligate-rich? A decomposition with a lineage-conserving null"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+Southern Africa and Australia hold far more obligate associates than other regions, also within the climates they share with them; the genus-weighted results suggested that they get there differently (`s18`). Following the sixth external review (`writing/research_roadmap.md`, rank 7), this notebook decomposes the obligate share of each fauna, for the biogeographic regions, the five Mediterranean-climate pools and the climate-matched subsets of the Cape, southern Australia and the Mediterranean Basin:
+
+- **S**, the obligate share of the classified species, equals **R × W**: R, the share of species in genera that hold any obligate species; and W, the obligate share within those genera;
+- the share of genera holding obligate species; the mutualist and parasite shares; the share of the obligate species in the three largest obligate genera;
+- the spread of the obligate-holding genera (median hexagons of about 210,000 km² occupied by the genus worldwide, `s33`).
+
+A **lineage-conserving null** then asks whether a region holds more obligate species than expected from which genera it holds and how strategies are conserved within subfamilies: the obligate share of each genus (over all its classified species) is permuted among the genera of its subfamily, keeping every genus's species in every region; the null share of a region is the species-weighted mean of the permuted genus shares. The observed counterpart uses the genera's own shares. An excess over the null means that a region holds the obligate genera of its subfamilies disproportionately, which the subfamilies present cannot account for; it describes a pattern, not a process. Genus richness is not interpreted as diversification.
+
+A full run takes about 2 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(ggplot2)
+```
+
+## Variables
+
+```{r setup_variables}
+n_null <- 999
+strata_widths <- c(bio01 = 2, bio06 = 3, log_aridity = 0.15, bio15 = 15)   # as in s13 and s18
+min_pixels <- 5
+min_species_stratum <- 3
+pairs <- list(c("Cape", "Mediterranean Basin"), c("Southern Australia", "Mediterranean Basin"),
+              c("Cape", "Southern Australia"))
+region_levels <- c("Southern Africa", "Australia", "Tropical Africa", "New Guinea and islands", "Indomalayan",
+                   "Palearctic", "Nearctic", "Neotropic")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_s13 <- path_resrepo("data/intermediate/s13_compare_matched_climates")
+dir_s33 <- path_resrepo("data/intermediate/s33_test_confinement")
+dir_data_intermediate <- path_resrepo("data/intermediate/s43_decompose_southern_faunas")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+stratum_of <- function(pix) paste(floor(pix$bio01 / strata_widths[["bio01"]]), floor(pix$bio06 / strata_widths[["bio06"]]),
+                                  floor(pix$log_aridity / strata_widths[["log_aridity"]]),
+                                  floor(pix$bio15 / strata_widths[["bio15"]]), sep = "_")
+# Decomposition of one set of classified species (columns genus, type)
+decompose <- function(d, spread) {
+  g <- d[, .(n = .N, obl = sum(type %in% c("m", "p"))), by = genus]
+  og <- g[obl > 0]
+  data.table(species = nrow(d), genera = nrow(g),
+             S = mean(d$type %in% c("m", "p")), mutualists = mean(d$type == "m"), parasites = mean(d$type == "p"),
+             genera_with_obligate = nrow(og) / nrow(g),
+             R = sum(og$n) / nrow(d), W = if (nrow(og)) sum(og$obl) / sum(og$n) else NA_real_,
+             top3_share = if (nrow(og)) sum(head(sort(og$obl, decreasing = TRUE), 3)) / sum(og$obl) else NA_real_,
+             median_hexagons_obligate_genera = as.numeric(median(spread[og$genus], na.rm = TRUE)))
+}
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom")
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Species sets
+
+The classified species of each biogeographic region (`s05`), of the Mediterranean-climate pixels of each Mediterranean-climate region, and of each region of a pair within the climate strata both occupy (the strata and rules of `s13` and `s18`).
+
+*Inputs:* s05/species_regions.csv; s13/ pixel_strata.rds, record_pixels.rds, taxa.csv
+*Outputs:* species_sets.csv
+
+```{r sets}
+taxa <- fread(file.path(dir_s13, "taxa.csv"), colClasses = c(pool_key = "character"))[classified == TRUE]
+reg <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))[
+  interaction_type %in% c("n", "f", "m", "p")]
+sets <- list(reg[, .(set = "Biogeographic region", unit = region, pool_key, genus, subfamily, type = interaction_type)])
+pix <- readRDS(file.path(dir_s13, "pixel_strata.rds"))
+rec <- readRDS(file.path(dir_s13, "record_pixels.rds"))
+rec[, pool_key := as.character(pool_key)]
+cs <- pix[!is.na(med_region)]
+cs[, s := stratum_of(cs)]
+sp <- unique(merge(rec[cell %in% cs$cell], cs[, .(cell, region = as.character(med_region), s)], by = "cell")[
+  , .(region, s, pool_key)])
+sp <- merge(sp, taxa[, .(pool_key, genus, subfamily, type = interaction_type)], by = "pool_key")
+sets[[2]] <- unique(sp[, .(set = "Mediterranean-climate region", unit = region, pool_key, genus, subfamily, type)])
+area <- cs[, .(pixels = .N), by = .(region = as.character(med_region), s)]
+for (pr in pairs) {
+  occ <- area[region %in% pr & pixels >= min_pixels]
+  n_sp <- sp[region %in% pr, .(n = uniqueN(pool_key)), by = .(region, s)]
+  ok <- merge(occ, n_sp, by = c("region", "s"))[n >= min_species_stratum]
+  s_ok <- ok[, .N, by = s][N == 2]$s
+  sets[[length(sets) + 1]] <- unique(sp[region %in% pr & s %in% s_ok,
+                                        .(set = paste("Shared climates:", paste(pr, collapse = " vs ")), unit = region,
+                                          pool_key, genus, subfamily, type)])
+}
+sets <- rbindlist(sets)
+write_table(sets, file.path(dir_data_intermediate, "species_sets.csv"))
+print(sets[, .(species = uniqueN(pool_key), genera = uniqueN(genus)), by = .(set, unit)])
+```
+
+```{r clear_sets, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Decomposition and null
+
+*Inputs:* s43/species_sets.csv; s05/species_regions.csv; s33/confinement_genera.csv
+*Outputs:* decomposition.csv, null_shares.csv
+
+```{r decompose}
+sets <- fread(file.path(dir_data_intermediate, "species_sets.csv"), colClasses = c(pool_key = "character"))
+cg <- fread(file.path(dir_s33, "confinement_genera.csv"))
+spread <- setNames(cg$hexagons, cg$genus)
+dec <- sets[, decompose(.SD, spread), by = .(set, unit)]
+write_table(dec, file.path(dir_data_intermediate, "decomposition.csv"))
+print(dec[, .(set = substr(set, 1, 34), unit, species, genera, S = round(S, 2), R = round(R, 2), W = round(W, 2),
+              genera_obl = round(genera_with_obligate, 2), top3 = round(top3_share, 2),
+              hex = median_hexagons_obligate_genera)])
+
+# Lineage-conserving null: genus obligate shares (over all classified species of the genus) permuted
+# among the genera of each subfamily
+reg <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))[
+  interaction_type %in% c("n", "f", "m", "p") & subfamily != ""]
+gshare <- reg[, .(o = mean(interaction_type %in% c("m", "p")), subfamily = subfamily[1]), by = genus]
+expected <- function(s, o) {
+  e <- merge(s[genus %in% names(o), .N, by = .(set, unit, genus)], data.table(genus = names(o), o = o), by = "genus")
+  e[, .(share = sum(N * o) / sum(N)), by = .(set, unit)]
+}
+o_obs <- setNames(gshare$o, gshare$genus)
+obs <- expected(sets, o_obs)
+set.seed(43)
+null <- rbindlist(lapply(seq_len(n_null), function(i) {
+  perm <- gshare[, .(genus, o = if (.N > 1) sample(o) else o), by = subfamily]
+  expected(sets, setNames(perm$o, perm$genus))[, permutation := i]
+}))
+nul <- merge(obs, null[, .(null_median = median(share), null_low = quantile(share, 0.025),
+                           null_high = quantile(share, 0.975)), by = .(set, unit)], by = c("set", "unit"))
+nul <- merge(nul, null[obs, on = .(set, unit), .(p_above = mean(share >= i.share)), by = .EACHI], by = c("set", "unit"))
+write_table(nul, file.path(dir_data_intermediate, "null_shares.csv"))
+print(nul[, .(set = substr(set, 1, 34), unit, expected_from_genera = round(share, 2), null_median = round(null_median, 2),
+              null_low = round(null_low, 2), null_high = round(null_high, 2), p_above = round(p_above, 3))])
+```
+
+```{r clear_decompose, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) For each fauna, the obligate share S as the product of R (share of species in obligate-holding genera) and W (obligate share within them), with the mutualist and parasite shares. (b) The obligate share expected from the genera of each biogeographic region and Mediterranean-climate region against the lineage-conserving null (95% range).
+
+*Inputs:* s43/ decomposition.csv, null_shares.csv
+*Outputs:* plot_southern_decomposition.png
+
+```{r plot_southern_decomposition}
+dec <- fread(file.path(dir_data_intermediate, "decomposition.csv"))
+nul <- fread(file.path(dir_data_intermediate, "null_shares.csv"))
+dec[, label := fifelse(set == "Biogeographic region" | set == "Mediterranean-climate region", unit,
+                       paste0(unit, " (", sub("Shared climates: ", "", set), ")"))]
+dec[, set_short := fifelse(grepl("^Shared", set), "Shared climates", set)]
+long <- melt(dec, id.vars = c("set_short", "label"), measure.vars = c("R", "W", "S", "mutualists", "parasites"))
+long[, variable := factor(variable, c("R", "W", "S", "mutualists", "parasites"),
+                          c("R: species in obligate-holding genera", "W: obligate share within them",
+                            "S = R x W: obligate share", "Mutualist share", "Parasite share"))]
+ord <- dec[order(set_short, S)]$label
+long[, label := factor(label, unique(ord))]
+fig_a <- ggplot(long, aes(value, label, colour = variable, shape = variable)) +
+  geom_point(size = 2) +
+  facet_grid(set_short ~ ., scales = "free_y", space = "free_y") +
+  scale_colour_manual(values = c("#56B4E9", "#0072B2", "#3B3B3B", "#E69F00", "#CC79A7"), name = NULL) +
+  scale_shape_manual(values = c(1, 2, 16, 15, 17), name = NULL) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = "Share of the classified species", y = NULL, title = "(a) Decomposition of the obligate share") +
+  guides(colour = guide_legend(ncol = 2)) +
+  theme_figure(8) + theme(strip.text.y = element_text(angle = 0))
+n2 <- nul[!grepl("^Shared", set)]
+n2[, unit := factor(unit, n2[order(set, share)]$unit)]
+fig_b <- ggplot(n2, aes(y = unit)) +
+  geom_errorbar(aes(xmin = null_low, xmax = null_high), width = 0.3, colour = "grey60", orientation = "y") +
+  geom_point(aes(x = null_median), shape = 3, colour = "grey40") +
+  geom_point(aes(x = share), colour = "#D55E00", size = 2.2) +
+  facet_grid(set ~ ., scales = "free_y", space = "free_y") +
+  scale_x_continuous(labels = scales::percent) +
+  labs(x = "Obligate share expected from the region's genera (orange) and under the null (grey)", y = NULL,
+       title = "(b) Lineage-conserving null") +
+  theme_figure(8) + theme(strip.text.y = element_text(angle = 0))
+fig <- patchwork::wrap_plots(fig_a, fig_b, ncol = 2, widths = c(1.2, 1))
+save_figure(fig, "plot_southern_decomposition", 11, 7)
+fig
+```
+
+```{r clear_plot_southern_decomposition, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

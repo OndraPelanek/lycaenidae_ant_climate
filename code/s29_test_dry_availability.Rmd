@@ -1,0 +1,280 @@
+---
+title: "Lycaenidae ant-interaction climate 29 - dry months used and available"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+Given region and lineage, and within genera, obligate mutualists live in climates with more dry months than facultative species (`s19`), although the association is fragile (`s28`). A species' climate reflects two things: the climates available where it occurs, and where within them its records fall. Obligate species could have more dry months because they live in drier parts of the world (availability), or because they occupy the drier places within the areas they inhabit (use beyond availability). This notebook separates the two (big-picture follow-up 9):
+
+1. **Available dry months.** For every species, the mean number of dry months (`s19`; precipitation in mm below twice the mean temperature in °C) over all land pixels of the hexagons holding its records, every hexagon weighted equally; at two grains, hexagons of about 210,000 km² (`dggridR` resolution 5, as in `s05`) and about 630,000 km² (resolution 4).
+2. **Use beyond availability.** The species' dry months (median over its record pixels, `s19`) minus the dry months available to it.
+3. **Tests.** Each measure related to obligacy and to obligate mutualism given region and lineage (as in `s19`), the two together in one model, within the genera containing both outcomes (conditional logistic regression on genus, as in `s19`), and genus by genus.
+
+If obligacy goes with available dry months but not with use beyond them, obligate species live in drier areas without occupying the drier places within them; if it goes with use beyond availability, obligate species sit in the drier parts of the areas they occupy. Neither is evidence of a cause.
+
+A full run takes about 2 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(dggridR)
+library(mgcv)
+library(survival)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+contrasts <- list(obligate = list(rows = c("f", "m", "p"), success = c("m", "p"),
+                                  label = "Obligate vs facultative"),
+                  mutualist = list(rows = c("f", "m"), success = "m",
+                                   label = "Obligate mutualist vs facultative"))
+# Hexagon grains (dggridR resolution)
+grains <- c(hex5 = 5, hex4 = 4)
+grain_labels <- c(hex5 = "Hexagons of about 210,000 km²", hex4 = "Hexagons of about 630,000 km²")
+measure_labels <- c(used = "Dry months of the records", available = "Dry months available",
+                    beyond = "Use beyond availability")
+type_colours <- c(f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_s19 <- path_resrepo("data/intermediate/s19_test_mixed_genera")
+dir_s28 <- path_resrepo("data/intermediate/s28_test_robustness")
+dir_data_intermediate <- path_resrepo("data/intermediate/s29_test_dry_availability")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Species of a contrast, coded 0/1
+contrast_data <- function(sp, ct) {
+  d <- copy(sp[interaction_type %in% contrasts[[ct]]$rows])
+  d[, y := as.integer(interaction_type %in% contrasts[[ct]]$success)]
+  d[, `:=`(genus = factor(genus), subfamily = factor(subfamily), region = factor(region))]
+  d
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom", plot.tag = element_text(face = "bold", size = 11))
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Dry months used and available
+
+The dry months of every land pixel (`s19`), averaged within each hexagon; each species' available dry months are the mean over the hexagons holding its records.
+
+*Inputs:* s19/drought_10m.tif; s05/ presence_hex5.csv, presence_hex4.csv; s28/species_drought_balance.csv
+*Outputs:* species_availability.csv
+
+```{r availability}
+dr <- rast(file.path(dir_s19, "drought_10m.tif"))[["dry_months"]]
+px <- as.data.table(as.data.frame(dr, xy = TRUE, na.rm = TRUE))
+setnames(px, c("x", "y", "dry_months"))
+sp <- fread(file.path(dir_s28, "species_drought_balance.csv"),
+            colClasses = c(pool_key = "character"))
+sp <- sp[interaction_type %in% c("f", "m", "p") & is.finite(dry_months)]
+avail <- rbindlist(lapply(names(grains), function(g) {
+  dg <- dgconstruct(res = grains[[g]])
+  px[, cell_id := dgGEO_to_SEQNUM(dg, x, y)$seqnum]
+  hex <- px[, .(available = mean(dry_months)), by = cell_id]
+  pres <- fread(file.path(dir_s05, paste0("presence_", g, ".csv")),
+                colClasses = c(pool_key = "character"))
+  pres <- merge(pres[pool_key %in% sp$pool_key], hex, by = "cell_id")
+  pres[, .(grain = g, hexagons = .N, available = mean(available)), by = pool_key]
+}))
+sp <- merge(sp[, .(pool_key, species, genus, subfamily, region, interaction_type, used = dry_months)],
+            avail, by = "pool_key")
+sp[, beyond := used - available]
+write_table(sp, file.path(dir_data_intermediate, "species_availability.csv"))
+print(sp[, .(species = .N, used = mean(used), available = mean(available), beyond = mean(beyond)),
+         by = .(grain, interaction_type)], digits = 3)
+cat("Correlation of used and available dry months:\n")
+print(sp[, .(r = cor(used, available)), by = grain], digits = 2)
+```
+
+```{r clear_availability, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Given region and lineage
+
+Each measure (standardised over the species of the contrast) related to each contrast with region as a fixed effect and random intercepts of subfamily and genus (as in `s19`), alone, and available and use beyond availability together.
+
+*Inputs:* s29/species_availability.csv
+*Outputs:* availability_effects.csv
+
+```{r effects}
+sp <- fread(file.path(dir_data_intermediate, "species_availability.csv"),
+            colClasses = c(pool_key = "character"))
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+fit <- function(d, terms) {
+  m <- gam(as.formula(paste("y ~ region +", paste(terms, collapse = " + "), "+", lineage)),
+           data = d, family = binomial, method = "REML")
+  pt <- summary(m)$p.table
+  data.table(term = terms, estimate = pt[terms, 1], se = pt[terms, 2], p = pt[terms, 4])
+}
+effects <- rbindlist(lapply(names(grains), function(g) rbindlist(lapply(names(contrasts), function(ct) {
+  d <- contrast_data(sp[grain == g], ct)
+  for (v in names(measure_labels)) set(d, j = paste0(v, "_s"), value = as.numeric(scale(d[[v]])))
+  rbind(rbindlist(lapply(names(measure_labels), function(v) fit(d, paste0(v, "_s"))))[
+          , model := "alone"],
+        fit(d, c("available_s", "beyond_s"))[, model := "together"])[
+    , `:=`(grain = g, contrast = ct, species = nrow(d), events = sum(d$y))]
+}))))
+effects[, measure := sub("_s$", "", term)]
+write_table(effects, file.path(dir_data_intermediate, "availability_effects.csv"))
+print(effects[, .(grain, contrast, model, measure, estimate, se, p)], digits = 3)
+```
+
+```{r clear_effects, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Within genera
+
+In the genera containing both outcomes of each contrast: conditional logistic regression on genus (each measure standardised over the species of these genera), and for every genus the mean of each measure in its obligate (or obligate mutualist) species minus that in its facultative species.
+
+*Inputs:* s29/species_availability.csv
+*Outputs:* availability_within.csv, availability_genera.csv, availability_sign_tests.csv
+
+```{r within}
+sp <- fread(file.path(dir_data_intermediate, "species_availability.csv"),
+            colClasses = c(pool_key = "character"))
+within <- list()
+genera <- list()
+for (g in names(grains)) for (ct in names(contrasts)) {
+  d <- contrast_data(sp[grain == g], ct)
+  mixed <- d[, .(both = uniqueN(y) == 2), by = genus][both == TRUE]$genus
+  d <- droplevels(d[genus %in% mixed])
+  for (v in names(measure_labels)) {
+    x <- as.numeric(scale(d[[v]]))
+    cl <- summary(clogit(y ~ x + strata(genus),
+                         data = data.frame(y = d$y, x = x, genus = d$genus)))$coefficients
+    within[[length(within) + 1]] <- data.table(
+      grain = g, contrast = ct, measure = v, genera = length(mixed), species = nrow(d),
+      estimate = cl[1, "coef"], se = cl[1, "se(coef)"], p = cl[1, "Pr(>|z|)"])
+  }
+  gd <- d[, .(used = mean(used[y == 1]) - mean(used[y == 0]),
+              available = mean(available[y == 1]) - mean(available[y == 0]),
+              beyond = mean(beyond[y == 1]) - mean(beyond[y == 0]),
+              coded_1 = sum(y), coded_0 = sum(1 - y)), by = genus]
+  genera[[length(genera) + 1]] <- gd[, `:=`(grain = g, contrast = ct)]
+}
+within <- rbindlist(within)
+genera <- rbindlist(genera)
+write_table(within, file.path(dir_data_intermediate, "availability_within.csv"))
+write_table(genera, file.path(dir_data_intermediate, "availability_genera.csv"))
+print(within, digits = 3)
+
+# --- Genus by genus: genera in which the obligate species have the higher value (sign test) ---
+sign_tests <- melt(genera, id.vars = c("grain", "contrast", "genus"),
+                   measure.vars = names(measure_labels), variable.name = "measure")[
+  , .(genera = .N, positive = sum(value > 0),
+      sign_test_p = binom.test(sum(value > 0), .N)$p.value), by = .(grain, contrast, measure)]
+write_table(sign_tests, file.path(dir_data_intermediate, "availability_sign_tests.csv"))
+print(sign_tests, digits = 3)
+```
+
+```{r clear_within, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) Effect of each measure on obligacy and on obligate mutualism given region and lineage (log odds per SD, 95% intervals): alone (circles), and available and use beyond availability in one model (triangles); both grains. (b) Within the genera containing obligate mutualists and facultative species: the difference between the mean available dry months (x) and the mean use beyond availability (y) of the obligate mutualists and the facultative species of each genus (hexagons of about 210,000 km²); point size: species.
+
+*Inputs:* s29/ availability_effects.csv, availability_genera.csv
+*Outputs:* plot_dry_availability.png
+
+```{r plot_dry_availability}
+ef <- fread(file.path(dir_data_intermediate, "availability_effects.csv"))
+gd <- fread(file.path(dir_data_intermediate, "availability_genera.csv"))
+ef[, `:=`(measure = factor(measure_labels[measure], rev(measure_labels)),
+          contrast = factor(sapply(contrasts, `[[`, "label")[contrast],
+                            sapply(contrasts, `[[`, "label")),
+          grain = factor(grain_labels[grain], grain_labels))]
+panel_a <- ggplot(ef, aes(estimate, measure, shape = model, colour = grain)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), width = 0,
+                linewidth = 0.5, orientation = "y", position = position_dodge(width = 0.7)) +
+  geom_point(size = 2, position = position_dodge(width = 0.7)) +
+  facet_wrap(~ contrast, nrow = 1) +
+  scale_colour_manual(values = c("#3B3B3B", "#9A9A9A"), name = NULL) +
+  scale_shape_manual(values = c(alone = 16, together = 17), name = NULL) +
+  labs(x = "Effect given region and lineage (log odds per SD)", y = NULL,
+       title = "Available dry months or use beyond them?") +
+  guides(colour = guide_legend(nrow = 2), shape = guide_legend(nrow = 2)) +
+  theme_figure()
+g5 <- gd[grain == "hex5" & contrast == "mutualist"]
+panel_b <- ggplot(g5, aes(available, beyond)) +
+  geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_point(aes(size = coded_1 + coded_0), colour = type_colours[["m"]], alpha = 0.8) +
+  geom_text(aes(label = genus), size = 2.5, vjust = -1, fontface = "italic", colour = "grey30") +
+  scale_size_area(max_size = 5, name = "Species") +
+  scale_x_continuous(expand = expansion(mult = 0.15)) +
+  labs(x = "Available dry months: mutualists minus facultative",
+       y = "Use beyond availability: mutualists minus facultative",
+       title = "Genus by genus") +
+  theme_figure()
+fig <- panel_a / panel_b + plot_layout(heights = c(1, 1.2)) +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")")
+save_figure(fig, "plot_dry_availability", 8, 9)
+fig
+```
+
+```{r clear_plot_dry_availability, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

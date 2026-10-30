@@ -30,7 +30,7 @@ Five models are compared for each contrast (ant-associated vs non-associated; ob
 - **lineage**: random intercepts of subfamily and genus;
 - **lineage + climate**.
 
-For each held-out unit and model: the predicted and observed share of the outcome (calibration in the large), the area under the ROC curve (discrimination; species of the unit only), the deviance explained relative to the baseline, and the calibration slope. Intervals come from resampling genera within the held-out unit (the predictions are fixed; the resampling expresses how much the metric depends on which lineages the unit happens to contain). The climatic novelty of each held-out species is its Mahalanobis distance from the training species in the six climate predictors, called novel when beyond the 99th percentile of the training species' own distances; the metrics are also given for the non-novel species only.
+For each held-out unit and model: the predicted and observed share of the outcome (calibration in the large), the area under the ROC curve (discrimination; species of the unit only), the deviance explained relative to the baseline, and the calibration slope. Intervals come from resampling genera within the held-out unit (the predictions are fixed; the resampling expresses how much the metric depends on which lineages the unit happens to contain). The climatic novelty of each held-out species is its Mahalanobis distance from the training species in the six climate predictors, called novel when beyond the 99th percentile of the training species' own distances; the metrics are also given for the non-novel species only. Finally, the predictions for held-out realms are pooled separately for species whose genus also occurs in another realm (known to the model) and species whose genus is found only in the held-out realm, to show where the lineage model's predictive power comes from.
 
 A full run takes about 10 min.
 
@@ -95,6 +95,7 @@ dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
 
 ```{r load_functions}
 source(here::here("code", "R", "write_table.R"))
+source(here::here("code", "R", "lineage_prediction.R"))
 ```
 
 ```{r define_helpers}
@@ -104,10 +105,11 @@ binary_deviance <- function(y, q) {
   -2 * sum(y * log(q) + (1 - y) * log(1 - q))
 }
 
-# Area under the ROC curve (Mann-Whitney); NA unless both outcomes occur
+# Area under the ROC curve (Mann-Whitney); NA unless both outcomes occur. Predictions are
+# rounded first, so that differences at the level of floating-point noise do not rank species
 auc <- function(y, q) {
   if (length(unique(y)) < 2) return(NA_real_)
-  r <- rank(q)
+  r <- rank(signif(q, 8))
   n1 <- sum(y == 1)
   n0 <- sum(y == 0)
   (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
@@ -141,10 +143,11 @@ contrast_data <- function(sp, ct) {
   d
 }
 
-# Held-out predictions of every model for the species of one held-out unit. GAMs keep the factor
-# levels of all species (an unseen genus or subfamily gets a random effect of 0) and the
-# random-effect variances of the fit to all species (as in s12)
-predict_unit <- function(d, test, sps) {
+# Held-out predictions of every model for the species of one held-out unit. GAMs are fitted to
+# the training species only (random-effect variances by REML in each fold) with the factor levels
+# of all species, and a species of an unseen genus or subfamily gets the average prediction over
+# the distribution of the random effects it does not know (predict_lineage)
+predict_unit <- function(d, test) {
   train <- d[!test]
   out <- d[test, .(pool_key, genus, subfamily, region, y)]
   out[, q0 := mean(train$y)]
@@ -159,8 +162,8 @@ predict_unit <- function(d, test, sps) {
     if (mo == "baseline") return(rep(mean(train$y), sum(test)))
     if (grepl("s\\(", models[[mo]])) {
       m <- gam(as.formula(paste("y ~", models[[mo]])), data = train, family = binomial,
-               sp = sps[[mo]], drop.unused.levels = FALSE)
-      return(as.numeric(predict(m, newdata = d[test], type = "response")))
+               method = "REML", drop.unused.levels = FALSE)
+      return(predict_lineage(m, train, d[test]))
     }
     X <- model.matrix(as.formula(paste("~", models[[mo]])), data = d)
     fit <- suppressWarnings(glm.fit(X[!test, , drop = FALSE], train$y, family = binomial()))
@@ -200,7 +203,9 @@ The classified species with complete climate predictors and a majority region (`
 
 ```{r held_out_predictions}
 sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
-sp <- sp[interaction_type %in% types & !is.na(region)]
+# Species without a recorded subfamily (two) are left out, as they would form a "subfamily" of
+# their own
+sp <- sp[interaction_type %in% types & !is.na(region) & subfamily != ""]
 sp <- sp[complete.cases(sp[, c(climate_vars, "abs_latitude"), with = FALSE])]
 x <- readRDS(file.path(dir_s02, "species_records.rds"))
 x[, pool_key := as.character(pool_key)]
@@ -212,14 +217,11 @@ print(sp[, .N, by = .(region, interaction_type)][order(region, interaction_type)
 
 pred <- rbindlist(lapply(names(contrasts), function(ct) {
   d <- contrast_data(sp, ct)
-  # Random-effect variances from the fit to all species of the contrast
-  sps <- lapply(models[grepl("s\\(", models)], function(rhs)
-    gam(as.formula(paste("y ~", rhs)), data = d, family = binomial, method = "REML")$sp)
   schemes <- list(`held-out realm` = d$region, `held-out subfamily` = as.character(d$subfamily))
   rbindlist(lapply(names(schemes), function(s) rbindlist(lapply(unique(schemes[[s]]), function(u) {
     test <- schemes[[s]] == u
     if (sum(test) < 5 || length(unique(d$y[!test])) < 2) return(NULL)
-    predict_unit(d, test, sps)[, `:=`(contrast = ct, scheme = s, unit = u)]
+    predict_unit(d, test)[, `:=`(contrast = ct, scheme = s, unit = u)]
   }))))
 }))
 write_table(pred, file.path(dir_data_intermediate, "held_out_predictions.csv"))
@@ -268,6 +270,41 @@ print(pooled[, .(contrast, scheme, model, auc, auc_low, auc_high, d2, d2_low, d2
 ```
 
 ```{r clear_held_out_metrics, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Known and unseen genera
+
+Whether the lineage model predicts a held-out realm because it knows the realm's genera from other realms, or also for genera found only in the held-out realm. For each held-out realm, a species' genus is known when the genus has species of the same contrast in any other realm (and so in the training data). Metrics are pooled over all held-out realms within each group, with intervals from resampling genera (500 replicates).
+
+*Inputs:* s20/held_out_predictions.csv
+*Outputs:* held_out_by_genus.csv
+
+```{r held_out_by_genus}
+pred <- fread(file.path(dir_data_intermediate, "held_out_predictions.csv"),
+              colClasses = c(pool_key = "character"))[scheme == "held-out realm"]
+# Units (realms) of each genus within a contrast; known = present in another realm
+units <- unique(pred[model == "baseline", .(contrast, genus, unit)])
+units[, known := uniqueN(unit) > 1, by = .(contrast, genus)]
+pred <- merge(pred, units, by = c("contrast", "genus", "unit"))
+pred[, genus_group := fifelse(known, "genus known", "genus unseen")]
+set.seed(20261029)
+by_genus <- pred[, {
+  m <- metrics(y, q, q0)
+  b <- boot_metrics(.SD, 500)
+  ci <- apply(b, 2, quantile, c(0.025, 0.975), na.rm = TRUE)
+  c(list(species = .N, genera = uniqueN(genus), events = sum(y)), as.list(m),
+    setNames(as.list(ci[1, ]), paste0(names(m), "_low")),
+    setNames(as.list(ci[2, ]), paste0(names(m), "_high")))
+}, by = .(contrast, genus_group, model)]
+write_table(by_genus, file.path(dir_data_intermediate, "held_out_by_genus.csv"))
+print(by_genus[model %in% c("climate", "latitude x hemisphere", "lineage"),
+               .(contrast, genus_group, model, species, genera, events, observed, predicted,
+                 auc, d2, d2_low, d2_high)], digits = 2)
+```
+
+```{r clear_held_out_by_genus, include=FALSE}
 rm(list = setdiff(ls(), setup_objects))
 invisible(gc())
 ```

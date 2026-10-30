@@ -85,6 +85,7 @@ dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
 
 ```{r load_functions}
 source(here::here("code", "R", "write_table.R"))
+source(here::here("code", "R", "lineage_prediction.R"))
 ```
 
 ```{r define_helpers}
@@ -122,18 +123,20 @@ binary_deviance <- function(y, q) {
 }
 
 # Cross-validated deviance explained of a binomial GAM with right-hand side `rhs`: each group
-# of `fold` is predicted by a model fitted to the others (with the factor levels of all species,
-# so that an unseen genus or subfamily gets a random effect of 0), against the outcome
-# proportion of the training species. The random-effect variances (smoothing parameters `sp`)
-# are those estimated on all species, which makes each fit five times faster; refitting them
-# in each fold changed held-out predictions little in a trial (r = 0.9999)
+# of `fold` is predicted by a model fitted to the others (with the factor levels of all species),
+# against the outcome proportion of the training species. A species of a genus or subfamily
+# absent from the training data gets the average prediction over the distribution of the random
+# effects it does not know (predict_lineage), not the prediction for a random effect of 0. The
+# random-effect variances (smoothing parameters `sp`) are those estimated on all species, which
+# makes each fit five times faster; refitting them in each fold changed held-out predictions
+# little in a trial (r = 0.9999)
 gam_cv_d2 <- function(d, rhs, fold, sp) {
   q <- q0 <- numeric(nrow(d))
   for (k in unique(fold)) {
     test <- fold == k
     m <- gam(as.formula(paste("y ~", rhs)), data = d[!test], family = binomial, sp = sp,
              drop.unused.levels = FALSE)
-    q[test] <- predict(m, newdata = d[test], type = "response")
+    q[test] <- predict_lineage(m, d[!test], d[test])
     q0[test] <- mean(d$y[!test])
   }
   1 - binary_deviance(d$y, q) / binary_deviance(d$y, q0)

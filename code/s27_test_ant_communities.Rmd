@@ -1,0 +1,325 @@
+---
+title: "Lycaenidae ant-interaction climate 27 - partner ants in local ant communities"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+`s21` found that the ant genera most often recorded with obligate lycaenids, *Crematogaster* and *Camponotus*, are present and rich in species in the Mediterranean Basin and California, so the mere presence of partner genera does not explain where obligate associations occur. Obligate associations involve dominant ants with large colonies more often than facultative ones (Fiedler 2021), so what may matter is how much these ants **dominate local communities**. This notebook uses the sampled local ant communities of the Global Ant Database (GLAD; the copy in the Kass et al. 2022 archive) to ask (big-picture plan, test D):
+
+1. **Communities.** For every sampled locality: the share of its species, and of its individuals where abundances were recorded, that belong to *Crematogaster* or *Camponotus*; and the dominance of the community (the share of individuals in its most abundant species).
+2. **Regions.** The medians of these measures in each biogeographic region and Mediterranean-climate region, beside the region's obligate share.
+3. **Hexagons.** Whether the obligate share of lycaenids in a hexagon (about 210,000 km²) goes with the dominance of the two partner genera in its sampled ant communities, across all hexagons and given region.
+
+Only these two genera are used as partners, because they occur on every continent and host most obligate lycaenids (`s21`). Genera found mainly in one region, such as *Iridomyrmex* in Australia, would make the test circular: they would look like partners of obligate species simply because their region has many. A full run takes about 2 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(dggridR)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+kass_zip <- "ants_kass2022/main_analysis_data.zip"
+glad_files <- c(observations = "main_analysis_data/glad_data/ObservationsALL - corrected 21.02.20.xlsx",
+                localities = "main_analysis_data/glad_data/LocalityALL - 2020.01.22.xlsx")
+partner_genera <- c("Crematogaster", "Camponotus")
+
+# Localities with at least this many species; hexagons with at least this many localities and
+# classified lycaenid species
+min_species_locality <- 3
+min_localities_hex <- 2
+min_classified_hex <- 10
+
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+region_short <- c(Nearctic = "Nearctic", Neotropic = "Neotropics", Palearctic = "Palaearctic",
+                  `Tropical Africa` = "Tropical Africa", `Southern Africa` = "Southern Africa",
+                  Indomalayan = "Indomalaya", Australia = "Australia",
+                  `New Guinea and islands` = "New Guinea")
+med_levels <- c("Cape", "Southern Australia", "Mediterranean Basin", "California",
+                "Central Chile")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_s07 <- path_resrepo("data/intermediate/s07_compare_mediterranean")
+dir_s13 <- path_resrepo("data/intermediate/s13_compare_matched_climates")
+dir_data_intermediate <- path_resrepo("data/intermediate/s27_test_ant_communities")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# A GLAD spreadsheet from the Kass archive, extracted to a temporary folder
+read_glad <- function(name) {
+  out <- unzip(file.path(dir_data_raw, kass_zip), files = glad_files[[name]], exdir = tempdir(),
+               junkpaths = TRUE)
+  on.exit(unlink(out))
+  as.data.table(suppressMessages(readxl::read_excel(out, guess_max = 60000)))
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          panel.grid.major.y = element_blank(),
+          plot.title = element_text(face = "bold", size = base_size + 0.5),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom", plot.tag = element_text(face = "bold", size = 11))
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Local ant communities
+
+*Inputs:* raw/ants_kass2022/main_analysis_data.zip (GLAD tables); s01/climate_present_10m.tif; s13/pixel_strata.rds
+*Outputs:* glad_localities.csv
+
+```{r communities}
+ob <- read_glad("observations")
+ob <- ob[, .(locality = `Locality ID`, lat = as.numeric(Latitude), lon = as.numeric(Longitude),
+             genus = fifelse(is.na(Genus.corrected), Genus, Genus.corrected),
+             species = fifelse(is.na(Gen.sp.corrected), paste(Genus, Species), Gen.sp.corrected),
+             measure = `Measurement Type`, abundance = suppressWarnings(as.numeric(Abundance)))]
+ob <- ob[is.finite(lat) & is.finite(lon) & !is.na(genus)]
+
+# --- Per locality: species of the partner genera, individuals of the partner genera and the
+# share of the most abundant species (where abundances were counted). Abundance-based measures
+# use only localities whose measurement type is "Abundance": in "Abundance/Occurrence" localities
+# the values may count samples in which a species occurred rather than individuals ---
+print(ob[, .(localities = uniqueN(locality)), by = measure])
+loc <- ob[, {
+  counted <- all(measure == "Abundance", na.rm = TRUE) && any(!is.na(measure))
+  ab <- if (!counted || all(is.na(abundance)) || sum(abundance, na.rm = TRUE) <= 0) NA_real_ else
+    sum(abundance, na.rm = TRUE)
+  by_sp <- .SD[is.finite(abundance), .(a = sum(abundance)), by = species]
+  list(lat = lat[1], lon = lon[1], species_n = uniqueN(species),
+       partner_species_share = mean(unique(.SD[, .(species, genus)])$genus %in% partner_genera),
+       partner_abundance_share = if (is.na(ab)) NA_real_ else
+         sum(abundance[genus %in% partner_genera], na.rm = TRUE) / ab,
+       dominance = if (is.na(ab) || nrow(by_sp) < 2) NA_real_ else max(by_sp$a) / sum(by_sp$a),
+       individuals = ab)
+}, by = locality]
+loc <- loc[species_n >= min_species_locality]
+
+# --- Region, Mediterranean-climate region and hexagon of each locality ---
+template <- rast(file.path(dir_s01, "climate_present_10m.tif"))[[1]]
+pix <- readRDS(file.path(dir_s13, "pixel_strata.rds"))[, .(cell, region = as.character(region),
+                                                           med_region = as.character(med_region))]
+loc[, cell := cellFromXY(template, cbind(lon, lat))]
+loc <- merge(loc, pix, by = "cell", all.x = TRUE)
+dg <- dgconstruct(res = 5)
+loc[, hex := dgGEO_to_SEQNUM(dg, lon, lat)$seqnum]
+write_table(loc, file.path(dir_data_intermediate, "glad_localities.csv"))
+print(loc[!is.na(region), .(localities = .N, with_abundance = sum(!is.na(dominance)),
+                            partner_species = median(partner_species_share),
+                            partner_abundance = median(partner_abundance_share, na.rm = TRUE),
+                            dominance = median(dominance, na.rm = TRUE)), by = region][
+  order(factor(region, region_levels))], digits = 2)
+```
+
+```{r clear_communities, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Regions and Mediterranean-climate regions
+
+Medians over the localities of each region, with 95% intervals from resampling localities, beside the obligate share of the region's classified species (`s05`) or Mediterranean-climate pool (`s07`).
+
+*Inputs:* s27/glad_localities.csv; s05/species_regions.csv; s07/mediterranean_pool_species.csv
+*Outputs:* region_communities.csv
+
+```{r regions}
+loc <- fread(file.path(dir_data_intermediate, "glad_localities.csv"))
+sp <- fread(file.path(dir_s05, "species_regions.csv"))[interaction_type %in% c("n", "f", "m", "p")]
+med <- fread(file.path(dir_s07, "mediterranean_pool_species.csv"))[
+  interaction_type %in% c("n", "f", "m", "p")]
+obl <- rbind(sp[, .(obligate_share = mean(interaction_type %in% c("m", "p"))), by = .(unit = region)],
+             med[, .(obligate_share = mean(interaction_type %in% c("m", "p"))),
+                 by = .(unit = med_region)])
+
+boot_median <- function(x, reps = 1000) {
+  x <- x[is.finite(x)]
+  if (length(x) < 3) return(c(NA_real_, NA_real_))
+  quantile(replicate(reps, median(x[sample.int(length(x), replace = TRUE)])), c(0.025, 0.975))
+}
+set.seed(20261029)
+summarise_units <- function(d, unit_col, level) {
+  d[!is.na(get(unit_col)) & get(unit_col) != "", {
+    ps <- boot_median(partner_species_share)
+    pa <- boot_median(partner_abundance_share)
+    dm <- boot_median(dominance)
+    list(level = level, localities = .N, with_abundance = sum(is.finite(partner_abundance_share)),
+         partner_species = median(partner_species_share), partner_species_low = ps[1],
+         partner_species_high = ps[2],
+         partner_abundance = median(partner_abundance_share, na.rm = TRUE),
+         partner_abundance_low = pa[1], partner_abundance_high = pa[2],
+         dominance = median(dominance, na.rm = TRUE), dominance_low = dm[1],
+         dominance_high = dm[2])
+  }, by = .(unit = get(unit_col))]
+}
+reg <- rbind(summarise_units(loc, "region", "Biogeographic region"),
+             summarise_units(loc, "med_region", "Mediterranean-climate region"))
+reg <- merge(reg, obl, by = "unit", all.x = TRUE)
+write_table(reg, file.path(dir_data_intermediate, "region_communities.csv"))
+print(reg[, .(level, unit, localities, with_abundance, partner_species = round(partner_species, 2),
+              partner_abundance = round(partner_abundance, 2), dominance = round(dominance, 2),
+              obligate_share = round(obligate_share, 2))][order(level, -obligate_share)])
+cat("Spearman correlation across the eight regions, obligate share against:\n")
+r8 <- reg[level == "Biogeographic region" & localities >= 10]
+print(sapply(c("partner_species", "partner_abundance", "dominance"),
+             function(v) cor(r8$obligate_share, r8[[v]], method = "spearman")))
+
+# --- Dominance depends on how many species and individuals a sample holds: the region effects
+# on the logit of dominance given log species and log individuals, against the Palaearctic ---
+dl <- loc[is.finite(dominance) & dominance > 0 & dominance < 1 & !is.na(region) & region != "" &
+            is.finite(individuals) & individuals > 0]
+dl[, region := relevel(factor(region), ref = "Palearctic")]
+m <- lm(qlogis(dominance) ~ region + log(species_n) + log(individuals), data = dl)
+dom_adj <- as.data.table(summary(m)$coefficients, keep.rownames = "term")[grepl("^region", term)]
+setnames(dom_adj, c("term", "estimate", "se", "t", "p"))
+dom_adj[, `:=`(region = sub("^region", "", term), localities = nrow(dl))]
+write_table(dom_adj, file.path(dir_data_intermediate, "dominance_adjusted.csv"))
+print(dom_adj[, .(region, estimate, se, p)], digits = 2)
+```
+
+```{r clear_regions, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Hexagons
+
+Hexagons with at least `r min_localities_hex` GLAD localities and `r min_classified_hex` classified lycaenid species: binomial regressions (quasi-binomial) of the obligate share of the hexagon's associated lycaenid species on the median partner share of its ant communities, without and with region, for the species share of the partner genera and, where available, their abundance share.
+
+*Inputs:* s27/glad_localities.csv; s05/cell_data_hex5.csv
+*Outputs:* hex_communities.csv, hex_models.csv
+
+```{r hexagons}
+loc <- fread(file.path(dir_data_intermediate, "glad_localities.csv"))
+cells <- fread(file.path(dir_s05, "cell_data_hex5.csv"))
+hx <- loc[, .(localities = .N, partner_species = median(partner_species_share),
+              partner_abundance = median(partner_abundance_share, na.rm = TRUE),
+              dominance = median(dominance, na.rm = TRUE)), by = hex]
+hx <- merge(hx[localities >= min_localities_hex], cells, by.x = "hex", by.y = "cell_id")
+hx <- hx[n_classified >= min_classified_hex & (n_f + n_m + n_p) > 0]
+hx[, `:=`(associated = n_f + n_m + n_p, obligate = n_m + n_p, region = factor(region))]
+write_table(hx, file.path(dir_data_intermediate, "hex_communities.csv"))
+
+fit <- function(v, with_region) {
+  d <- hx[is.finite(get(v))]
+  d[, z := as.numeric(scale(get(v)))]
+  f <- if (with_region) cbind(obligate, associated - obligate) ~ z + region else
+    cbind(obligate, associated - obligate) ~ z
+  m <- glm(f, data = d, family = quasibinomial)
+  cf <- summary(m)$coefficients["z", ]
+  data.table(measure = v, given_region = with_region, hexagons = nrow(d), estimate = cf[[1]],
+             se = cf[[2]], p = cf[[4]])
+}
+models <- rbindlist(lapply(c("partner_species", "partner_abundance", "dominance"), function(v)
+  rbind(fit(v, FALSE), fit(v, TRUE))))
+write_table(models, file.path(dir_data_intermediate, "hex_models.csv"))
+print(models, digits = 3)
+```
+
+```{r clear_hexagons, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) Median share of the individuals of local ant communities belonging to *Crematogaster* or *Camponotus*, in each region (95% intervals from resampling localities; labels: localities with abundances), against the region's obligate share. (b) The same for the species share. (c) The Mediterranean-climate regions. (d) Hexagons: obligate share of the associated lycaenid species against the median partner abundance share of the hexagon's ant communities.
+
+*Inputs:* s27/ region_communities.csv, hex_communities.csv
+*Outputs:* plot_ant_communities.png
+
+```{r plot_ant_communities}
+reg <- fread(file.path(dir_data_intermediate, "region_communities.csv"))
+hx <- fread(file.path(dir_data_intermediate, "hex_communities.csv"))
+r8 <- reg[level == "Biogeographic region" & localities >= 10]
+r8[, label := region_short[unit]]
+point_panel <- function(d, x, lo, hi, xlab, title) {
+  ggplot(d, aes(100 * get(x), 100 * obligate_share)) +
+    geom_errorbar(aes(xmin = 100 * get(lo), xmax = 100 * get(hi)), width = 0, colour = "grey60",
+                  orientation = "y") +
+    geom_point(size = 2.4, colour = "#E69F00") +
+    geom_text(aes(label = label), size = 2.6, vjust = -0.9, colour = "grey25") +
+    labs(x = xlab, y = "Obligate share of classified lycaenids (%)", title = title) +
+    theme_figure() + theme(panel.grid.major.y = element_line(colour = "grey92"))
+}
+panel_a <- point_panel(r8, "partner_abundance", "partner_abundance_low", "partner_abundance_high",
+                       "Crematogaster and Camponotus, share of individuals (%)", "Abundance of partner genera")
+panel_b <- point_panel(r8, "partner_species", "partner_species_low", "partner_species_high",
+                       "Crematogaster and Camponotus, share of species (%)", "Species of partner genera")
+md <- reg[level == "Mediterranean-climate region"]
+md[, label := unit]
+panel_c <- point_panel(md, "partner_abundance", "partner_abundance_low", "partner_abundance_high",
+                       "Crematogaster and Camponotus, share of individuals (%)",
+                       "Mediterranean-climate regions")
+hx[, region := factor(region_short[region], region_short[region_levels])]
+panel_d <- ggplot(hx[is.finite(partner_abundance)], aes(100 * partner_abundance,
+                                                        100 * (n_m + n_p) / (n_f + n_m + n_p),
+                                                        colour = region)) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  scale_colour_manual(values = c("#3B3B3B", "#56B4E9", "#009E73", "#F0E442", "#E69F00",
+                                 "#0072B2", "#D55E00", "#CC79A7"), name = NULL) +
+  labs(x = "Partner genera, share of individuals (%)",
+       y = "Obligate share of associated lycaenids (%)", title = "Hexagons") +
+  theme_figure() + theme(panel.grid.major.y = element_line(colour = "grey92"))
+fig <- (panel_a | panel_b) / (panel_c | panel_d) +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")")
+save_figure(fig, "plot_ant_communities", 10, 8.5)
+fig
+```
+
+```{r clear_plot_ant_communities, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

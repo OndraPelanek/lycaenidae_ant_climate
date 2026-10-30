@@ -14,6 +14,12 @@ Each folder of `data/raw` has a `README.md` that describes its files and the not
 - `soil_phosphorus_he2021_stp.0-10cm.tif`: soil total phosphorus at 0-10 cm and 0.5° (He et al. 2021; downloaded manually from figshare), read by s08
 - `gfed5/`: GFED5 monthly burned area, 1997-2020
 - `ants_kass2022/`: the main analysis data of Kass et al. (2022, Dryad), downloaded manually; s21 reads the estimated ant species and genus richness rasters and the filtered species- and genus-level GABI records directly from `main_analysis_data.zip`
+- `ants_bellroberts2024/`: the supplementary tables of Bell-Roberts et al. (2024, Nature Ecology & Evolution), downloaded from the GitHub repository of the paper; colony size, queen number and worker castes of ant species (Supplementary Table 20) and supercolonial and parasitic species (Table 21)
+- `butterflies_kawahara2023/`: two members of the Figshare archive of Kawahara et al. (2023): the treePL-dated trees (`Data.S22.treePL.zip`) and the tip-label table (`Data.S9.tips_fullname_mod_prob.csv`), extracted from the 1.4-GB `Data_S1-S28.zip` with HTTP range requests
+- `landcover_earthenv2014/`: classes 1-7 of the global 1-km consensus land cover of Tuanmu & Jetz (2014, EarthEnv, reduced version), percentage cover of four tree classes, shrubs, herbaceous and cultivated vegetation; aggregated to 10 arc-minutes by s31
+- `butterflies_gbif_density/`: records of all butterflies (Hesperiidae, Lycaenidae, Nymphalidae, Papilionidae, Pieridae, Riodinidae) per 10-arc-minute pixel of the Old World, counted from GBIF's public occurrence-density map tiles (zoom 4, EPSG:4326; georeferenced records without geospatial issues; the bases of record and years of the cleaned lycaenid records), and the records of each focal species of s36 within its extent; and of every facultative species and obligate mutualist of the subfamilies with obligate mutualists (`species_counts_10m.csv.gz`, s37); fetched on first run (`fetch_log.csv` gives the query and date)
+- `etopo1/`: ETOPO1 global relief (NOAA National Geophysical Data Center 2009) subsampled to 10 arc-minutes from the NOAA ERDDAP server (`etopo180`), for the landmasses of the glacial shelf (s35)
+- `natural_history/`: data-entry templates (empty) for the larval natural history of the dry-niche contrast species and the traits of their partner ants, written by s39, to be filled from the original literature with sources
 - `literature/pdfs/`: open-access PDFs of the papers of the literature review (see `writing/literature_review.md`); for reading only
 
 ## Generated data
@@ -218,3 +224,133 @@ The GBIF records in `butterfly_ant_interactions/records_final.rds` are licensed 
 | File | Contents | Read by |
 |---|---|---|
 | `figure_2_shared_climates.png`, `figure_3_lineage_climate.png`, `figure_4_remaining_signal.png` | Main figures 2–4 of the paper (Fig. 1 is `s16/plot_world_strategies.png`) | paper |
+
+### Files of `s23_test_dispersal/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `genus_spread.csv`, `spread_models.csv` | Regions and hexagons occupied by every genus, with strategy, stem age and species; effects of obligacy on spread across models | big-picture plan |
+| `range_models.csv`, `range_mixed_genera.csv` | Effect of obligacy on species range area given region and lineage, and within mixed genera; median ranges of obligate and facultative congeners | big-picture plan |
+| `obligate_genera_regions.csv`, `plot_dispersal.png` | Obligate genera found in more than one region, with their species per region; figure | big-picture plan |
+
+### Files of `s24_compare_all_climates/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `all_pairs.csv`, `all_pairs_shares.csv` | Standardised obligate share and its difference for every pair of regions within their shared climate strata, with genus-bootstrap intervals and the area and species retained; the share of each strategy | big-picture plan |
+| `all_pairs_summary.csv`, `plot_all_climates.png` | Summary by group of pairs; figure | big-picture plan |
+
+### Files of `s25_test_convergence/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `convergence_trees.rds` | Tree of genera and matched-only Yumnam tree with obligacy and region group of each tip | s25 |
+| `gain_rates.csv`, `rate_summary.csv`, `ratio_null.csv` | Origins of obligacy, non-obligate lineage time and rates per region group and pair of maps; summaries with the southern rate ratio and its permutation null | paper |
+| `gain_ages.csv`, `plot_convergence.png` | Age of every origin by region group; figure | paper |
+
+### Files of `s26_test_knowledge/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `knowledge_regions.csv`, `sampling_effects.csv`, `plot_knowledge.png` | Obligate share of each region under four knowledge filters with completeness and upper bound; GBIF records of obligate against facultative species; figure | paper |
+
+### Files of `s27_test_ant_communities/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `glad_localities.csv` | Every GLAD locality with at least three species: partner-genus species and abundance shares, dominance, region and hexagon | s27 |
+| `region_communities.csv`, `hex_communities.csv`, `hex_models.csv`, `plot_ant_communities.png` | Medians by region and Mediterranean-climate region; hexagon table and models against the obligate share of lycaenids; figure | paper |
+
+### Files of `s28_test_robustness/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `flexible_climate.csv` | Held-out deviance explained and AUC of linear and flexible climate models and lineage, for held-out realms and subfamilies, with all and species-specific evidence | paper, s22 |
+| `shared_climates_specific.csv` | Standardised obligate contrasts within shared climates with all and species-specific evidence | paper |
+| `species_drought_balance.csv`, `drought_robustness.csv`, `drought_logo.csv`, `drought_genera.csv`, `drought_genus_balanced.csv` | Water-deficit months of each species; effects of dry and water-deficit months given region and lineage and in phylogenetic regressions; leave-one-genus-out estimates; genus-balanced differences | paper, s22 |
+| `plot_robustness.png` | Figure | paper |
+
+### Files of `s35_prepare_dry_niche/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `focal_species.csv` | Facultative species and obligate mutualists of the genera with both, with evidence basis and the extent of their records | s35, s36 |
+| `accessible_areas.csv` | Accessible area of every land pixel of the eight regions: realms on glacial-shelf landmasses (primary), on present-day landmasses, and the study's regions | s35 |
+| `dry_niche_pixels.rds` | Every land pixel of the eight regions: accessible areas, dry months, climatic water deficit, water-deficit months, months below 50 mm, seasonality, driest-month precipitation, temperature, pixel area and butterfly records | s36 |
+| `coverage.csv`, `plot_coverage.png` | Share of land pixels with butterfly records by accessible area and dry months; figure | s36, manuscript |
+
+### Files of `s36_test_dry_niche/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `eligibility.csv`, `eligible_units.csv` | Every species of the mixed genera with its occupied pixels per accessible area and eligibility at 10, 20 and 30 pixels; the eligible species-area units under each area definition | s36, paper |
+| `pilot_estimates.csv` | Pilot fits for *Arhopala*, *Hypochrysops* and *Ogyris* with a raw check | s36 |
+| `species_estimates.csv` | Presence-background (point-process) coefficients of every unit, model, background, area definition and resolution, signed so that positive means drier | s36, paper |
+| `response_curves.csv` | Penalised response shapes along dry months (primary settings) | s36 |
+| `comparison_summary.csv`, `comparison_genera.csv`, `comparison_units.csv` | Mutualists minus facultative congeners: pooled over genera, per genus and per genus-area unit, for every setting (measures, backgrounds, thresholds, areas, resolution, evidence, overlap, leave one genus out); hierarchical and phylogenetic meta-analyses | paper, s22 |
+| `direct_comparison.csv`, `direct_units.csv` | Comparison without a background: which strategy an occupied pixel belongs to | paper |
+| `blocked_cv.csv` | Spatially blocked cross-validation: AUC with temperature alone and with dry months | paper |
+| `outcome.csv` | Outcome under the pre-specified rules | paper |
+| `plot_dry_niche_genera.png`, `plot_dry_niche_robustness.png`, `plot_dry_niche_species.png` | Figures | paper, s22 |
+
+### Files of `s37_test_dry_niche_v2/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `candidate_species.csv` | Facultative species and obligate mutualists of the subfamilies with obligate mutualists, with the extent of their records | s37 |
+| `presences.csv` | Occupied pixels of every candidate species: cleaned records and GBIF records within 100 km of them in the same accessible area | s37 |
+| `contrasts.csv` | Species-area units of every contrast, with cleaned or supplemented occurrences, within genera or one per origin | s37, paper |
+| `species_estimates.csv`, `two_stage_summary.csv`, `two_stage_origins.csv` | Point-process coefficients of every unit; two-stage comparison pooled over origins and per origin, for each step, background and model | paper, s22 |
+| `joint_estimates.csv`, `joint_leave_one_out.csv`, `bootstrap.csv`, `joint_data_primary.rds` | Joint-model estimates of the mutualist-minus-facultative difference for each step, background and model; leaving out each origin; cluster bootstrap over origins; the data of the primary model | paper |
+| `outcome.csv` | Outcome under the rules declared before analysis | paper |
+| `plot_dry_niche_origins.png`, `plot_dry_niche_steps.png` | Figures | paper, s22 |
+
+### Files of `s38_diagnose_identifiability/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `mechanism_pixels.rds` | Land pixels with temperature, the longest run of months below 50 mm, the climatic water deficit, dry months and months below 50 mm | s39, s41, s42, s44 |
+| `contrast_pixels.rds`, `identifiability.csv` | Occupied pixels of every contrast; identifiability diagnostics per contrast and variable | s41, paper |
+| `plot_environment_space_run.png`, `plot_environment_space_cwd.png` | Figures | paper |
+
+### Files of `s39_audit_occurrences_origins/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `supplement_pixels.csv`, `supplement_species.csv` | Every GBIF pixel added in s37 with what the parent cleaning did there; per species summaries | s41, paper |
+| `supplement_decomposition.csv`, `supplement_influence.csv` | Pooled estimate with cleaned records, re-estimated species and newly eligible species; influence of each unit | paper |
+| `gbif_added_facets.csv`, `provenance_summary.csv` | GBIF providers, bases of record, years and issues of the added records of the most influential species (cached) | s39 |
+| `origins.csv` | Balance and separate mutualist clades of every contrast | paper |
+| `plot_supplement_audit.png` | Figure | paper |
+
+### Files of `s40_simulate_power/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `power_parameters.csv`, `power_species.rds`, `power.csv`, `plot_power.png` | Estimated variance structure; power and interval width per scenario; figure | paper |
+
+### Files of `s41_test_matched_case_case/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `case_pixels.rds`, `variable_sds.rds` | Occupied pixels of every setting with climate and biome | s41 |
+| `species_scores.csv`, `case_summary.csv`, `case_origins.csv` | Species scores; pooled and per-origin differences for every setting and hypothesis | paper, s22 |
+| `plot_case_origins.png`, `plot_case_sensitivity.png` | Figures | paper |
+
+### Files of `s42_test_four_strategies/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `species_mechanisms.csv`, `strategy_effects.csv`, `plot_four_strategies.png` | Species medians of the three variables; effects on the four nested contrasts; figure | paper |
+
+### Files of `s43_decompose_southern_faunas/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `species_sets.csv`, `decomposition.csv`, `null_shares.csv`, `plot_southern_decomposition.png` | Species sets; decomposition of every fauna; lineage-conserving null; figure | paper |
+
+### Files of `s44_test_confinement_contrasts/`
+
+| File | Contents | Read by |
+|---|---|---|
+| `genus_responses.csv`, `sister_clades.csv`, `contrast_values.csv`, `contrast_tests.csv`, `plot_confinement_contrasts.png` | Responses per genus; sister clades on both trees; contrasts and tests; figure | paper |

@@ -297,7 +297,7 @@ invisible(gc())
 
 # Figure
 
-(A) The effect of precipitation seasonality on the three contrasts across the controls and subsets (filled: p < 0.05; intervals truncated at ±2.8; labels give events and species). (B) Deviance explained in each held-out subfamily by the predictor sets, against the prevalence baseline (zero). (C) In each genus with both obligate and facultative species, the median precipitation seasonality of its obligate against its facultative species (point size: obligate species).
+(A) The effect of precipitation seasonality on the three contrasts across the controls and subsets (filled: p < 0.05; full 95% intervals on a pseudo-logarithmic axis; labels give events and species). (B) Deviance explained in each held-out subfamily by the predictor sets, against the prevalence baseline (zero). (C) In each genus with both obligate and facultative species, the median precipitation seasonality of its obligate against its facultative species (point size: obligate species).
 
 *Inputs:* s11/ seasonality_effects.csv, subfamily_transfer.csv, mixed_genera.csv
 *Outputs:* plot_seasonality.png
@@ -307,7 +307,9 @@ effects <- fread(file.path(dir_data_intermediate, "seasonality_effects.csv"))
 transfer <- fread(file.path(dir_data_intermediate, "subfamily_transfer.csv"))
 mixed <- fread(file.path(dir_data_intermediate, "mixed_genera.csv"))
 contrast_labels <- sapply(contrasts, `[[`, "label")
-ci_limit <- 2.8
+# Full intervals on a pseudo-logarithmic axis (linear near zero), so that the wide intervals of
+# small subsets do not hide the others
+effect_axis <- scales::pseudo_log_trans(sigma = 0.5)
 
 # --- A: effects across controls and subsets ---
 order <- unique(effects$analysis)
@@ -315,17 +317,17 @@ effects[, `:=`(analysis = factor(analysis, rev(order)),
                contrast = factor(contrast_labels[contrast], contrast_labels),
                fill_key = ifelse(p < 0.05, "p < 0.05", "p >= 0.05"),
                label = paste0(events, "/", species),
-               lower = pmax(estimate - 1.96 * se, -ci_limit),
-               upper = pmin(estimate + 1.96 * se, ci_limit))]
+               lower = estimate - 1.96 * se, upper = estimate + 1.96 * se)]
+label_x <- max(effects$upper) * 1.6
 panel_a <- ggplot(effects, aes(estimate, analysis)) +
   geom_vline(xintercept = 0, colour = "grey55", linewidth = 0.4) +
   geom_errorbar(aes(xmin = lower, xmax = upper), width = 0, linewidth = 0.45,
                 orientation = "y") +
   geom_point(aes(fill = fill_key), shape = 21, size = 1.8, stroke = 0.5) +
-  geom_text(aes(x = ci_limit + 0.25, label = label), hjust = 0, size = 2.1, colour = "grey40") +
+  geom_text(aes(x = label_x, label = label), hjust = 0, size = 2.1, colour = "grey40") +
   facet_wrap(~ contrast, nrow = 1) +
-  scale_x_continuous(breaks = -2:2) +
-  coord_cartesian(xlim = c(-ci_limit, ci_limit + 1.6)) +
+  scale_x_continuous(trans = effect_axis, breaks = c(-10, -3, -1, 0, 1, 3, 10),
+                     expand = expansion(mult = c(0.05, 0.25))) +
   scale_fill_manual(values = c(`p < 0.05` = "black", `p >= 0.05` = "white"), name = NULL) +
   labs(x = "Effect of precipitation seasonality (log odds per SD, 95% CI)", y = NULL,
        title = "Seasonality under strong controls") +

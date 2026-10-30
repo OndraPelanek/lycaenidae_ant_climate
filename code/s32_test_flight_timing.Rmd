@@ -1,0 +1,292 @@
+---
+title: "Lycaenidae ant-interaction climate 32 - adult flight and the dry season"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+Obligate mutualists occupy places with longer and harsher dry seasons than their surroundings (`s29`, `s31`). If larvae tended by ants are protected through the dry season (Cottrell 1984), their development should overlap the dry season more in obligate mutualists than in facultative relatives. Larval dates are not recorded, but adults are: the months of the occurrence records of a species are, for most lycaenids, the months of its adult flight, which follows larval development. This notebook asks whether obligate mutualists fly in or just after the dry months of their places more than facultative species do. It is an indirect test: the interval between larval development and adult flight varies, and record months also reflect when collectors are active.
+
+1. **Flight months.** For every associated species, the number of its GBIF records in each calendar month (records with coordinates, from the GBIF occurrence API, queried by the species' GBIF key, the `pool_key` of the analysis), restricted to its main hemisphere (that of the median latitude of its records), so that the seasons of the two hemispheres are not mixed.
+2. **Dry calendar.** For every species and calendar month, the share of its record pixels in which the month is dry (precipitation in mm below twice the mean temperature in °C; WorldClim 2.1 monthly climate, as in `s19`).
+3. **Flight in the dry season.** The share of a species' records falling in dry months (each month weighted by its dry share), minus the share expected if records were spread evenly over the year; and the same for the months following dry months by one and by two months (adults emerging from larvae that developed during the dry season).
+4. **Tests.** Each measure related to obligate mutualism and to obligacy given region and lineage, and within the genera containing both outcomes (conditional logistic regression on genus), for species with at least 20 dated records.
+
+A full run takes about 10 min (most of it querying GBIF; the responses are cached in this notebook's folder, so later runs read the cache).
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(jsonlite)
+library(mgcv)
+library(survival)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+contrasts <- list(mutualist = list(rows = c("f", "m"), success = "m",
+                                   label = "Obligate mutualist vs facultative"),
+                  obligate = list(rows = c("f", "m", "p"), success = c("m", "p"),
+                                  label = "Obligate vs facultative"))
+min_records <- 20
+measures <- c(dry_flight = "In dry months", lag1_flight = "One month after dry months",
+              lag2_flight = "Two months after dry months")
+gbif_api <- "https://api.gbif.org/v1/occurrence/search"
+type_colours <- c(f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s29 <- path_resrepo("data/intermediate/s29_test_dry_availability")
+dir_data_intermediate <- path_resrepo("data/intermediate/s32_test_flight_timing")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Monthly WorldClim layers (as in s28)
+read_monthly <- function(variable) {
+  zip <- file.path(dir_data_raw, "worldclim_2.1", paste0("wc2.1_10m_", variable, ".zip"))
+  files <- sort(grep("\\.tif$", unzip(zip, list = TRUE)$Name, value = TRUE))
+  rast(file.path("/vsizip", zip, files))
+}
+# Records per calendar month of one species in one hemisphere (GBIF occurrence API, month facet)
+month_counts <- function(key, south) {
+  lat <- if (south) "-90,0" else "0,90"
+  url <- sprintf("%s?taxonKey=%s&hasCoordinate=true&hasGeospatialIssue=false&decimalLatitude=%s&facet=month&facetLimit=12&limit=0",
+                 gbif_api, key, lat)
+  res <- tryCatch(fromJSON(url), error = function(e) NULL)
+  Sys.sleep(0.1)
+  out <- data.table(month = 1:12, n = 0)
+  # A species without records in the hemisphere returns no facet, or an empty list
+  counts <- if (is.null(res) || !length(res$facets)) NULL else res$facets$counts[[1]]
+  if (!is.data.frame(counts) || !nrow(counts)) return(out)
+  f <- as.data.table(counts)
+  out[match(as.integer(f$name), month), n := f$count]
+  out
+}
+contrast_data <- function(sp, ct) {
+  d <- copy(sp[interaction_type %in% contrasts[[ct]]$rows])
+  d[, y := as.integer(interaction_type %in% contrasts[[ct]]$success)]
+  d[, `:=`(genus = factor(genus), subfamily = factor(subfamily), region = factor(region))]
+  d
+}
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom", plot.tag = element_text(face = "bold", size = 11))
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Dry calendar of each species
+
+*Inputs:* raw/worldclim_2.1/ monthly prec, tmin, tmax; s02/species_records.rds; s29/species_availability.csv
+*Outputs:* species_dry_calendar.csv
+
+```{r dry_calendar}
+sp <- fread(file.path(dir_s29, "species_availability.csv"), colClasses = c(pool_key = "character"))[
+  grain == "hex5", .(pool_key, species, genus, subfamily, region, interaction_type)]
+rec <- readRDS(file.path(dir_s02, "species_records.rds"))
+rec[, pool_key := as.character(pool_key)]
+rec <- rec[pool_key %in% sp$pool_key]
+prec <- read_monthly("prec")
+rec[, cell := cellFromXY(prec, cbind(decimalLongitude, decimalLatitude))]
+lat <- rec[, .(south = median(decimalLatitude) < 0), by = pool_key]
+# Only the record pixels of the species' main hemisphere, matching the GBIF month counts
+rec <- merge(rec, lat, by = "pool_key")
+px <- unique(rec[!is.na(cell) & (decimalLatitude < 0) == south, .(pool_key, cell)])
+cells <- unique(px$cell)
+P <- as.matrix(prec[cells])
+Tm <- (as.matrix(read_monthly("tmin")[cells]) + as.matrix(read_monthly("tmax")[cells])) / 2
+dry <- data.table(cell = cells, (P < 2 * Tm) * 1)
+setnames(dry, c("cell", paste0("m", 1:12)))
+cal <- merge(px, dry, by = "cell")[, lapply(.SD, mean, na.rm = TRUE), by = pool_key,
+                                    .SDcols = paste0("m", 1:12)]
+cal <- merge(cal, lat, by = "pool_key")
+write_table(cal, file.path(dir_data_intermediate, "species_dry_calendar.csv"))
+print(cal[, .(species = .N, south = sum(south), mean_dry_months = mean(rowSums(.SD))),
+          .SDcols = paste0("m", 1:12)])
+```
+
+```{r clear_dry_calendar, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Flight months from GBIF
+
+Queried once and cached (`gbif_month_counts.csv`); delete the file to query again.
+
+*Inputs:* s32/species_dry_calendar.csv; GBIF occurrence API
+*Outputs:* gbif_month_counts.csv
+
+```{r gbif_months}
+cache <- file.path(dir_data_intermediate, "gbif_month_counts.csv")
+cal <- fread(file.path(dir_data_intermediate, "species_dry_calendar.csv"),
+             colClasses = c(pool_key = "character"))
+if (!file.exists(cache)) {
+  mc <- rbindlist(lapply(seq_len(nrow(cal)), function(i)
+    month_counts(cal$pool_key[i], cal$south[i])[, pool_key := cal$pool_key[i]]))
+  mc[, queried := as.character(Sys.Date())]
+  write_table(mc, cache)
+}
+mc <- fread(cache, colClasses = c(pool_key = "character"))
+print(mc[, .(records = sum(n)), by = pool_key][, .(species = .N, with_20 = sum(records >= min_records),
+                                                    median_records = median(records))])
+```
+
+```{r clear_gbif_months, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Flight in and after the dry season
+
+*Inputs:* s32/ species_dry_calendar.csv, gbif_month_counts.csv; s29/species_availability.csv
+*Outputs:* species_flight.csv, flight_effects.csv
+
+```{r flight}
+cal <- fread(file.path(dir_data_intermediate, "species_dry_calendar.csv"),
+             colClasses = c(pool_key = "character"))
+mc <- fread(file.path(dir_data_intermediate, "gbif_month_counts.csv"),
+            colClasses = c(pool_key = "character"))
+sp <- fread(file.path(dir_s29, "species_availability.csv"), colClasses = c(pool_key = "character"))[
+  grain == "hex5", .(pool_key, species, genus, subfamily, region, interaction_type)]
+d <- melt(cal, id.vars = c("pool_key", "south"), measure.vars = paste0("m", 1:12),
+          variable.name = "month", value.name = "dry")
+d[, month := as.integer(sub("m", "", month))]
+setorder(d, pool_key, month)
+# Dryness of the previous one and two months (circular)
+d[, `:=`(dry_lag1 = dry[c(12, 1:11)], dry_lag2 = dry[c(11, 12, 1:10)]), by = pool_key]
+d <- merge(d, mc[, .(pool_key, month, n)], by = c("pool_key", "month"))
+fl <- d[, .(records = sum(n),
+            dry_flight = sum(n * dry) / sum(n) - mean(dry),
+            lag1_flight = sum(n * dry_lag1) / sum(n) - mean(dry_lag1),
+            lag2_flight = sum(n * dry_lag2) / sum(n) - mean(dry_lag2),
+            dry_months = sum(dry)), by = pool_key]
+fl <- merge(sp, fl, by = "pool_key")[records >= min_records & dry_months > 0]
+write_table(fl, file.path(dir_data_intermediate, "species_flight.csv"))
+print(fl[, lapply(.SD, mean), by = interaction_type, .SDcols = c(names(measures), "records")],
+      digits = 2)
+
+lineage <- "s(subfamily, bs = 're') + s(genus, bs = 're')"
+effects <- rbindlist(lapply(names(contrasts), function(ct) {
+  d0 <- contrast_data(fl, ct)
+  rbindlist(lapply(names(measures), function(v) {
+    dd <- copy(d0)
+    dd[, x := as.numeric(scale(get(v)))]
+    m <- gam(as.formula(paste("y ~ region + x +", lineage)), data = dd, family = binomial,
+             method = "REML")
+    pt <- summary(m)$p.table["x", ]
+    mixed <- dd[, .(both = uniqueN(y) == 2), by = genus][both == TRUE]$genus
+    dw <- droplevels(dd[genus %in% mixed])
+    dw[, xw := as.numeric(scale(get(v)))]
+    cf <- summary(clogit(y ~ xw + strata(genus), data = dw))$coefficients
+    rbind(data.table(analysis = "Given region and lineage", estimate = pt[[1]], se = pt[[2]],
+                     p = pt[[4]], species = nrow(dd), genera = uniqueN(dd$genus)),
+          data.table(analysis = "Within genera", estimate = cf[1, "coef"], se = cf[1, "se(coef)"],
+                     p = cf[1, "Pr(>|z|)"], species = nrow(dw), genera = length(mixed)))[
+      , `:=`(contrast = ct, measure = v)]
+  }))
+}))
+write_table(effects, file.path(dir_data_intermediate, "flight_effects.csv"))
+print(effects, digits = 2)
+```
+
+```{r clear_flight, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) Share of each species' records in dry months (and in the one and two months after dry months) beyond the share expected from an even spread over the year, for facultative species, obligate mutualists and obligate parasites with at least 20 dated records; points: species. (b) Effect of each measure on obligate mutualism and on obligacy, given region and lineage and within genera (log odds per SD, 95% intervals).
+
+*Inputs:* s32/ species_flight.csv, flight_effects.csv
+*Outputs:* plot_flight_timing.png
+
+```{r plot_flight_timing}
+fl <- fread(file.path(dir_data_intermediate, "species_flight.csv"))
+ef <- fread(file.path(dir_data_intermediate, "flight_effects.csv"))
+long <- melt(fl, id.vars = c("pool_key", "interaction_type"), measure.vars = names(measures),
+             variable.name = "measure")
+long[, `:=`(measure = factor(measures[as.character(measure)], measures),
+            interaction_type = factor(interaction_type, c("f", "m", "p"),
+                                      c("Facultative", "Obligate mutualist", "Obligate parasite")))]
+panel_a <- ggplot(long, aes(100 * value, interaction_type, colour = interaction_type)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, colour = "grey60") +
+  geom_point(position = position_jitter(height = 0.15, width = 0, seed = 1), size = 0.8, alpha = 0.4) +
+  facet_wrap(~ measure, ncol = 1) +
+  scale_colour_manual(values = setNames(type_colours, c("Facultative", "Obligate mutualist",
+                                                        "Obligate parasite")), guide = "none") +
+  labs(x = "Records in dry months beyond an even spread (percentage points)", y = NULL,
+       title = "Flight and the dry season") +
+  theme_figure()
+ef[, `:=`(measure = factor(measures[measure], rev(measures)),
+          contrast = factor(sapply(contrasts, `[[`, "label")[contrast],
+                            sapply(contrasts, `[[`, "label")))]
+panel_b <- ggplot(ef, aes(estimate, measure, colour = analysis)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), width = 0,
+                linewidth = 0.5, orientation = "y", position = position_dodge(width = 0.6)) +
+  geom_point(size = 2, position = position_dodge(width = 0.6)) +
+  facet_wrap(~ contrast, ncol = 1) +
+  scale_colour_manual(values = c(`Given region and lineage` = "#3B3B3B", `Within genera` = "#E69F00"),
+                      name = NULL) +
+  labs(x = "Effect (log odds per SD)", y = NULL, title = "Obligacy and flight timing") +
+  theme_figure()
+fig <- (panel_a | panel_b) + plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")")
+save_figure(fig, "plot_flight_timing", 9, 6.5)
+fig
+```
+
+```{r clear_plot_flight_timing, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

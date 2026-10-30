@@ -1,0 +1,236 @@
+---
+title: "Lycaenidae ant-interaction climate 44 - does confinement replicate across independent origins of obligacy? Sister-clade contrasts with several responses"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+Obligate genera occupy fewer places than other genera of the same age and richness (`s23`, `s33`), but among sister clades the pattern was unclear (6 of 9 contrasts). The sixth external review asked whether confinement replicates across independently evolved obligate lineages, with several responses (`writing/research_roadmap.md`, rank 8). This notebook:
+
+1. finds, on each of two trees of genera (the tree of genera from the matched Yumnam species, and the tree of genera from Kawahara et al. 2023), every **maximal clade of obligate genera** (genera whose classified species are mostly obligate; states as in `s25`), each treated as one independent origin, and its **sister clade** (the non-obligate genera of the sibling subtree);
+2. compares them on six responses, each measured per genus from the cleaned records:
+   - hexagons of about 210,000 km² occupied, given recorded species and stem age (the residual of `s33`);
+   - biogeographic regions occupied;
+   - landmasses of the glacial shelf occupied (crossing deep-water barriers);
+   - range fragmentation: separate patches of occupied 1° cells (eight-neighbour), given occupied cells;
+   - climatic breadth relative to availability: the 5–95% range of annual mean temperature, and of the run of months below 50 mm, over the genus's pixels, divided by the same range over all land of the accessible areas it occupies;
+3. reports, for each response and tree, the contrasts in which the obligate clade is lower, a sign test and a Wilcoxon test.
+
+Counts and breadths depend on the number of recorded species; counts are therefore compared as residuals from a regression on log recorded species and log stem age across all genera, and fragmentation as patches given occupied cells. These contrasts describe present-day distributions; they do not show whether ranges contracted before or after obligacy evolved.
+
+**Decision rule (roadmap):** if the obligate clade is lower in at least two thirds of contrasts on both trees for most responses, the confinement pattern replicates and dated range reconstructions on well-resolved clades are justified; otherwise confinement remains a genus-level association.
+
+A full run takes about 3 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(ape)
+library(ggplot2)
+```
+
+## Variables
+
+```{r setup_variables}
+trees_used <- c("Tree of genera", "Tree of genera (Kawahara)")
+responses <- c(hexagons_resid = "Hexagons occupied (residual)", regions_resid = "Regions occupied (residual)",
+               landmasses_resid = "Shelf landmasses occupied (residual)", patches_resid = "Range patches (given cells)",
+               temp_breadth = "Temperature breadth / available", run_breadth = "Dry-season breadth / available")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s02 <- path_resrepo("data/intermediate/s02_build_assemblages")
+dir_s13 <- path_resrepo("data/intermediate/s13_compare_matched_climates")
+dir_s25 <- path_resrepo("data/intermediate/s25_test_convergence")
+dir_s33 <- path_resrepo("data/intermediate/s33_test_confinement")
+dir_s38 <- path_resrepo("data/intermediate/s38_diagnose_identifiability")
+dir_data_intermediate <- path_resrepo("data/intermediate/s44_test_confinement_contrasts")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Maximal clades whose tips are all in `target`, with the tips of their sibling subtrees
+obligate_clades <- function(tree, target) {
+  n <- Ntip(tree)
+  desc <- lapply(seq_len(n + tree$Nnode), function(v) if (v <= n) tree$tip.label[v] else extract.clade(tree, v)$tip.label)
+  all_t <- vapply(desc, function(x) all(x %in% target), logical(1))
+  parent <- setNames(tree$edge[, 1], tree$edge[, 2])
+  roots <- which(all_t & vapply(seq_along(all_t), function(v) {
+    p <- parent[as.character(v)]; is.na(p) || !all_t[p] }, logical(1)))
+  rbindlist(lapply(roots, function(v) {
+    p <- parent[as.character(v)]
+    if (is.na(p)) return(NULL)
+    sib <- setdiff(tree$edge[tree$edge[, 1] == p, 2], v)
+    data.table(clade = paste(sort(desc[[v]]), collapse = " + "), obligate = list(desc[[v]]),
+               sister = list(setdiff(unlist(desc[sib]), target)))
+  }))
+}
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom")
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Responses per genus
+
+*Inputs:* s33/confinement_genera.csv; s13/taxa.csv; s02/species_records.rds; s38/mechanism_pixels.rds; s13/pixel_strata.rds; s01/climate_present_10m.tif
+*Outputs:* genus_responses.csv
+
+```{r genus_responses}
+cg <- fread(file.path(dir_s33, "confinement_genera.csv"))
+taxa <- fread(file.path(dir_s13, "taxa.csv"), colClasses = c(pool_key = "character"))
+pix <- readRDS(file.path(dir_s38, "mechanism_pixels.rds"))
+reg <- readRDS(file.path(dir_s13, "pixel_strata.rds"))[!is.na(region), .(cell, region = as.character(region))]
+pix <- merge(pix, reg, by = "cell")
+pix[, landmass := sub("^[^:]+: ", "", area_shelf)]
+template <- rast(file.path(dir_s01, "climate_present_10m.tif"))[[1]]
+rec <- readRDS(file.path(dir_s02, "species_records.rds"))
+rec[, pool_key := as.character(pool_key)]
+rec <- merge(rec, taxa[, .(pool_key, genus)], by = "pool_key")[genus %in% cg$genus]
+rec[, cell := cellFromXY(template, cbind(decimalLongitude, decimalLatitude))]
+gp <- merge(unique(rec[!is.na(cell), .(genus, cell)]), pix[, .(cell, lon, lat, region, landmass, area_shelf, bio01, dry_run50)],
+            by = "cell")
+q <- function(x) diff(quantile(x, c(0.05, 0.95)))
+resp <- gp[, {
+  avail <- pix[area_shelf %in% unique(area_shelf)]
+  deg <- unique(data.table(x = floor(lon), y = floor(lat)))
+  r <- rast(xmin = min(deg$x) - 1, xmax = max(deg$x) + 2, ymin = min(deg$y) - 1, ymax = max(deg$y) + 2, resolution = 1)
+  r[cellFromXY(r, cbind(deg$x + 0.5, deg$y + 0.5))] <- 1
+  .(regions = uniqueN(region), landmasses = uniqueN(landmass), cells_1deg = nrow(deg),
+    patches = length(unique(na.omit(values(patches(r, directions = 8), mat = FALSE)))),
+    temp_breadth = q(bio01) / max(q(avail$bio01), 1e-6), run_breadth = q(dry_run50) / max(q(avail$dry_run50), 1e-6))
+}, by = genus]
+resp <- merge(cg[, .(genus, subfamily, hexagons, log_age, log_species, recorded, stem_age)], resp, by = "genus")
+resp <- resp[is.finite(log_age)]
+for (v in c("hexagons", "regions", "landmasses")) {
+  fit <- lm(as.formula(paste0("log(", v, ") ~ log_species + log_age")), data = resp)
+  set(resp, j = paste0(v, "_resid"), value = residuals(fit))
+}
+resp[, patches_resid := residuals(lm(log(patches) ~ log(cells_1deg), data = resp))]
+write_table(resp, file.path(dir_data_intermediate, "genus_responses.csv"))
+print(resp[, lapply(.SD, median), .SDcols = c("regions", "landmasses", "patches", "temp_breadth", "run_breadth")])
+```
+
+```{r clear_genus_responses, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Sister-clade contrasts
+
+*Inputs:* s25/convergence_trees.rds; s44/genus_responses.csv
+*Outputs:* sister_clades.csv, contrast_values.csv, contrast_tests.csv
+
+```{r contrasts}
+trees <- readRDS(file.path(dir_s25, "convergence_trees.rds"))
+resp <- fread(file.path(dir_data_intermediate, "genus_responses.csv"))
+cl_all <- list(); vals <- list()
+for (tn in trees_used) {
+  tr <- trees[[tn]]$tree
+  ob <- names(trees[[tn]]$obligate)[trees[[tn]]$obligate == "1"]
+  cl <- obligate_clades(tr, ob)
+  cl <- cl[vapply(sister, function(x) length(intersect(x, resp$genus)) > 0, logical(1)) &
+             vapply(obligate, function(x) length(intersect(x, resp$genus)) > 0, logical(1))]
+  cl_all[[tn]] <- cl[, .(tree = tn, clade, obligate_genera = vapply(obligate, paste, character(1), collapse = ", "),
+                         sister_genera = vapply(sister, function(x) paste(intersect(x, resp$genus), collapse = ", "), character(1)))]
+  for (i in seq_len(nrow(cl))) for (v in names(responses)) {
+    a <- resp[genus %in% cl$obligate[[i]]][[v]]; b <- resp[genus %in% cl$sister[[i]]][[v]]
+    vals[[length(vals) + 1]] <- data.table(tree = tn, clade = cl$clade[i], response = v,
+                                           obligate = mean(a, na.rm = TRUE), sister = mean(b, na.rm = TRUE))
+  }
+}
+cl_all <- rbindlist(cl_all)
+vals <- rbindlist(vals)[is.finite(obligate) & is.finite(sister)]
+vals[, difference := obligate - sister]
+write_table(cl_all, file.path(dir_data_intermediate, "sister_clades.csv"))
+write_table(vals, file.path(dir_data_intermediate, "contrast_values.csv"))
+tests <- vals[, .(contrasts = .N, obligate_lower = sum(difference < 0), median_difference = median(difference),
+                  sign_test_p = binom.test(sum(difference < 0), .N)$p.value,
+                  wilcoxon_p = suppressWarnings(wilcox.test(difference)$p.value)), by = .(tree, response)]
+tests[, `:=`(share_lower = obligate_lower / contrasts, replicates = obligate_lower >= 2 / 3 * contrasts)]
+write_table(tests, file.path(dir_data_intermediate, "contrast_tests.csv"))
+print(cl_all[, .(tree, clade = substr(clade, 1, 40), sister = substr(sister_genera, 1, 40))])
+print(tests[, .(tree, response, contrasts, obligate_lower, median = round(median_difference, 2),
+                sign_p = round(sign_test_p, 3), wilcoxon_p = round(wilcoxon_p, 3), replicates)])
+```
+
+```{r clear_contrasts, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+Obligate clade minus its sister clade for each response, on both trees; points: contrasts; labels: contrasts in which the obligate clade is lower.
+
+*Inputs:* s44/ contrast_values.csv, contrast_tests.csv
+*Outputs:* plot_confinement_contrasts.png
+
+```{r plot_confinement_contrasts}
+vals <- fread(file.path(dir_data_intermediate, "contrast_values.csv"))
+tests <- fread(file.path(dir_data_intermediate, "contrast_tests.csv"))
+vals[, response := factor(responses[response], rev(responses))]
+tests[, response := factor(responses[response], rev(responses))]
+fig <- ggplot(vals, aes(difference, response)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_jitter(height = 0.15, width = 0, size = 1.6, alpha = 0.7, colour = "#D55E00") +
+  geom_point(data = tests, aes(x = median_difference), shape = 18, size = 3.5, colour = "#3B3B3B") +
+  geom_text(data = tests, aes(x = Inf, label = paste0(obligate_lower, "/", contrasts, " lower")), hjust = 1.05,
+            size = 2.5, colour = "grey30") +
+  facet_wrap(~ tree, ncol = 2) +
+  labs(x = "Obligate clade minus sister clade", y = NULL,
+       title = "Does confinement replicate across independent origins of obligacy?",
+       subtitle = "Points: contrasts; diamonds: medians") +
+  theme_figure()
+save_figure(fig, "plot_confinement_contrasts", 10, 4.5)
+fig
+```
+
+```{r clear_plot_confinement_contrasts, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

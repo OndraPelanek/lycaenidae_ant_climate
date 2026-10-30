@@ -1,0 +1,218 @@
+---
+title: "Lycaenidae ant-interaction climate 26 - could knowledge explain the geography of obligacy?"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+The obligate-rich regions are also the best known: 97% of the recorded species of Australia and 80% of southern Africa are classified, against 51–53% of the Holarctic, 15–34% of the tropics and 15% of the Neotropics (`s12`). Obligate associations are found by people who rear larvae, so the best-studied faunas might look the most obligate. This notebook tests whether the regional ordering of obligate shares could be an artefact of knowledge (big-picture plan, test E). For each region, the obligate share of its species is estimated in five ways:
+
+1. **All classified species** (as elsewhere).
+2. **Species-specific evidence only**: species whose type was recorded for the species itself, not presumed from relatives.
+3. **Well-classified places only**: the species recorded in hexagons (about 210,000 km²) where at least half of the recorded species are classified.
+4. **Unclassified species imputed**: every unclassified species given the obligate share of its classified congeners (or, without classified congeners, of its subfamily in its region), so the estimate covers all recorded species.
+5. **Unclassified species obligate (upper bound)** for the poorly known regions only.
+
+Finally, whether obligate species are better sampled than facultative ones, in GBIF records per species given region and lineage; if obligate species were the better known, knowledge could inflate their share.
+
+A full run takes under a minute.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(mgcv)
+library(ggplot2)
+```
+
+## Variables
+
+```{r setup_variables}
+min_completeness <- 0.5
+min_recorded_hex <- 10
+types <- c("n", "f", "m", "p")
+specific_basis <- c("direct", "direct_class_inferred_subtype")
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+region_short <- c(Nearctic = "Nearctic", Neotropic = "Neotropics", Palearctic = "Palaearctic",
+                  `Tropical Africa` = "Tropical Africa", `Southern Africa` = "Southern Africa",
+                  Indomalayan = "Indomalaya", Australia = "Australia",
+                  `New Guinea and islands` = "New Guinea")
+estimate_levels <- c("All classified species", "Species-specific evidence only",
+                     "Well-classified hexagons only", "Unclassified species imputed from relatives")
+estimate_colours <- c("#3B3B3B", "#0072B2", "#009E73", "#E69F00")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_data_intermediate <- path_resrepo("data/intermediate/s26_test_knowledge")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Obligate share of each region, five ways
+
+*Inputs:* s05/ species_regions.csv, presence_hex5.csv, cell_data_hex5.csv; raw/butterfly_ant_interactions/species_table.csv
+*Outputs:* knowledge_regions.csv
+
+```{r knowledge_regions}
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+tab <- fread(file.path(dir_data_raw, "butterfly_ant_interactions", "species_table.csv"),
+             colClasses = c(pool_key = "character"))
+# One row per species unit (a unit may pool several rows of the parent table)
+tab <- tab[, .(basis = interaction_type_basis[1],
+               records = suppressWarnings(max(as.numeric(occurrence_count), na.rm = TRUE))), by = pool_key]
+sp <- merge(sp, tab, by = "pool_key", all.x = TRUE)
+sp[, `:=`(classified = interaction_type %in% types,
+          obligate = as.numeric(interaction_type %in% c("m", "p")))]
+sp[classified == FALSE, obligate := NA]
+
+# --- 1, 2: classified species, and species-specific evidence only ---
+est <- rbind(
+  sp[classified == TRUE, .(estimate = "All classified species", species = .N,
+                           obligate_share = mean(obligate)), by = region],
+  sp[classified == TRUE & basis %in% specific_basis,
+     .(estimate = "Species-specific evidence only", species = .N,
+       obligate_share = mean(obligate)), by = region])
+
+# --- 3: species recorded in well-classified hexagons ---
+pres <- fread(file.path(dir_s05, "presence_hex5.csv"), colClasses = c(pool_key = "character"))
+cells <- fread(file.path(dir_s05, "cell_data_hex5.csv"))
+good <- cells[n_total >= min_recorded_hex & n_classified / n_total >= min_completeness]$cell_id
+in_good <- unique(pres[cell_id %in% good]$pool_key)
+est <- rbind(est, sp[classified == TRUE & pool_key %in% in_good,
+                     .(estimate = "Well-classified hexagons only", species = .N,
+                       obligate_share = mean(obligate)), by = region])
+
+# --- 4: unclassified species imputed from classified congeners, else subfamily in region ---
+genus_share <- sp[classified == TRUE, .(g = mean(obligate)), by = genus]
+sub_share <- sp[classified == TRUE, .(s = mean(obligate)), by = .(subfamily, region)]
+imp <- merge(merge(sp, genus_share, by = "genus", all.x = TRUE), sub_share,
+             by = c("subfamily", "region"), all.x = TRUE)
+imp[, value := fifelse(classified, obligate, fifelse(!is.na(g), g, s))]
+est <- rbind(est, imp[!is.na(value), .(estimate = "Unclassified species imputed from relatives",
+                                       species = .N, obligate_share = mean(value)), by = region])
+
+# --- 5: upper bound with every unclassified species obligate ---
+bound <- sp[, .(recorded = .N, classified = sum(classified),
+                upper_bound = (sum(obligate, na.rm = TRUE) + sum(!classified)) / .N), by = region]
+est <- merge(est, bound, by = "region")
+write_table(est, file.path(dir_data_intermediate, "knowledge_regions.csv"))
+print(dcast(est, region + recorded + classified ~ estimate, value.var = "obligate_share"),
+      digits = 2)
+cat("Rank correlation of the regional obligate shares with the classified-only estimate:\n")
+w <- dcast(est, region ~ estimate, value.var = "obligate_share")
+print(sapply(estimate_levels[-1], function(v) cor(w[["All classified species"]], w[[v]],
+                                                  method = "spearman", use = "complete.obs")))
+```
+
+```{r clear_knowledge_regions, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Are obligate species better sampled?
+
+GBIF records per species (log) of obligate against facultative species, given region and lineage (random intercepts of subfamily and genus).
+
+*Inputs:* s05/species_regions.csv; raw/butterfly_ant_interactions/species_table.csv
+*Outputs:* sampling_effects.csv
+
+```{r sampling}
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+tab <- fread(file.path(dir_data_raw, "butterfly_ant_interactions", "species_table.csv"),
+             colClasses = c(pool_key = "character"))
+tab <- tab[, .(records = suppressWarnings(max(as.numeric(occurrence_count), na.rm = TRUE))), by = pool_key]
+sp <- merge(sp, tab, by = "pool_key")
+d <- sp[interaction_type %in% c("f", "m", "p") & is.finite(records) & records > 0]
+d[, `:=`(obligate = as.integer(interaction_type %in% c("m", "p")), region = factor(region),
+         genus = factor(genus), subfamily = factor(subfamily))]
+m <- gam(log10(records) ~ obligate + region + s(subfamily, bs = "re") + s(genus, bs = "re"),
+         data = d, method = "REML")
+cf <- summary(m)$p.table["obligate", ]
+res <- data.table(response = "GBIF records per species (log10)", species = nrow(d),
+                  estimate = cf[[1]], se = cf[[2]], p = cf[[4]])
+write_table(res, file.path(dir_data_intermediate, "sampling_effects.csv"))
+print(res, digits = 3)
+```
+
+```{r clear_sampling, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+Obligate share of each region estimated from all classified species, from species-specific evidence only, from the species of well-classified hexagons only, and with unclassified species imputed from their relatives; labels: share of the region's recorded species that is classified.
+
+*Inputs:* s26/knowledge_regions.csv
+*Outputs:* plot_knowledge.png
+
+```{r plot_knowledge}
+est <- fread(file.path(dir_data_intermediate, "knowledge_regions.csv"))
+est[, `:=`(region = factor(region_short[region], rev(region_short[region_levels])),
+           estimate = factor(estimate, estimate_levels))]
+lab <- unique(est[, .(region, completeness = classified / recorded)])
+p <- ggplot(est, aes(100 * obligate_share, region, colour = estimate)) +
+  geom_point(size = 2.4, position = position_dodge(width = 0.6)) +
+  geom_text(data = lab, aes(x = 72, y = region, label = paste0(round(100 * completeness), "%")),
+            inherit.aes = FALSE, hjust = 0, size = 2.8, colour = "grey35") +
+  scale_colour_manual(values = setNames(estimate_colours, estimate_levels), name = NULL) +
+  scale_x_continuous(limits = c(0, 80)) +
+  labs(x = "Obligate share (%)", y = NULL,
+       title = "The regional ordering of obligacy is not an artefact of knowledge",
+       subtitle = "Right: share of recorded species classified") +
+  guides(colour = guide_legend(ncol = 2)) +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        legend.position = "bottom", plot.title = element_text(face = "bold"),
+        plot.title.position = "plot")
+save_figure(p, "plot_knowledge", 7, 5)
+p
+```
+
+```{r clear_plot_knowledge, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

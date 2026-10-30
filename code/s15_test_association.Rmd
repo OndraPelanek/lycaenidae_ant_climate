@@ -525,13 +525,16 @@ effects[, `:=`(region = factor(region, rev(region_levels)),
                model = factor(model, c("Given lineage", "Within genera")))]
 panel_f <- ggplot(effects, aes(estimate, region, shape = model)) +
   geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
-  geom_errorbar(aes(xmin = pmax(estimate - 1.96 * se, -6), xmax = pmin(estimate + 1.96 * se, 6)),
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se),
                 width = 0, linewidth = 0.45, orientation = "y",
                 position = position_dodge(width = 0.6)) +
   geom_point(size = 1.9, fill = "white", position = position_dodge(width = 0.6)) +
   scale_shape_manual(values = c(16, 21), name = NULL) +
-  coord_cartesian(xlim = c(-6, 6)) +
-  labs(x = "Effect of temperature on ant association (log odds per SD, 95% CI)", y = NULL,
+  # Full intervals on a pseudo-logarithmic axis (linear near zero)
+  scale_x_continuous(trans = scales::pseudo_log_trans(sigma = 0.5),
+                     breaks = c(-30, -10, -3, -1, 0, 1, 3, 10, 30)) +
+  labs(x = "Effect of temperature on ant association (log odds per SD, 95% CI; pseudo-log axis)",
+       y = NULL,
        title = "Among species, temperature does not predict ant association within regions") +
   theme_figure()
 

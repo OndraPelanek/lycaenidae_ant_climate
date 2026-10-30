@@ -1,0 +1,363 @@
+---
+title: "Lycaenidae ant-interaction climate 25 - did obligacy arise more often in the south?"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+Obligate species are concentrated in southern Africa and Australia in every climate these regions share with others (`s24`), and obligate lineages spread less than their relatives (`s23`). Two histories could produce this. Obligacy may have **arisen more often** in lineages living in the south (convergence), or it may have arisen at ordinary rates and **stayed** where it arose. `s09`, `s10` and `s14` counted origins per region, but a count says nothing about how much lineage history each region holds: a region with many lineages offers more opportunities for obligacy to arise. This notebook estimates the **rate** of origins per million years of non-obligate lineage history in each group of regions (big-picture plan, test A):
+
+1. Stochastic character maps of obligacy (ARD model) and, independently, of the region group (three groups: southern Africa and Australia; the Old World tropics; the Holarctic and the Americas; ER model), 100 of each, on the tree of genera (`s10`), on the dated tree of Yumnam & Kodandaramaiah (2025) pruned to its matched species (`s14`), and, as an independent check, on trees of genera taken from the dated phylogeny of Kawahara et al. (2023), which samples most butterfly genera with one or two species (the tree with secondary and fossil calibrations, and the tree with secondary calibrations only).
+2. Each map of obligacy is overlaid on a map of region: every gain of obligacy is placed in the region group of its branch at that moment, and the time each branch spends non-obligate is summed by region group. The rate of origins is gains divided by this time.
+3. The ratio of the southern rate to the rate elsewhere, over the pairs of maps, against its distribution when, in each pair of maps, the gains are placed at random along the non-obligate history regardless of region (the number of southern gains drawn from a binomial with the southern share of the exposure). This asks whether gains fall in the south more often than its share of lineage history would give. (Permuting the regions of the tips, the first design, was abandoned: scrambled regions give the region model a very high rate, and simulating one such map took longer than ten minutes.)
+4. The age of each origin (Myr before present), by region group.
+
+The two maps of each pair are drawn independently given the tips, so the placement of a gain in a region reflects only where the descendants of that branch live. A full run takes about 10 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(ape)
+library(phytools)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+n_maps <- 100
+n_perm <- 100
+region_groups <- c(`Southern Africa` = "South", Australia = "South",
+                   `Tropical Africa` = "Old World tropics", Indomalayan = "Old World tropics",
+                   `New Guinea and islands` = "Old World tropics", Nearctic = "Holarctic and Americas",
+                   Neotropic = "Holarctic and Americas", Palearctic = "Holarctic and Americas")
+group_levels <- c("South", "Old World tropics", "Holarctic and Americas")
+group_labels <- c(South = "Southern Africa and Australia", `Old World tropics` = "Old World tropics",
+                  `Holarctic and Americas` = "Holarctic and Americas")
+group_colours <- c(South = "#E69F00", `Old World tropics` = "#56B4E9",
+                   `Holarctic and Americas` = "#3B3B3B")
+branch <- c(yumnam_2025 = "published")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_data_raw <- path_resrepo("data/raw")
+dir_s09 <- path_resrepo("data/intermediate/s09_test_history")
+dir_s10 <- path_resrepo("data/intermediate/s10_test_diversification")
+dir_data_intermediate <- path_resrepo("data/intermediate/s25_test_convergence")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+tree_file <- file.path(dir_data_raw, "phylogenies", "yumnam_2025",
+                       "21Jan2025_30June23_SubfamAdded_RelTime_DivergenceTime_928sp.nwk")
+crosswalk_file <- file.path(dir_data_raw, "butterfly_ant_interactions", "crosswalk_yumnam_2025.csv")
+# Kawahara et al. (2023): treePL-dated trees from 154 amino-acid partitions (Strategy A, the tree
+# used for their downstream analyses), with secondary and fossil calibrations, and with secondary
+# calibrations only
+kawahara_zip <- file.path(dir_data_raw, "butterflies_kawahara2023", "Data.S22.treePL.zip")
+kawahara_trees <- c(`Tree of genera (Kawahara)` = "Data.S22.treePL/StrategyA/AA154_secondary_fossils_strategyA.tre",
+                    `Tree of genera (Kawahara, secondary calibrations)` = "Data.S22.treePL/StrategyA/AA154_secondary_only_strategyA.tre")
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+source(here::here("code", "R", "phylogeny.R"))
+```
+
+```{r define_helpers}
+# Polytomies resolved at random and very short branches lengthened (as in s14)
+min_branch_share <- 1e-4
+prepare_tree <- function(tr, seed = 1) {
+  set.seed(seed)
+  tr <- multi2di(tr, random = TRUE)
+  floor <- min_branch_share * max(node.depth.edgelength(tr))
+  tr$edge.length[tr$edge.length < floor] <- floor
+  tr
+}
+
+# Overlay one map of obligacy (states "0", "1") on one map of region group on the same tree:
+# gains of obligacy with their region group and age, and the time spent non-obligate in each
+# region group
+overlay_maps <- function(mo, mr) {
+  height <- max(nodeHeights(mo))
+  start <- nodeHeights(mo)[, 1]
+  gains <- list()
+  exposure <- setNames(numeric(length(group_levels)), group_levels)
+  for (i in seq_len(nrow(mo$edge))) {
+    so <- mo$maps[[i]]
+    sr <- mr$maps[[i]]
+    bo <- c(0, cumsum(so))
+    br <- c(0, cumsum(sr))
+    cuts <- sort(unique(c(bo, br)))
+    # Segment index of a position on the branch (the two maps' branch totals can differ in the
+    # last decimals, so indices are kept within range)
+    seg <- function(pos, b) min(max(findInterval(pos, b, rightmost.closed = TRUE), 1), length(b) - 1)
+    for (k in seq_len(length(cuts) - 1)) {
+      mid <- (cuts[k] + cuts[k + 1]) / 2
+      ob <- names(so)[seg(mid, bo)]
+      rg <- names(sr)[seg(mid, br)]
+      if (ob == "0") exposure[[rg]] <- exposure[[rg]] + (cuts[k + 1] - cuts[k])
+    }
+    states <- names(so)
+    if (length(states) > 1) for (k in seq_len(length(states) - 1)) {
+      if (states[k] == "0" && states[k + 1] == "1") {
+        t <- bo[k + 1]
+        rg <- names(sr)[seg(max(t - 1e-9, 0), br)]
+        gains[[length(gains) + 1]] <- data.table(group = rg, age = height - (start[i] + t))
+      }
+    }
+  }
+  list(gains = rbindlist(gains), exposure = exposure)
+}
+
+# Rates of gain per region group over pairs of maps, with the ratio of the southern rate to the
+# rate in the other groups together
+gain_rates <- function(maps_o, maps_r) {
+  rbindlist(lapply(seq_along(maps_o), function(s) {
+    ov <- overlay_maps(maps_o[[s]], maps_r[[s]])
+    g <- if (nrow(ov$gains)) ov$gains[, .N, by = group] else data.table(group = character(), N = integer())
+    g <- merge(data.table(group = group_levels), g, by = "group", all.x = TRUE)
+    g[is.na(N), N := 0L]
+    g[, `:=`(exposure = ov$exposure[group], map = s)]
+    g[, rate := N / exposure]
+    g[, ratio_south := g[group == "South"]$rate /
+          (sum(g[group != "South"]$N) / sum(g[group != "South"]$exposure))]
+    g
+  }))
+}
+
+# Ages of gains over pairs of maps
+gain_ages <- function(maps_o, maps_r) {
+  rbindlist(lapply(seq_along(maps_o), function(s) {
+    ov <- overlay_maps(maps_o[[s]], maps_r[[s]])
+    if (nrow(ov$gains)) ov$gains[, map := s] else NULL
+  }))
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 0.5),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom", plot.tag = element_text(face = "bold", size = 11))
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Trees and tip states
+
+*Inputs:* s10/ genus_table.csv, genus_tree.rds; s09/history_species.csv; raw/phylogenies/yumnam_2025; raw/butterfly_ant_interactions/crosswalk_yumnam_2025.csv
+*Outputs:* convergence_trees.rds
+
+```{r trees}
+# --- Tree of genera: genus strategy (obligate if at least half its classified species are) and
+# main region ---
+genera <- fread(file.path(dir_s10, "genus_table.csv"), na.strings = c("", "NA"))
+gt <- readRDS(file.path(dir_s10, "genus_tree.rds"))
+gd <- genera[genus %in% gt$tip.label & !is.na(strategy) & !is.na(region)]
+gt <- keep.tip(gt, gd$genus)
+genus_tree <- list(tree = gt,
+                   obligate = setNames(ifelse(gd$strategy == "Obligate", "1", "0"), gd$genus),
+                   group = setNames(region_groups[gd$region], gd$genus))
+
+# --- Yumnam tree pruned to its matched classified species (as in s14) ---
+sp <- fread(file.path(dir_s09, "history_species.csv"))
+cw <- read.csv(crosswalk_file, na.strings = c("", "NA"))
+matched <- intersect(sp$species, cw$analysis_species[cw$matched])
+tr <- prepare_tree(prepare_analysis_tree(read_published_tree(tree_file), cw, matched,
+                                         branch[["yumnam_2025"]]))
+d <- sp[species %in% tr$tip.label & region %in% names(region_groups)]
+tr <- keep.tip(tr, d$species)
+species_tree <- list(tree = tr,
+                     obligate = setNames(ifelse(d$obligate == 1, "1", "0"), d$species),
+                     group = setNames(region_groups[d$region], d$species))
+
+trees <- list(`Tree of genera` = genus_tree, `Species tree (Yumnam, matched)` = species_tree)
+
+# --- Kawahara et al. (2023): one tip per lycaenid genus (labels are ID_ID_family_subfamily_tribe_
+# genus_epithet[_suffix]; the first tip of each genus is kept), genera with a strategy and region ---
+for (nm in names(kawahara_trees)) {
+  unzip(kawahara_zip, files = kawahara_trees[[nm]], exdir = tempdir(), junkpaths = TRUE)
+  kt <- read.nexus(file.path(tempdir(), basename(kawahara_trees[[nm]])))
+  parts <- strsplit(kt$tip.label, "_")
+  fam <- vapply(parts, `[`, "", 3)
+  gen <- vapply(parts, `[`, "", 6)
+  # All genera with a strategy and a region, not only those on the Yumnam-based tree of genera
+  gk <- genera[!is.na(strategy) & !is.na(region)]
+  keep <- which(fam == "Lycaenidae" & gen %in% gk$genus & !duplicated(gen))
+  kt <- keep.tip(kt, kt$tip.label[keep])
+  kt$tip.label <- gen[keep]
+  kt <- prepare_tree(kt)
+  kd <- gk[genus %in% kt$tip.label]
+  trees[[nm]] <- list(tree = kt,
+                      obligate = setNames(ifelse(kd$strategy == "Obligate", "1", "0"), kd$genus),
+                      group = setNames(region_groups[kd$region], kd$genus))
+}
+saveRDS(trees, file.path(dir_data_intermediate, "convergence_trees.rds"))
+for (nm in names(trees)) {
+  cat(nm, ":", Ntip(trees[[nm]]$tree), "tips; obligate", sum(trees[[nm]]$obligate == "1"),
+      "; height", round(max(nodeHeights(trees[[nm]]$tree)), 1), "Myr\n")
+  print(table(trees[[nm]]$group, trees[[nm]]$obligate))
+}
+```
+
+```{r clear_trees, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Rates of origin by region group
+
+*Inputs:* s25/convergence_trees.rds
+*Outputs:* gain_rates.csv, gain_ages.csv, rate_summary.csv, ratio_null.csv
+
+```{r gain_rates}
+trees <- readRDS(file.path(dir_data_intermediate, "convergence_trees.rds"))
+set.seed(20261029)
+rates <- list()
+ages <- list()
+null <- list()
+for (nm in names(trees)) {
+  x <- trees[[nm]]
+  maps_o <- make.simmap(x$tree, x$obligate, model = "ARD", nsim = n_maps, message = FALSE)
+  maps_r <- make.simmap(x$tree, x$group, model = "ER", nsim = n_maps, message = FALSE)
+  rates[[nm]] <- gain_rates(maps_o, maps_r)[, tree := nm]
+  ages[[nm]] <- gain_ages(maps_o, maps_r)[, tree := nm]
+  # --- Null: in each pair of maps, the gains placed at random along the non-obligate history,
+  # ignoring region (the southern count is binomial with the southern share of the exposure) ---
+  null[[nm]] <- rates[[nm]][, {
+    south <- group == "South"
+    n_gains <- sum(N)
+    e_south <- sum(exposure[south])
+    e_other <- sum(exposure[!south])
+    k <- rbinom(n_perm, n_gains, e_south / (e_south + e_other))
+    .(permutation = seq_len(n_perm), ratio_south = (k / e_south) / ((n_gains - k) / e_other))
+  }, by = map][, tree := nm]
+}
+rates <- rbindlist(rates)
+ages <- rbindlist(ages)
+null <- rbindlist(null)
+write_table(rates, file.path(dir_data_intermediate, "gain_rates.csv"))
+write_table(ages, file.path(dir_data_intermediate, "gain_ages.csv"))
+write_table(null, file.path(dir_data_intermediate, "ratio_null.csv"))
+
+summ <- rates[, .(gains_median = median(N), gains_low = quantile(N, 0.025),
+                  gains_high = quantile(N, 0.975), exposure_myr = median(exposure),
+                  rate_median = median(rate), rate_low = quantile(rate, 0.025),
+                  rate_high = quantile(rate, 0.975)), by = .(tree, group)]
+ratio <- unique(rates[, .(tree, map, ratio_south)])[
+  , .(ratio_median = median(ratio_south, na.rm = TRUE),
+      ratio_low = quantile(ratio_south, 0.025, na.rm = TRUE),
+      ratio_high = quantile(ratio_south, 0.975, na.rm = TRUE)), by = tree]
+ratio <- merge(ratio, null[, .(null_median = median(ratio_south, na.rm = TRUE),
+                               null_high = quantile(ratio_south, 0.975, na.rm = TRUE)),
+                           by = tree], by = "tree")
+# One-sided p: share of null draws at least as high as the observed ratio of the same map pair
+ratio <- merge(ratio, merge(unique(rates[, .(tree, map, ratio_south)]),
+                            null[, .(tree, map, null_ratio = ratio_south)], by = c("tree", "map"))[
+  , .(p_null = mean(null_ratio >= ratio_south, na.rm = TRUE)), by = tree], by = "tree")
+summ <- merge(summ, ratio, by = "tree")
+write_table(summ, file.path(dir_data_intermediate, "rate_summary.csv"))
+print(summ, digits = 3)
+print(ages[, .(gains = .N / n_maps, age_median = median(age), age_low = quantile(age, 0.1),
+               age_high = quantile(age, 0.9)), by = .(tree, group)], digits = 3)
+```
+
+```{r clear_gain_rates, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) Rate of origin of obligacy per 100 Myr of non-obligate lineage history in each region group, on each tree (median and 95% range over 100 pairs of stochastic maps). (b) Ratio of the southern rate to the rate elsewhere (points and bars: maps), against its distribution when the gains are placed at random along the non-obligate history (grey). (c) Ages of the origins in each region group (all origins over all maps; tree of genera).
+
+*Inputs:* s25/ gain_rates.csv, ratio_null.csv, gain_ages.csv
+*Outputs:* plot_convergence.png
+
+```{r plot_convergence}
+rates <- fread(file.path(dir_data_intermediate, "gain_rates.csv"))
+null <- fread(file.path(dir_data_intermediate, "ratio_null.csv"))
+ages <- fread(file.path(dir_data_intermediate, "gain_ages.csv"))
+rates[, group := factor(group, rev(group_levels))]
+rs <- rates[, .(rate = median(100 * rate), low = quantile(100 * rate, 0.025),
+                high = quantile(100 * rate, 0.975)), by = .(tree, group)]
+panel_a <- ggplot(rs, aes(rate, group, colour = group)) +
+  geom_errorbar(aes(xmin = low, xmax = high), width = 0, linewidth = 0.6, orientation = "y") +
+  geom_point(size = 2.4) +
+  facet_wrap(~ tree, ncol = 1) +
+  scale_colour_manual(values = group_colours, guide = "none") +
+  scale_y_discrete(labels = group_labels) +
+  labs(x = "Origins per 100 Myr of non-obligate history", y = NULL,
+       title = "Rate of origin by region") +
+  theme_figure()
+
+obs <- unique(rates[, .(tree, map, ratio_south)])
+panel_b <- ggplot() +
+  geom_violin(data = null, aes(ratio_south, tree), fill = "grey88", colour = NA, scale = "width") +
+  geom_vline(xintercept = 1, colour = "grey60", linewidth = 0.4) +
+  geom_point(data = obs[, .(r = median(ratio_south, na.rm = TRUE)), by = tree],
+             aes(r, tree), colour = group_colours[["South"]], size = 2.6) +
+  geom_errorbar(data = obs[, .(low = quantile(ratio_south, 0.025, na.rm = TRUE),
+                               high = quantile(ratio_south, 0.975, na.rm = TRUE)), by = tree],
+                aes(xmin = low, xmax = high, y = tree), width = 0, linewidth = 0.6,
+                colour = group_colours[["South"]], orientation = "y") +
+  scale_x_log10() +
+  labs(x = "Southern rate / rate elsewhere (log)", y = NULL,
+       title = "Against gains placed at random (grey)") +
+  theme_figure()
+
+ag <- ages[tree == "Tree of genera"]
+ag[, group := factor(group, rev(group_levels))]
+panel_c <- ggplot(ag, aes(age, group, fill = group)) +
+  geom_violin(scale = "count", colour = NA, alpha = 0.8) +
+  scale_fill_manual(values = group_colours, guide = "none") +
+  scale_y_discrete(labels = group_labels) +
+  scale_x_reverse() +
+  labs(x = "Age of the origin (Myr before present)", y = NULL,
+       title = "When obligacy arose (tree of genera)") +
+  theme_figure()
+
+fig <- (panel_a | (panel_b / panel_c)) +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")")
+save_figure(fig, "plot_convergence", 10, 8)
+fig
+```
+
+```{r clear_plot_convergence, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

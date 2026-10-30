@@ -1,0 +1,211 @@
+---
+title: "Lycaenidae ant-interaction climate 40 - which data would resolve the dry-niche contrast? A power simulation"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+The dry-niche contrast between obligate mutualists and facultative relatives is positive but uncertain (`s36`, `s37`). The sixth external review asked which additions to the data would improve inference most (`writing/research_roadmap.md`, rank 4). This notebook simulates the two-stage comparison of `s37` (per-origin differences between mutualists and facultative relatives, pooled by random-effects meta-analysis) under the structure estimated from the data: the observed species and their standard errors, the variance among species of a strategy within an origin, and the variance of the difference among origins. For each scenario of added data it reports the power to detect a true difference of 0.5 or 0.8 log relative intensity per SD at the 5% level, and the median width of the 95% interval.
+
+Scenarios: the current data; twice the records per species; better coverage of species with few records; one or three more species of each strategy per origin; more balanced origins (at least three species of each strategy); five or ten more origins of median composition; and ten more balanced origins with twice the records.
+
+The standard error of a species' coefficient is predicted from its number of occupied pixels by a log–log regression on the observed coefficients. The simulation assumes the fitted variances; with nine origins they are themselves uncertain, so the results rank the scenarios rather than give exact power.
+
+A full run takes about 5 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(metafor)
+library(ggplot2)
+```
+
+## Variables
+
+```{r setup_variables}
+n_sim <- 1000
+true_differences <- c(0.5, 0.8)
+step_v2 <- "Version 2 (supplementation and origins)"
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s37 <- path_resrepo("data/intermediate/s37_test_dry_niche_v2")
+dir_data_intermediate <- path_resrepo("data/intermediate/s40_simulate_power")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Two-stage estimate from species coefficients y with standard errors s, strategy m (0/1) and origin
+two_stage <- function(y, s, m, origin, tau2_species) {
+  d <- data.table(y, s, m, origin)
+  o <- d[, { w <- 1 / (s^2 + tau2_species)
+    .(difference = sum((w * y)[m == 1]) / sum(w[m == 1]) - sum((w * y)[m == 0]) / sum(w[m == 0]),
+      se = sqrt(1 / sum(w[m == 1]) + 1 / sum(w[m == 0]))) }, by = origin]
+  r <- tryCatch(rma(o$difference, sei = o$se, method = "REML", control = list(maxiter = 200)),
+                error = function(e) rma(o$difference, sei = o$se, method = "DL"))
+  c(estimate = r$b[1], low = r$ci.lb, high = r$ci.ub, p = r$pval)
+}
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom")
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Structure estimated from the data
+
+Species coefficients of dry months (all-butterfly background, version 2 contrasts, `s37`): the variance among species within a strategy and origin, the variance of the mutualist-minus-facultative difference among origins, and the relation between a species' standard error and its occupied pixels.
+
+*Inputs:* s37/ species_estimates.csv, contrasts.csv
+*Outputs:* power_parameters.csv
+
+```{r parameters}
+est <- fread(file.path(dir_s37, "species_estimates.csv"), colClasses = c(pool_key = "character"))[
+  occurrences == "supplemented" & model == "primary" & background == "record"]
+ct <- fread(file.path(dir_s37, "contrasts.csv"), colClasses = c(pool_key = "character"))[
+  occurrences == "supplemented" & scheme == "origins"]
+e <- merge(est, ct, by = c("pool_key", "area", "occurrences"))[is.finite(estimate) & is.finite(se)]
+setnames(e, "cells.x", "cells", skip_absent = TRUE)
+e[, m := as.integer(strategy == "m")]
+h <- rma.mv(estimate, se^2, mods = ~ m, random = list(~ 1 | origin, ~ 1 | species), data = e, method = "REML")
+tau2_species <- h$sigma2[2]
+o <- e[, { w <- 1 / (se^2 + tau2_species)
+  .(difference = sum((w * estimate)[m == 1]) / sum(w[m == 1]) - sum((w * estimate)[m == 0]) / sum(w[m == 0]),
+    se = sqrt(1 / sum(w[m == 1]) + 1 / sum(w[m == 0]))) }, by = origin]
+tau2_difference <- rma(o$difference, sei = o$se, method = "REML")$tau2
+se_fit <- lm(log(se) ~ log(cells), data = e)
+pars <- data.table(tau2_species = tau2_species, tau2_difference = tau2_difference,
+                   se_intercept = coef(se_fit)[1], se_slope = coef(se_fit)[2], se_sigma = sigma(se_fit),
+                   species = nrow(e), origins = uniqueN(e$origin))
+write_table(pars, file.path(dir_data_intermediate, "power_parameters.csv"))
+saveRDS(e[, .(origin, m, cells, se)], file.path(dir_data_intermediate, "power_species.rds"))
+print(pars, digits = 3)
+```
+
+```{r clear_parameters, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Simulation
+
+*Inputs:* s40/ power_parameters.csv, power_species.rds
+*Outputs:* power.csv
+
+```{r simulate}
+pars <- fread(file.path(dir_data_intermediate, "power_parameters.csv"))
+sp0 <- readRDS(file.path(dir_data_intermediate, "power_species.rds"))
+pred_se <- function(cells) exp(pars$se_intercept + pars$se_slope * log(cells) + rnorm(length(cells), 0, pars$se_sigma))
+med_cells <- median(sp0$cells)
+add_species <- function(sp, k) rbind(sp, rbindlist(lapply(unique(sp$origin), function(o)
+  data.table(origin = o, m = rep(c(1L, 0L), each = k), cells = sample(sp0$cells, 2 * k, replace = TRUE), se = NA_real_))))
+balance <- function(sp, k = 3) rbind(sp, rbindlist(lapply(unique(sp$origin), function(o) {
+  n1 <- sp[origin == o & m == 1, .N]; n0 <- sp[origin == o & m == 0, .N]
+  data.table(origin = o, m = c(rep(1L, max(0, k - n1)), rep(0L, max(0, k - n0))), cells = NA_real_, se = NA_real_)
+})), fill = TRUE)
+add_origins <- function(sp, k, per = 3) rbind(sp, rbindlist(lapply(seq_len(k), function(j)
+  data.table(origin = paste("new", j), m = rep(c(1L, 0L), each = per), cells = NA_real_, se = NA_real_))))
+scenarios <- list(
+  "Current data" = function(sp) sp,
+  "Twice the records per species" = function(sp) sp[, `:=`(cells = cells * 2, se = NA_real_)],
+  "Few-record species brought to the median" = function(sp) sp[cells < med_cells, `:=`(cells = med_cells, se = NA_real_)],
+  "One more species of each strategy per origin" = function(sp) add_species(sp, 1),
+  "Three more species of each strategy per origin" = function(sp) add_species(sp, 3),
+  "Balanced origins (at least three of each)" = function(sp) balance(sp),
+  "Five more origins (three of each)" = function(sp) add_origins(sp, 5),
+  "Ten more origins (three of each)" = function(sp) add_origins(sp, 10),
+  "Ten more balanced origins and twice the records" = function(sp) add_origins(sp, 10)[, `:=`(cells = cells * 2, se = NA_real_)])
+set.seed(40)
+res <- rbindlist(lapply(names(scenarios), function(sc) rbindlist(lapply(true_differences, function(delta) {
+  r <- t(replicate(n_sim, {
+    sp <- scenarios[[sc]](copy(sp0))
+    sp[is.na(cells), cells := sample(sp0$cells, .N, replace = TRUE)]
+    sp[is.na(se), se := pred_se(cells)]
+    v <- setNames(rnorm(uniqueN(sp$origin), 0, sqrt(pars$tau2_difference)), unique(sp$origin))
+    y <- delta * sp$m + v[sp$origin] * sp$m + rnorm(nrow(sp), 0, sqrt(pars$tau2_species)) + rnorm(nrow(sp), 0, sp$se)
+    two_stage(y, sp$se, sp$m, sp$origin, pars$tau2_species)
+  }))
+  data.table(scenario = sc, true_difference = delta, power = mean(r[, "p"] < 0.05 & r[, "estimate"] > 0),
+             median_width = median(r[, "high"] - r[, "low"]), origins = NA_integer_)
+}))))
+write_table(res, file.path(dir_data_intermediate, "power.csv"))
+print(res, digits = 2)
+```
+
+```{r clear_simulate, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+Power to detect a positive difference (5% level) and median width of the 95% interval under each scenario.
+
+*Inputs:* s40/power.csv
+*Outputs:* plot_power.png
+
+```{r plot_power}
+res <- fread(file.path(dir_data_intermediate, "power.csv"))
+res[, scenario := factor(scenario, rev(unique(scenario)))]
+res[, delta := factor(paste("True difference", true_difference))]
+fig_a <- ggplot(res, aes(power, scenario, colour = delta)) +
+  geom_vline(xintercept = 0.8, colour = "grey60", linetype = "dashed", linewidth = 0.4) +
+  geom_point(size = 2.2) +
+  scale_colour_manual(values = c("#56B4E9", "#D55E00"), name = NULL) +
+  scale_x_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(x = "Power (5% level)", y = NULL, title = "(a) Power") +
+  theme_figure()
+fig_b <- ggplot(res[true_difference == true_differences[1]], aes(median_width, scenario)) +
+  geom_point(size = 2.2, colour = "#3B3B3B") +
+  labs(x = "Median width of the 95% interval (log relative intensity per SD)", y = NULL, title = "(b) Precision") +
+  theme_figure() + theme(axis.text.y = element_blank())
+fig <- patchwork::wrap_plots(fig_a, fig_b, ncol = 2, widths = c(1.4, 1))
+save_figure(fig, "plot_power", 9, 4.5)
+fig
+```
+
+```{r clear_plot_power, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

@@ -1,0 +1,305 @@
+---
+title: "Lycaenidae ant-interaction climate 41 - warmth, dry-season length or water stress? A matched case-case comparison of mutualists and their facultative relatives"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+`s38` showed that, with temperature-independent measures, dryness varies almost as much within 1 °C temperature bins as overall in every contrast, so a drought effect can in principle be told apart from a warmth effect. This notebook makes the comparison the sixth external review asked for (`writing/research_roadmap.md`, rank 5): **among the places where mutualists and their facultative relatives both occur at comparable temperatures, are the mutualists' places drier?** It compares the species' occurrences directly (a case–case comparison), so it needs no background; it assumes that mutualists and facultative relatives were recorded in comparable ways, which presence data cannot guarantee.
+
+This analysis was designed after the results of `s36`–`s38` were known; it is sequential, and its design is fixed here before it is run.
+
+**Hypotheses and variables** (fixed in the roadmap):
+
+- **H1 warmth:** annual mean temperature, compared within bins of dry-season length (1 month);
+- **H2 dry-season duration:** the longest run of months below 50 mm, compared within 1 °C temperature bins;
+- **H3 water stress:** the annual climatic water deficit, compared within 1 °C temperature bins.
+
+**Estimand.** For each species, its mean residual of the variable within its contrast: each occupied pixel's value minus the mean of the pixels of the same bin (bins held by both strategies only; every species weighted equally in the bin mean), averaged over the species' pixels, in SD units of the variable over the land of the eight regions. A positive mutualist-minus-facultative difference means mutualists occupy drier (or, for H1, warmer) places than their relatives at the same temperature (or dry-season length).
+
+**Replication.** Species are the units within a contrast; the standard error of a species' score comes from 2° blocks of its pixels. Per contrast, the inverse-variance difference between strategies, with the between-species variance of a hierarchical meta-analysis; contrasts of one origin combined; a random-effects meta-analysis over origins, the number of origins in each direction, and leave-one-origin-out. Holm adjustment over the three hypotheses.
+
+**Primary analysis:** the origin contrasts of `s37` with cleaned records, 1 °C bins. **Sensitivity (fixed now):** without the multi-genus Aphnaeinae origin (34 mutualists against 2 facultative species); only origins with at least two species of each strategy; the within-genus contrasts of version 1; supplemented records without the pixels where the parent cleaning removed records (`s39`); matching on temperature bin and biome together; 2 °C bins; and an unmatched comparison (no bins), to show what matching does.
+
+**Outcome rules (fixed now), per hypothesis:** *consistent support* if the pooled 95% interval excludes zero, at least two thirds of origins share its sign, and every leave-one-origin-out estimate shares it; *inconsistent* if the pooled interval excludes zero but these conditions fail; *not detected* otherwise.
+
+A full run takes about 5 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(metafor)
+library(ggplot2)
+```
+
+## Variables
+
+```{r setup_variables}
+hypotheses <- data.table(h = c("H1", "H2", "H3"), variable = c("bio01", "dry_run50", "cwd"),
+                         matching = c("dry_run50", "bio01", "bio01"), width = c(1, 1, 1),
+                         label = c("H1 warmth (temperature, within dry-season bins)",
+                                   "H2 dry-season length (run of months below 50 mm, within temperature bins)",
+                                   "H3 water stress (climatic water deficit, within temperature bins)"))
+block_deg <- 2
+aphnaeinae_origin <- "Aloeides + Aphnaeus + Argyraspodes + Chloroselas + Chrysoritis + Crudaria + Phasis + Tylopaedia"
+strategy_colours <- c(f = "#56B4E9", m = "#D55E00")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_climate")
+dir_s37 <- path_resrepo("data/intermediate/s37_test_dry_niche_v2")
+dir_s38 <- path_resrepo("data/intermediate/s38_diagnose_identifiability")
+dir_s39 <- path_resrepo("data/intermediate/s39_audit_occurrences_origins")
+dir_data_intermediate <- path_resrepo("data/intermediate/s41_test_matched_case_case")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Species scores within contrasts: residual of x relative to the species-weighted mean of its matching bin
+species_scores <- function(cp, x, match_var, width, sds, by_biome = FALSE) {
+  d <- copy(cp)
+  d[, xs := get(x) / sds[[x]]]
+  d[, bin := if (is.na(match_var)) "all" else as.character(floor(get(match_var) / width))]
+  if (by_biome) d[, bin := paste(bin, biome)]
+  shared <- d[, .(both = uniqueN(strategy) == 2), by = .(contrast, bin)][both == TRUE]
+  d <- merge(d, shared[, .(contrast, bin)], by = c("contrast", "bin"))
+  ref <- d[, .(sp_mean = mean(xs)), by = .(contrast, bin, pool_key)][, .(bin_mean = mean(sp_mean)), by = .(contrast, bin)]
+  d <- merge(d, ref, by = c("contrast", "bin"))
+  d[, r := xs - bin_mean]
+  d[, block := paste(floor(lon / block_deg), floor(lat / block_deg))]
+  d[, {
+    bm <- .SD[, .(r = mean(r)), by = block]$r
+    se <- if (length(bm) >= 3) sd(bm) / sqrt(length(bm)) else sd(r) / sqrt(.N)
+    .(score = mean(r), se = max(se, 0.01), pixels = .N, blocks = length(bm))
+  }, by = .(origin, contrast, pool_key, species, strategy)]
+}
+# Two-stage comparison over origins, with leave-one-origin-out
+compare <- function(s) {
+  s <- s[is.finite(score) & is.finite(se)]
+  s <- s[contrast %in% s[, .(both = uniqueN(strategy) == 2), by = contrast][both == TRUE]$contrast]
+  if (uniqueN(s$origin) < 2) return(NULL)
+  s[, m := as.integer(strategy == "m")]
+  h <- tryCatch(rma.mv(score, se^2, mods = ~ m, random = list(~ 1 | contrast, ~ 1 | species), data = s,
+                       method = "REML"), error = function(e) NULL)
+  tau2 <- if (is.null(h)) 0 else h$sigma2[2]
+  per_origin <- function(ss) {
+    u <- ss[, { w <- 1 / (se^2 + tau2)
+      .(difference = sum((w * score)[m == 1]) / sum(w[m == 1]) - sum((w * score)[m == 0]) / sum(w[m == 0]),
+        se = sqrt(1 / sum(w[m == 1]) + 1 / sum(w[m == 0])), mutualists = sum(m), facultative = sum(1 - m)) },
+      by = .(origin, contrast)]
+    u[, .(difference = sum(difference / se^2) / sum(1 / se^2), se = sqrt(1 / sum(1 / se^2)),
+          mutualists = sum(mutualists), facultative = sum(facultative)), by = origin]
+  }
+  o <- per_origin(s)
+  p <- rma(o$difference, sei = o$se, method = "REML")
+  loo <- vapply(o$origin, function(x) { oo <- o[origin != x]
+    if (nrow(oo) < 2) NA_real_ else rma(oo$difference, sei = oo$se, method = "REML")$b[1] }, numeric(1))
+  list(origins = o, summary = data.table(origins = nrow(o), positive = sum(o$difference > 0),
+                                         pooled = p$b[1], pooled_se = p$se, pooled_low = p$ci.lb, pooled_high = p$ci.ub,
+                                         pooled_p = p$pval, tau2_origins = p$tau2, loo_min = min(loo, na.rm = TRUE),
+                                         loo_max = max(loo, na.rm = TRUE), species = nrow(s)))
+}
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 1),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom")
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Occupied pixels of every setting
+
+The occupied pixels of each contrast with their climate (`s38`) and biome (RESOLVE, `s01`): cleaned records (origin and within-genus contrasts), and supplemented records without the pixels where the parent cleaning had removed records (`s39`).
+
+*Inputs:* s38/ contrast_pixels.rds, mechanism_pixels.rds; s37/ contrasts.csv, presences.csv; s39/supplement_pixels.csv; s01/ realm_biome_10m.tif
+*Outputs:* case_pixels.rds
+
+```{r pixels}
+pix <- readRDS(file.path(dir_s38, "mechanism_pixels.rds"))
+rb <- rast(file.path(dir_s01, "realm_biome_10m.tif"))
+pix[, biome := rb[["biome"]][cell][, 1]]
+cp <- readRDS(file.path(dir_s38, "contrast_pixels.rds"))
+cp <- merge(cp, pix[, .(cell, lon, lat, biome)], by = "cell")
+cp[, records := "cleaned"]
+ct <- fread(file.path(dir_s37, "contrasts.csv"), colClasses = c(pool_key = "character"))[
+  occurrences == "supplemented" & scheme == "origins"]
+pres <- fread(file.path(dir_s37, "presences.csv"), colClasses = c(pool_key = "character"))
+bad <- fread(file.path(dir_s39, "supplement_pixels.csv"), colClasses = c(pool_key = "character"))[
+  reason != "No record in the parent download", .(pool_key, cell)]
+pres <- pres[!paste(pool_key, cell) %in% paste(bad$pool_key, bad$cell)]
+sup <- merge(ct[, .(pool_key, strategy, area, origin, contrast, scheme, species, genus)], pres[, .(pool_key, area, cell)],
+             by = c("pool_key", "area"))
+sup <- merge(sup, pix[, .(cell, bio01, dry_run50, cwd, lon, lat, biome)], by = "cell")
+sup[, records := "supplemented, filtered"]
+case_pix <- rbind(cp, sup, use.names = TRUE)
+saveRDS(case_pix, file.path(dir_data_intermediate, "case_pixels.rds"))
+sds <- pix[, lapply(.SD, sd), .SDcols = c("bio01", "dry_run50", "cwd")]
+saveRDS(sds, file.path(dir_data_intermediate, "variable_sds.rds"))
+print(case_pix[, .(pixels = .N, species = uniqueN(pool_key), contrasts = uniqueN(contrast)), by = .(records, scheme)])
+```
+
+```{r clear_pixels, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Species scores and comparisons
+
+*Inputs:* s41/ case_pixels.rds, variable_sds.rds
+*Outputs:* species_scores.csv, case_summary.csv, case_origins.csv
+
+```{r compare}
+cp <- readRDS(file.path(dir_data_intermediate, "case_pixels.rds"))
+sds <- readRDS(file.path(dir_data_intermediate, "variable_sds.rds"))
+base <- cp[records == "cleaned" & scheme == "origins"]
+settings <- list(
+  list(setting = "Primary: origin contrasts, cleaned records, 1-unit bins", d = base, width = 1, biome = FALSE, match = TRUE),
+  list(setting = "Without the multi-genus Aphnaeinae origin", d = base[origin != aphnaeinae_origin], width = 1, biome = FALSE, match = TRUE),
+  list(setting = "Origins with at least two species of each strategy", d = base, width = 1, biome = FALSE, match = TRUE, balanced = TRUE),
+  list(setting = "Within-genus contrasts (version 1)", d = cp[records == "cleaned" & scheme == "within"], width = 1, biome = FALSE, match = TRUE),
+  list(setting = "Supplemented records, cleaning-removed pixels excluded", d = cp[records == "supplemented, filtered"], width = 1, biome = FALSE, match = TRUE),
+  list(setting = "Matched on bin and biome", d = base, width = 1, biome = TRUE, match = TRUE),
+  list(setting = "Bins twice as wide", d = base, width = 2, biome = FALSE, match = TRUE),
+  list(setting = "Unmatched (no bins)", d = base, width = 1, biome = FALSE, match = FALSE))
+res <- list(); orig <- list(); scores <- list()
+for (st in settings) for (i in seq_len(nrow(hypotheses))) {
+  hy <- hypotheses[i]
+  sc <- species_scores(st$d, hy$variable, if (st$match) hy$matching else NA, st$width * hy$width, sds, st$biome)
+  if (isTRUE(st$balanced)) {
+    keep <- sc[, .(m = uniqueN(pool_key[strategy == "m"]), f = uniqueN(pool_key[strategy == "f"])), by = origin][m >= 2 & f >= 2]$origin
+    sc <- sc[origin %in% keep]
+  }
+  retained <- sc[, sum(pixels)] / st$d[, .N]
+  out <- compare(sc)
+  if (is.null(out)) next
+  tag <- data.table(setting = st$setting, hypothesis = hy$h, label = hy$label)
+  res[[length(res) + 1]] <- cbind(tag, out$summary, pixels_retained = retained)
+  orig[[length(orig) + 1]] <- cbind(tag, out$origins)
+  if (st$setting == settings[[1]]$setting) scores[[length(scores) + 1]] <- cbind(tag, sc)
+}
+res <- rbindlist(res)
+res[, p_holm := p.adjust(pooled_p, "holm"), by = setting]
+res[, outcome := fifelse(pooled_low > 0 | pooled_high < 0,
+                         fifelse(positive >= 2 / 3 * origins & sign(loo_min) == sign(pooled) & sign(loo_max) == sign(pooled),
+                                 "Consistent support", "Inconsistent"), "Not detected")]
+write_table(res, file.path(dir_data_intermediate, "case_summary.csv"))
+write_table(rbindlist(orig), file.path(dir_data_intermediate, "case_origins.csv"))
+write_table(rbindlist(scores), file.path(dir_data_intermediate, "species_scores.csv"))
+print(res[, .(setting = substr(setting, 1, 40), hypothesis, origins, positive, pooled = round(pooled, 2),
+              low = round(pooled_low, 2), high = round(pooled_high, 2), p = round(pooled_p, 3), p_holm = round(p_holm, 3),
+              retained = round(pixels_retained, 2), outcome)])
+```
+
+```{r clear_compare, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figures
+
+## Per origin
+
+For each hypothesis (primary analysis): every origin's difference between mutualists and facultative relatives at matched temperature (or dry-season length), with 95% intervals, and the random-effects estimate.
+
+*Inputs:* s41/ case_origins.csv, case_summary.csv
+*Outputs:* plot_case_origins.png
+
+```{r plot_case_origins}
+o <- fread(file.path(dir_data_intermediate, "case_origins.csv"))[grepl("^Primary", setting)]
+s <- fread(file.path(dir_data_intermediate, "case_summary.csv"))[grepl("^Primary", setting)]
+short <- function(x) vapply(strsplit(x, " + ", fixed = TRUE), function(g)
+  if (length(g) > 2) paste0(g[1], " + ", length(g) - 1, " genera") else paste(g, collapse = " + "), character(1))
+o[, row := sprintf("%s (%d/%d)", short(origin), mutualists, facultative)]
+lev <- o[hypothesis == "H2"][order(difference)]$row
+d <- rbind(o[, .(hypothesis, label, row, difference, low = difference - 1.96 * se, high = difference + 1.96 * se, pooled = FALSE)],
+           s[, .(hypothesis, label, row = "All origins", difference = pooled, low = pooled_low, high = pooled_high, pooled = TRUE)])
+d[, row := factor(row, c("All origins", lev))]
+d[, label := factor(label, unique(s$label))]
+fig <- ggplot(d, aes(difference, row)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = low, xmax = high), width = 0, linewidth = 0.5, orientation = "y", colour = "#3B3B3B") +
+  geom_point(aes(shape = pooled), size = 2.2, colour = "#D55E00") +
+  facet_wrap(~ label, ncol = 3, labeller = label_wrap_gen(40)) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 18), guide = "none") +
+  labs(x = "Mutualists minus facultative relatives at matched conditions (SD units)", y = NULL,
+       title = "Matched case-case comparison: one estimate per origin",
+       subtitle = "In brackets: mutualist/facultative species; positive: mutualists in warmer (H1) or drier (H2, H3) places") +
+  theme_figure() + theme(axis.text.y = element_text(face = "italic"))
+save_figure(fig, "plot_case_origins", 10, 4.5)
+fig
+```
+
+```{r clear_plot_case_origins, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+## Sensitivity
+
+The pooled estimate of every setting, for each hypothesis.
+
+*Inputs:* s41/case_summary.csv
+*Outputs:* plot_case_sensitivity.png
+
+```{r plot_case_sensitivity}
+s <- fread(file.path(dir_data_intermediate, "case_summary.csv"))
+s[, setting := factor(setting, rev(unique(setting)))]
+s[, label := factor(label, unique(label))]
+fig <- ggplot(s, aes(pooled, setting)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = pooled_low, xmax = pooled_high), width = 0, linewidth = 0.5, orientation = "y") +
+  geom_point(size = 2, colour = "#D55E00") +
+  geom_text(aes(x = Inf, label = paste0(positive, "/", origins)), hjust = 1.1, size = 2.3, colour = "grey30") +
+  facet_wrap(~ label, ncol = 3, labeller = label_wrap_gen(40)) +
+  labs(x = "Pooled difference, mutualists minus facultative relatives (SD units; 95% interval)", y = NULL,
+       title = "Matched case-case comparison: sensitivity", subtitle = "Labels: origins with a positive difference") +
+  theme_figure()
+save_figure(fig, "plot_case_sensitivity", 11, 4.5)
+fig
+```
+
+```{r clear_plot_case_sensitivity, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```

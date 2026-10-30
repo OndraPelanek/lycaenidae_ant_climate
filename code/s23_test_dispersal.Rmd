@@ -1,0 +1,315 @@
+---
+title: "Lycaenidae ant-interaction climate 23 - does dependence on ants limit the spread of lineages?"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+The obligate faunas are regional: the obligate species of the Cape and southern Australia belong to genera absent from the Mediterranean Basin and California (`s13`), and lineage predicts the strategies of held-out realms where climate fails (`s20`). If obligate dependence on particular ants limits the spread of lineages, obligate genera should occupy fewer regions, and fewer places, than other genera of the same age and size. This would explain why the geography of the strategies follows lineage composition (big-picture plan, test B):
+
+1. **Spread of genera.** For every genus on the tree of genera (`s10`), the number of biogeographic regions holding its species and the number of hexagons (about 210,000 km²) holding its records, related to obligacy, stem age and the number of species, with and without the genus's main region, and in phylogenetic regressions on the tree of genera. A genus is obligate when at least half of its classified species are.
+2. **Range size within genera.** In the genera with both obligate and facultative species, the range area of obligate against facultative congeners, against permutations of strategy within genera; and among all associated species, given region and lineage.
+3. **The obligate genera that did spread.** The obligate genera found in more than one region, with their species in each.
+
+All spread measures use every recorded species of a genus, classified or not. A full run takes about 2 min.
+
+# Setup
+
+## Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(ape)
+library(phylolm)
+library(mgcv)
+library(ggplot2)
+library(patchwork)
+```
+
+## Variables
+
+```{r setup_variables}
+# Genera: minimum stem age (Myr) and species for the analyses of spread
+min_stem_age <- 0.5
+min_species <- 2
+
+# Permutations of strategy within genera
+n_perm <- 9999
+
+region_levels <- c("Nearctic", "Neotropic", "Palearctic", "Tropical Africa", "Southern Africa",
+                   "Indomalayan", "Australia", "New Guinea and islands")
+southern_regions <- c("Southern Africa", "Australia")
+strategy_colours <- c(Obligate = "#E69F00", Facultative = "#0072B2", `Non-associated` = "#4D4D4D")
+```
+
+## Folders
+
+```{r setup_folders}
+dir_s05 <- path_resrepo("data/intermediate/s05_compare_regions")
+dir_s10 <- path_resrepo("data/intermediate/s10_test_diversification")
+dir_data_intermediate <- path_resrepo("data/intermediate/s23_test_dispersal")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+```{r load_functions}
+source(here::here("code", "R", "write_table.R"))
+```
+
+```{r define_helpers}
+# Coefficient table of a fitted model, for the terms whose names contain `pattern`
+coef_rows <- function(fit, pattern, model, extra = list()) {
+  cf <- summary(fit)$coefficients
+  cf <- cf[grepl(pattern, rownames(cf)), , drop = FALSE]
+  do.call(data.table, c(list(model = model, term = rownames(cf), estimate = cf[, 1],
+                             se = cf[, 2], p = cf[, ncol(cf)]), extra))
+}
+
+# Save a figure with ragg
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+theme_figure <- function(base_size = 9) {
+  theme_minimal(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.3),
+          plot.title = element_text(face = "bold", size = base_size + 0.5),
+          plot.title.position = "plot", strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom", plot.tag = element_text(face = "bold", size = 11))
+}
+```
+
+```{r keep_setup_objects}
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Spread of genera
+
+*Inputs:* s10/ genus_table.csv, genus_tree.rds; s05/ species_regions.csv, presence_hex5.csv
+*Outputs:* genus_spread.csv, spread_models.csv
+
+```{r genus_spread}
+genera <- fread(file.path(dir_s10, "genus_table.csv"), na.strings = c("", "NA"))
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+pres <- fread(file.path(dir_s05, "presence_hex5.csv"), colClasses = c(pool_key = "character"))
+
+# --- Regions and hexagons of every recorded species of each genus ---
+spread <- sp[, .(recorded = .N, regions = uniqueN(region),
+                 outside_main = mean(region != names(which.max(table(region))))), by = genus]
+hexes <- merge(pres, sp[, .(pool_key, genus)], by = "pool_key")[, .(hexagons = uniqueN(cell_id)),
+                                                                 by = genus]
+spread <- merge(spread, hexes, by = "genus", all.x = TRUE)
+gs <- merge(genera[!is.na(strategy) & !is.na(region)], spread, by = "genus")
+gs[, `:=`(obligate = as.integer(strategy == "Obligate"),
+          southern = as.integer(region %in% southern_regions),
+          one_region = as.integer(regions == 1))]
+write_table(gs, file.path(dir_data_intermediate, "genus_spread.csv"))
+print(gs[recorded >= min_species, .(genera = .N, mean_regions = mean(regions),
+                                    one_region = mean(one_region),
+                                    median_hexagons = median(hexagons),
+                                    median_stem_age = median(stem_age, na.rm = TRUE)),
+         by = strategy])
+
+# --- Models on the genera with a stem age and at least two recorded species ---
+d <- gs[is.finite(stem_age) & stem_age >= min_stem_age & recorded >= min_species]
+d[, `:=`(log_age = log(stem_age), log_species = log(recorded), region = factor(region))]
+tree <- readRDS(file.path(dir_s10, "genus_tree.rds"))
+tree <- keep.tip(tree, intersect(tree$tip.label, d$genus))
+d <- d[genus %in% tree$tip.label]
+dd <- as.data.frame(d)
+rownames(dd) <- dd$genus
+
+models <- rbind(
+  coef_rows(glm(regions - 1 ~ obligate + log_age + log_species, data = d, family = poisson),
+            "obligate", "Regions beyond the first (Poisson)"),
+  coef_rows(glm(regions - 1 ~ obligate + log_age + log_species + region, data = d,
+                family = poisson),
+            "obligate", "Regions beyond the first, with main region (Poisson)"),
+  coef_rows(glm(one_region ~ obligate + log_age + log_species, data = d, family = binomial),
+            "obligate", "Confined to one region (logistic)"),
+  coef_rows(lm(log(hexagons) ~ obligate + log_age + log_species, data = d),
+            "obligate", "Hexagons occupied (log)"),
+  coef_rows(lm(log(hexagons) ~ obligate + log_age + log_species + region, data = d),
+            "obligate", "Hexagons occupied (log), with main region"),
+  coef_rows(phylolm(log(hexagons) ~ obligate + log_age + log_species, data = dd, phy = tree,
+                    model = "lambda"),
+            "obligate", "Hexagons occupied (log), phylogenetic"),
+  coef_rows(phyloglm(one_region ~ obligate + log_age + log_species, data = dd, phy = tree,
+                     method = "logistic_MPLE", btol = 30),
+            "obligate", "Confined to one region, phylogenetic"))
+models[, genera := nrow(d)]
+write_table(models, file.path(dir_data_intermediate, "spread_models.csv"))
+print(models, digits = 3)
+```
+
+```{r clear_genus_spread, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Range size of species
+
+Among the associated species with a range estimate (the parent study's range area), the effect of obligacy on log range area given region and lineage (random intercepts of subfamily and genus), and within the genera that contain both obligate and facultative species (genus fixed effects), against permutations of strategy among the species of each genus.
+
+*Inputs:* s05/species_regions.csv
+*Outputs:* range_models.csv, range_mixed_genera.csv
+
+```{r range_size}
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+d <- sp[interaction_type %in% c("f", "m", "p") & is.finite(range_area) & range_area > 0]
+d[, `:=`(obligate = as.integer(interaction_type %in% c("m", "p")), log_range = log10(range_area),
+         genus = factor(genus), subfamily = factor(subfamily), region = factor(region))]
+
+# --- All associated species, given region and lineage ---
+m <- gam(log_range ~ obligate + region + s(subfamily, bs = "re") + s(genus, bs = "re"), data = d,
+         method = "REML")
+cf <- summary(m)$p.table["obligate", ]
+res <- data.table(analysis = "All associated species, given region and lineage",
+                  species = nrow(d), estimate = cf[[1]], se = cf[[2]], p = cf[[4]])
+
+# --- Within mixed genera, against permutations ---
+mixed <- d[, .(both = uniqueN(obligate) == 2), by = genus][both == TRUE]$genus
+dm <- droplevels(d[genus %in% mixed])
+X <- model.matrix(~ genus - 1, dm)
+slope <- function(o) coef(lm.fit(cbind(o, X), dm$log_range))[1]
+obs <- slope(dm$obligate)
+idx <- split(seq_len(nrow(dm)), dm$genus)
+set.seed(20261029)
+null <- vapply(seq_len(n_perm), function(r) {
+  o <- dm$obligate
+  for (i in idx) o[i] <- o[i][sample.int(length(i))]
+  slope(o)
+}, numeric(1))
+res <- rbind(res, data.table(analysis = "Within mixed genera (genus fixed effects)",
+                             species = nrow(dm), estimate = obs, se = sd(null),
+                             p = (1 + sum(abs(null) >= abs(obs))) / (n_perm + 1)))
+write_table(res, file.path(dir_data_intermediate, "range_models.csv"))
+print(res, digits = 3)
+
+per_genus <- dm[, .(region = names(which.max(table(region))),
+                    obligate_species = sum(obligate), facultative_species = sum(1 - obligate),
+                    obligate_range = median(range_area[obligate == 1]),
+                    facultative_range = median(range_area[obligate == 0])), by = genus]
+per_genus[, log_ratio := log10(obligate_range / facultative_range)]
+write_table(per_genus[order(log_ratio)], file.path(dir_data_intermediate,
+                                                   "range_mixed_genera.csv"))
+print(per_genus[order(log_ratio)], digits = 3)
+```
+
+```{r clear_range_size, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# The obligate genera that spread
+
+*Inputs:* s23/genus_spread.csv; s05/species_regions.csv
+*Outputs:* obligate_genera_regions.csv
+
+```{r obligate_spread}
+gs <- fread(file.path(dir_data_intermediate, "genus_spread.csv"))
+sp <- fread(file.path(dir_s05, "species_regions.csv"), colClasses = c(pool_key = "character"))
+og <- gs[strategy == "Obligate" & regions > 1]$genus
+tab <- dcast(sp[genus %in% og, .N, by = .(genus, region)], genus ~ region, value.var = "N",
+             fill = 0)
+tab <- merge(gs[genus %in% og, .(genus, subfamily, main_region = region, stem_age, recorded,
+                                 regions)], tab, by = "genus")
+write_table(tab[order(-regions)], file.path(dir_data_intermediate, "obligate_genera_regions.csv"))
+print(tab[order(-regions)])
+```
+
+```{r clear_obligate_spread, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Figure
+
+(a) Regions occupied by each genus (the regions to which its species are assigned, each species to the region holding most of its records) against its stem age, by strategy (genera with at least two recorded species; points jittered vertically). (b) Hexagons occupied against the number of recorded species. (c) Effect of obligacy on the spread of genera across models (log scale for counts, logit for not being confined to one region, so that negative values mean less spread throughout; 95% intervals). (d) Median range area of the obligate and facultative species of each genus that has both.
+
+*Inputs:* s23/ genus_spread.csv, spread_models.csv, range_mixed_genera.csv
+*Outputs:* plot_dispersal.png
+
+```{r plot_dispersal}
+gs <- fread(file.path(dir_data_intermediate, "genus_spread.csv"))
+models <- fread(file.path(dir_data_intermediate, "spread_models.csv"))
+rg <- fread(file.path(dir_data_intermediate, "range_mixed_genera.csv"))
+d <- gs[recorded >= min_species & is.finite(stem_age)]
+d[, strategy := factor(strategy, names(strategy_colours))]
+
+panel_a <- ggplot(d, aes(stem_age, regions, colour = strategy)) +
+  geom_point(size = 1.6, alpha = 0.75, position = position_jitter(width = 0, height = 0.15,
+                                                                   seed = 1)) +
+  scale_x_log10() +
+  scale_y_continuous(breaks = 1:8) +
+  scale_colour_manual(values = strategy_colours, name = NULL) +
+  labs(x = "Stem age of the genus (Myr, log scale)", y = "Regions occupied",
+       title = "Regions occupied by genera of each age") +
+  theme_figure()
+
+panel_b <- ggplot(d, aes(recorded, hexagons, colour = strategy)) +
+  geom_point(size = 1.6, alpha = 0.75) +
+  scale_x_log10() + scale_y_log10() +
+  scale_colour_manual(values = strategy_colours, name = NULL) +
+  labs(x = "Recorded species in the genus (log)", y = "Hexagons occupied (log)",
+       title = "Places occupied for a given number of species") +
+  theme_figure()
+
+# Signs of the "confined to one region" models flipped, so that negative means less spread in
+# every model
+models[grepl("^Confined", model), `:=`(estimate = -estimate,
+                                       model = sub("^Confined to one region", "Not confined to one region", model))]
+models[, model := factor(model, rev(model))]
+panel_c <- ggplot(models, aes(estimate, model)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = estimate - 1.96 * se, xmax = estimate + 1.96 * se), width = 0,
+                linewidth = 0.5, orientation = "y") +
+  geom_point(aes(fill = p < 0.05), shape = 21, size = 2.2) +
+  scale_fill_manual(values = c(`TRUE` = "black", `FALSE` = "white"), guide = "none") +
+  labs(x = "Effect of obligacy (model scale, 95% CI)", y = NULL,
+       title = "Obligate genera spread less",
+       subtitle = "Given stem age and species; filled: p < 0.05") +
+  theme_figure()
+
+rg[, genus := factor(genus, genus[order(log_ratio)])]
+panel_d <- ggplot(rg, aes(y = genus)) +
+  geom_segment(aes(x = facultative_range, xend = obligate_range, yend = genus), colour = "grey55") +
+  geom_point(aes(x = facultative_range), colour = strategy_colours[["Facultative"]], size = 2.2) +
+  geom_point(aes(x = obligate_range), colour = strategy_colours[["Obligate"]], size = 2.2) +
+  scale_x_log10(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  labs(x = "Median range area (km², log)", y = NULL,
+       title = "Obligate (orange) and facultative (blue) congeners") +
+  theme_figure() + theme(axis.text.y = element_text(face = "italic"))
+
+fig <- (panel_a | panel_b) / (panel_c | panel_d) + plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")") &
+  theme(legend.position = "bottom")
+save_figure(fig, "plot_dispersal", 10, 8)
+fig
+```
+
+```{r clear_plot_dispersal, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+```{r save_r_environment}
+print(sessionInfo())
+```
